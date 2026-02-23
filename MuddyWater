@@ -68,3 +68,6 @@ DeviceProcessEvents
           FileName, ProcessCommandLine,
           InitiatingProcessParentFileName, ReportId
 | order by Timestamp desc
+
+
+
