@@ -1,0 +1,178 @@
+// ============================================================
+// PureLog Stealer – Advanced Hunting Detections
+// Source: Copyright-lure campaign (Trend Micro, March 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. COPYRIGHT-THEMED LURE EXECUTION
+//    Detects execution of files with copyright/legal-themed names
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName endswith ".exe"
+| where InitiatingProcessFileName in~ ("explorer.exe", "chrome.exe", "msedge.exe", "firefox.exe", "outlook.exe")
+| where ProcessCommandLine has_any (
+    "Copyright", "Intellectual Property", "Rights Violation",
+    "DMCA", "Infringement", "Documentation", "Legal Notice"
+)
+| project Timestamp, DeviceName, AccountName, FileName,
+          ProcessCommandLine, InitiatingProcessFileName, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. RENAMED WINRAR EXECUTING FROM NON-STANDARD PATH
+//    Detects WinRAR-like behaviour (archive extraction with password)
+//    from unexpected directories (e.g. Temp, AppData, Downloads)
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any ("e -p", "-hp", "x -p")  // password-extract flags
+| where not(FolderPath has_any (
+    @"C:\Program Files\WinRAR",
+    @"C:\Program Files (x86)\WinRAR"
+))
+| where FolderPath has_any ("Temp", "AppData", "Downloads", "Public")
+| project Timestamp, DeviceName, AccountName, FileName,
+          ProcessCommandLine, FolderPath, InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. PYTHON INTERPRETER RENAMED AS SVCHOST / SYSTEM BINARY
+//    Detects python executable masquerading as a Windows binary
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "svchost.exe"
+| where not(FolderPath has_any (
+    @"C:\Windows\System32",
+    @"C:\Windows\SysWOW64"
+))
+| project Timestamp, DeviceName, AccountName, FileName,
+          FolderPath, ProcessCommandLine, InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. PYTHON LOADING SCRIPT FILES DISGUISED AS PDF/IMAGE
+//    Detects python.exe or svchost.exe (renamed python) loading
+//    non-.py files as scripts (e.g. instructions.pdf)
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("python.exe", "python3.exe", "svchost.exe")
+| where ProcessCommandLine has_any (".pdf", ".png", ".jpg", ".bmp", ".log")
+| project Timestamp, DeviceName, AccountName, FileName,
+          ProcessCommandLine, FolderPath, InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. AMSI BYPASS – SUSPICIOUS PROCESS MEMORY WRITE PATTERNS
+//    Detects processes injecting into or patching security tools
+// ------------------------------------------------------------
+DeviceEvents
+| where Timestamp > ago(7d)
+| where ActionType in (
+    "AmsiScriptDetection",
+    "AntivirusDetection",
+    "CreateRemoteThreadApiCall",
+    "WriteProcessMemoryApiCall"
+)
+| where InitiatingProcessFileName in~ ("python.exe", "svchost.exe", "powershell.exe", "cmd.exe")
+| where InitiatingProcessFolderPath has_any ("Temp", "AppData", "Downloads", "Public")
+| project Timestamp, DeviceName, ActionType, InitiatingProcessFileName,
+          InitiatingProcessFolderPath, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. REGISTRY PERSISTENCE – HKCU\Run\SystemSettings
+//    Detects the specific Run key used by PureLog for persistence
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(7d)
+| where RegistryKey has @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+| where RegistryValueName =~ "SystemSettings"
+| project Timestamp, DeviceName, AccountName, RegistryKey,
+          RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. SCREENSHOT CAPTURE + OUTBOUND HTTPS POST TO C2
+//    Detects process taking screenshot then making HTTPS POST
+//    (correlate screenshot API call with subsequent network event)
+// ------------------------------------------------------------
+let ScreenshotProcs = DeviceEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ScreenshotTaken"
+| where InitiatingProcessFileName !in~ ("Teams.exe", "Slack.exe", "zoom.exe", "SnippingTool.exe", "ScreenSketch.exe")
+| project DeviceName, AccountSid, ScreenshotTime = Timestamp,
+          InitiatingProcessFileName, InitiatingProcessId;
+let C2Comms = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 443
+| where InitiatingProcessFileName !in~ ("chrome.exe", "msedge.exe", "firefox.exe", "Teams.exe")
+| project DeviceName, NetworkTime = Timestamp,
+          RemoteIP, RemoteUrl, InitiatingProcessId, InitiatingProcessFileName;
+ScreenshotProcs
+| join kind=inner C2Comms on DeviceName, InitiatingProcessId
+| where NetworkTime between (ScreenshotTime .. (ScreenshotTime + 2m))
+| project ScreenshotTime, NetworkTime, DeviceName, InitiatingProcessFileName,
+          RemoteIP, RemoteUrl
+| order by ScreenshotTime desc
+
+
+// ------------------------------------------------------------
+// 8. .NET IN-MEMORY LOADER – FILELESS PAYLOAD EXECUTION
+//    Detects .NET assemblies loaded reflectively without a file on disk
+// ------------------------------------------------------------
+DeviceEvents
+| where Timestamp > ago(7d)
+| where ActionType == "CreateRemoteThreadApiCall"
+    or ActionType == "NtAllocateVirtualMemoryApiCall"
+| where InitiatingProcessFileName in~ ("python.exe", "svchost.exe", "cmd.exe", "powershell.exe")
+| where InitiatingProcessFolderPath has_any ("Temp", "AppData", "Downloads", "Public")
+| project Timestamp, DeviceName, AccountName, ActionType,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. COMPREHENSIVE MULTI-STAGE CORRELATION (HIGH FIDELITY)
+//    Links all stages: lure execution → extraction → persistence → C2
+//    Use this for high-confidence incident investigation
+// ------------------------------------------------------------
+let LureExec = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any (
+    "Copyright", "Intellectual Property", "Rights Violation", "DMCA"
+)
+| project DeviceName, AccountSid, LureTime = Timestamp, LureProcess = ProcessCommandLine;
+
+let RegPersist = DeviceRegistryEvents
+| where Timestamp > ago(7d)
+| where RegistryKey has @"CurrentVersion\Run"
+| where RegistryValueName =~ "SystemSettings"
+| project DeviceName, AccountSid, PersistTime = Timestamp, RegValue = RegistryValueData;
+
+let C2Phone = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 443
+| where InitiatingProcessFileName !in~ ("chrome.exe", "msedge.exe", "firefox.exe", "Teams.exe", "OneDrive.exe")
+| project DeviceName, AccountSid, C2Time = Timestamp, RemoteIP, RemoteUrl;
+
+LureExec
+| join kind=inner RegPersist on DeviceName, AccountSid
+| join kind=inner C2Phone    on DeviceName, AccountSid
+| where PersistTime > LureTime
+| where C2Time     > PersistTime
+| project LureTime, PersistTime, C2Time, DeviceName,
+          LureProcess, RegValue, RemoteIP, RemoteUrl
+| order by LureTime desc
