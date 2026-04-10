@@ -1,0 +1,350 @@
+// ============================================================
+// ClickFix macOS Script Editor — Atomic Stealer (AMOS) Delivery
+// Source: CyberSecurity News (April 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1059.002, T1204.002, T1059.004, T1027,
+//               T1555.001, T1555.003, T1562.001, T1041, T1105
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// A new ClickFix social-engineering campaign targets macOS users
+// by abusing the native Script Editor (osascript / AppleScript)
+// instead of Terminal.  This bypasses Apple's tightened Terminal
+// security controls.  Victims are lured via fake CAPTCHAs,
+// browser update prompts, or error dialogs that instruct them
+// to copy-paste and execute a malicious AppleScript payload.
+// The payload downloads and executes Atomic Stealer (AMOS),
+// which harvests Keychain credentials, browser passwords, cookies,
+// autofill data, cryptocurrency wallets, and session tokens.
+//
+// KEY IOCs
+// ---------------------------------------------------------------
+// - Abuse of osascript / Script Editor from browser child process
+// - Base64 / obfuscated AppleScript or shell one-liners
+// - curl | sh / curl | bash patterns spawned by osascript
+// - Keychain dump attempts (security find-generic-password)
+// - Browser credential file access (Login Data, Cookies, etc.)
+// - LaunchAgent / LaunchDaemon plist persistence
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+// - Legitimate IT automation that uses osascript (Jamf, Munki)
+// - Developer scripts that call osascript for notifications
+// - Tune exclusions per your macOS management tooling
+//
+// REFERENCES
+// ---------------------------------------------------------------
+// - https://cybersecuritynews.com/new-clickfix-campaign-uses-macos-script-editor/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. BROWSER SPAWNING OSASCRIPT (SCRIPT EDITOR ABUSE)
+//    Detects a web browser launching osascript — the primary
+//    ClickFix execution vector replacing Terminal abuse
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "osascript"
+    or ProcessCommandLine has "osascript"
+| where InitiatingProcessFileName has_any (
+    "Safari", "Google Chrome", "firefox",
+    "msedge", "chrome", "brave", "arc"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName,
+          FileName, ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. APPLESCRIPT EXECUTION WITH OBFUSCATED / ENCODED PAYLOAD
+//    Detects osascript running base64-encoded or heavily
+//    obfuscated commands — hallmark of ClickFix payloads
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "osascript"
+    or ProcessCommandLine has "osascript"
+| where ProcessCommandLine has_any (
+    "base64", "b64decode", "openssl enc",
+    "do shell script", "curl", "wget",
+    "\\x", "\\u00", "eval"
+)
+| project Timestamp, DeviceName, AccountName,
+          ProcessCommandLine, FolderPath,
+          InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. OSASCRIPT SPAWNING SHELL INTERPRETER (PAYLOAD STAGING)
+//    Detects osascript dropping into bash/sh/zsh to execute
+//    the next-stage downloader or AMOS payload directly
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "osascript"
+| where FileName has_any ("bash", "sh", "zsh", "curl", "wget", "python3")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, FileName,
+          ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. CURL PIPE TO SHELL — ATOMIC STEALER DOWNLOAD & EXEC
+//    Detects the classic "curl <url> | bash" one-liner used
+//    to pull and immediately execute the AMOS binary
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine matches regex @"curl\s+.+\|\s*(ba)?sh"
+    or ProcessCommandLine matches regex @"wget\s+.+\|\s*(ba)?sh"
+| where InitiatingProcessFileName has_any (
+    "osascript", "bash", "sh", "zsh", "Terminal"
+)
+| project Timestamp, DeviceName, AccountName,
+          ProcessCommandLine, InitiatingProcessFileName, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. KEYCHAIN CREDENTIAL HARVESTING
+//    Detects use of macOS "security" CLI to dump Keychain
+//    entries — a core Atomic Stealer data-theft technique
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "security"
+| where ProcessCommandLine has_any (
+    "find-generic-password",
+    "find-internet-password",
+    "dump-keychain",
+    "find-certificate",
+    "export -k"
+)
+| where InitiatingProcessFileName !in~ ("Keychain Access", "Safari")
+| project Timestamp, DeviceName, AccountName,
+          ProcessCommandLine, InitiatingProcessFileName, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. BROWSER CREDENTIAL & COOKIE FILE ACCESS
+//    Detects processes reading Chrome/Firefox/Edge credential
+//    stores, cookies, and autofill databases — AMOS targets
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileRead", "FileAccessed", "FileModified")
+| where FolderPath has_any (
+    "Login Data",
+    "Cookies",
+    "Web Data",
+    "Local State",
+    "logins.json",
+    "cookies.sqlite",
+    "key4.db",
+    "key3.db"
+)
+| where InitiatingProcessFileName !has_any (
+    "chrome", "firefox", "msedge", "brave", "Safari", "arc"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. CRYPTOCURRENCY WALLET FILE ACCESS
+//    Detects non-wallet processes touching well-known crypto
+//    wallet data directories — AMOS steals wallet seed phrases
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath has_any (
+    "Electrum", "Exodus", "Atomic Wallet",
+    "Coinomi", "Metamask", "Phantom",
+    "Trust Wallet", "Ledger Live",
+    "com.liberty.jaxx", "Wasabi Wallet",
+    "Bitcoin/wallets"
+)
+| where ActionType in ("FileRead", "FileAccessed", "FileCopied")
+| where InitiatingProcessFileName !has_any (
+    "Electrum", "Exodus", "Atomic", "Coinomi",
+    "Ledger", "firefox", "chrome"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. LAUNCHAGENT / LAUNCHDAEMON PERSISTENCE (PLIST DROP)
+//    Detects creation of plist files in LaunchAgents/Daemons
+//    directories — AMOS persistence mechanism on macOS
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType == "FileCreated"
+| where FolderPath has_any (
+    "LaunchAgents",
+    "LaunchDaemons"
+)
+| where FileName endswith ".plist"
+| where InitiatingProcessFileName has_any (
+    "osascript", "bash", "sh", "zsh", "curl", "python3"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. SECURITY TOOL TAMPERING / GATEKEEPER BYPASS
+//    Detects attempts to disable macOS security features
+//    (Gatekeeper, XProtect, spctl) to allow AMOS execution
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any (
+    "spctl --master-disable",
+    "xattr -r -d com.apple.quarantine",
+    "xattr -c",
+    "defaults write com.apple.LaunchServices LSQuarantine",
+    "csrutil disable",
+    "xprotect"
+)
+| project Timestamp, DeviceName, AccountName,
+          ProcessCommandLine, FileName,
+          InitiatingProcessFileName, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. SUSPICIOUS DMG / PKG MOUNT + EXECUTION CHAIN
+//     Detects disk image mount followed by immediate binary
+//     execution — common AMOS delivery via fake installer DMGs
+// ------------------------------------------------------------
+let DmgMount = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any ("hdiutil attach", "hdiutil mount")
+| project DeviceName, MountTime = Timestamp,
+          MountCmd = ProcessCommandLine, AccountSid;
+let PostExec = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FolderPath has "/Volumes/"
+| where FileName !has_any ("Installer", "setup")
+| project DeviceName, ExecTime = Timestamp,
+          ExecFile = FileName, ExecCmd = ProcessCommandLine,
+          ExecPath = FolderPath, AccountSid;
+DmgMount
+| join kind=inner PostExec on DeviceName, AccountSid
+| where ExecTime between (MountTime .. (MountTime + 5m))
+| project MountTime, ExecTime, DeviceName,
+          MountCmd, ExecFile, ExecCmd, ExecPath
+| order by MountTime desc
+
+
+// ------------------------------------------------------------
+// 11. OUTBOUND C2 COMMUNICATION — AMOS DATA EXFILTRATION
+//     Detects suspicious HTTPS POST from non-browser processes
+//     shortly after osascript or shell activity — exfil stage
+// ------------------------------------------------------------
+let ScriptExec = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName has_any ("osascript", "bash", "sh", "zsh")
+| where ProcessCommandLine has_any ("curl", "base64", "do shell script", "wget")
+| project DeviceName, ScriptTime = Timestamp,
+          ScriptProcess = FileName, AccountSid;
+let OutboundC2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort in (443, 80, 8443)
+| where InitiatingProcessFileName !in~ (
+    "chrome", "firefox", "msedge", "Safari",
+    "brave", "Teams", "OneDrive", "Slack"
+)
+| project DeviceName, NetTime = Timestamp,
+          RemoteIP, RemoteUrl,
+          InitiatingProcessFileName, AccountSid;
+ScriptExec
+| join kind=inner OutboundC2 on DeviceName, AccountSid
+| where NetTime between (ScriptTime .. (ScriptTime + 10m))
+| project ScriptTime, NetTime, DeviceName,
+          ScriptProcess, InitiatingProcessFileName,
+          RemoteIP, RemoteUrl
+| order by ScriptTime desc
+
+
+// ------------------------------------------------------------
+// 12. COMPREHENSIVE MULTI-STAGE CORRELATION (HIGH FIDELITY)
+//     Links the full ClickFix kill chain:
+//     Browser → osascript → payload download → credential
+//     theft → persistence → C2 exfiltration
+//     Use this for high-confidence incident triage
+// ------------------------------------------------------------
+let Stage1_ClickFix = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "osascript"
+| where InitiatingProcessFileName has_any (
+    "Safari", "chrome", "firefox", "msedge", "brave", "arc"
+)
+| project DeviceName, AccountSid,
+          ClickFixTime = Timestamp,
+          Browser = InitiatingProcessFileName,
+          Payload = ProcessCommandLine;
+
+let Stage2_Download = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "osascript"
+| where FileName has_any ("bash", "sh", "zsh", "curl")
+| project DeviceName, AccountSid,
+          DownloadTime = Timestamp,
+          Downloader = ProcessCommandLine;
+
+let Stage3_CredTheft = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any (
+    "find-generic-password", "find-internet-password",
+    "dump-keychain", "Login Data", "Cookies"
+)
+| project DeviceName, AccountSid,
+          TheftTime = Timestamp,
+          TheftCmd = ProcessCommandLine;
+
+let Stage4_Persist = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath has "LaunchAgents"
+| where FileName endswith ".plist"
+| project DeviceName, AccountSid,
+          PersistTime = Timestamp,
+          PlistPath = FolderPath;
+
+let Stage5_Exfil = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort in (443, 80)
+| where InitiatingProcessFileName !in~ (
+    "chrome", "firefox", "msedge", "Safari", "Teams", "OneDrive"
+)
+| project DeviceName, AccountSid,
+          ExfilTime = Timestamp,
+          C2_IP = RemoteIP, C2_URL = RemoteUrl;
+
+Stage1_ClickFix
+| join kind=inner Stage2_Download on DeviceName, AccountSid
+| where DownloadTime between (ClickFixTime .. (ClickFixTime + 5m))
+| join kind=leftouter Stage3_CredTheft on DeviceName, AccountSid
+| where TheftTime between (DownloadTime .. (DownloadTime + 30m))
+| join kind=leftouter Stage4_Persist on DeviceName, AccountSid
+| where PersistTime between (DownloadTime .. (DownloadTime + 30m))
+| join kind=leftouter Stage5_Exfil on DeviceName, AccountSid
+| where ExfilTime between (DownloadTime .. (DownloadTime + 60m))
+| project ClickFixTime, DownloadTime, TheftTime, PersistTime, ExfilTime,
+          DeviceName, Browser, Payload, Downloader,
+          TheftCmd, PlistPath, C2_IP, C2_URL
+| order by ClickFixTime desc

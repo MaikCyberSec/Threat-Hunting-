@@ -12,7 +12,6 @@
 </p>
 
 <p align="center">
-  <a href="#detections">Detections</a> &bull;
   <a href="#getting-started">Getting Started</a> &bull;
   <a href="#mitre-attck-coverage">ATT&CK Coverage</a> &bull;
   <a href="#contributing">Contributing</a>
@@ -34,24 +33,11 @@ All queries are built for:
 
 ---
 
-## Detections
-
-| # | Detection | Threat Type | Platform | MITRE ATT&CK | Queries |
-|:-:|-----------|------------|----------|---------------|:-------:|
-| # | Detection | Threat Type | Platform | MITRE ATT&CK | Queries |
-|:-:|-----------|------------|----------|---------------|:-------:|
-| 1 | **[Adobe Reader 0-Day PDF Exploit — Data Theft & Fingerprinting](Adobe%20Reader%200-Day%20PDF%20Exploit%20-%20Data%20Theft%20%26%20System%20Fingerprinting%20(CVE-2026-27220))** | 0-Day Exploit / Data Theft | Windows | T1203, T1059.007, T1005, T1041 | 12 |
-| 2 | **[ChipSoft HiX EHR — Supply Chain Ransomware](ChipSoft%20HiX%20EHR%20-%20Supply%20Chain%20Ransomware%20Detection%20(CVE-2026-4404))** | Supply Chain / Ransomware | Windows | T1195, T1133, T1486 | 9 |
-| 3 | **[EvilTokens & AMOS Stealer — OAuth Hijacking & macOS Theft](EvilTokens%20%26%20AMOS%20Stealer%20-%20OAuth%20Hijacking%20%26%20macOS%20Credential%20Theft%20(March%202026))** | Credential Theft / Phishing | Windows, macOS, Entra ID | T1528, T1566, T1555 | 12 |
-| 4 | **[PureLog Stealer](PureLog%20Stealer)** | Infostealer / Fileless | Windows | T1566, T1059, T1547 | 9 |
-| 5 | **[FoxKitsune Malware Activity](FoxKitsune%20Malware%20Activity%20Detection)** | RAT / Espionage | Windows | T1071, T1059, T1082 | — |
-| 6 | **[MuddyWater](MuddyWater)** | APT / Nation-State | Windows | T1059, T1071, T1105 | — |
-| 7 | **[Authentication Bypass — Better Auth Plugin](Authentication%20Bypass%20via%20API%20Key%20Abuse%20(Better%20Auth%20Plugin))** | API Abuse / AuthN Bypass | Web / API | T1190, T1078 | — |
-
 ### Recent Additions
 
 **April 2026**
-- `Adobe Reader 0-Day PDF Exploit` — Active zero-day (CVE-2026-27220) discovered by EXPMON on March 26. Malicious PDF ("yummy_adobe_exploit_uwu.pdf") abuses JavaScript APIs (util.readFileIntoStream, RSS.addFeed) to steal local files and fingerprint systems. No user interaction beyond opening the PDF. C2: 169.40.2.68:45191, User-Agent: "Adobe Synchronizer". 12 queries covering C2 communication, vulnerable version detection, suspicious child processes, file read anomalies, and multi-signal correlation.
+- `ClickFix macOS Script Editor` — New ClickFix social-engineering campaign bypassing Terminal entirely by abusing macOS Script Editor (osascript) to deliver Atomic Stealer (AMOS). Victims lured via fake CAPTCHAs and browser error dialogs. Steals Keychain credentials, browser passwords, cookies, crypto wallets, and session tokens. 12 queries covering browser-to-osascript execution, encoded payloads, curl-pipe-to-shell delivery, Keychain harvesting, browser credential theft, crypto wallet access, LaunchAgent persistence, Gatekeeper bypass, DMG execution chains, C2 exfiltration, and full kill-chain correlation.
+- `Adobe Reader 0-Day PDF Exploit` — Active zero-day (CVE-2026-27220) discovered by EXPMON on March 26. Malicious PDF abuses JavaScript APIs (util.readFileIntoStream, RSS.addFeed) to steal local files and fingerprint systems. No user interaction beyond opening the PDF. C2: 169.40.2.68:45191. 12 queries covering C2 communication, vulnerable version detection, suspicious child processes, file read anomalies, and multi-signal correlation.
 - `ChipSoft HiX EHR` — Following the April 7 ransomware attack on ChipSoft, the dominant Dutch healthcare EHR provider (~70% market share). Includes 9 queries covering software inventory, process detection, VPN connections, post-compromise indicators, and lateral movement. Z-CERT advisory: disconnect VPN immediately.
 - `EvilTokens & AMOS Stealer` — Dual campaign: OAuth Device Code phishing hijacking enterprise M365 accounts (180+ phishing URLs/week), and AMOS macOS stealer targeting AI developers via ClickFix lures. 12 queries covering OAuth anomalies, C2 domains, behavioral patterns, persistence, credential harvesting, and multi-signal correlation.
 
@@ -102,8 +88,8 @@ All queries are built for:
                                     Threat Hunting — ATT&CK Heat Map
  ┌─────────────────────────────────────────────────────────────────────────────┐
  │ Initial Access     │ T1190  T1195  T1195.002  T1133  T1566.002  T1203      │
- │ Execution          │ T1059.001  T1059.004  T1059.007  T1204.002            │
- │ Persistence        │ T1547.001  T1547.011  T1078                           │
+ │ Execution          │ T1059.001  T1059.002  T1059.004  T1059.007  T1204.002 │
+ │ Persistence        │ T1547.001  T1547.011  T1543.001  T1078                │
  │ Privilege Esc.     │ T1078                                                 │
  │ Defense Evasion    │ T1027  T1027.013  T1036.005  T1497  T1562.001        │
  │ Discovery          │ T1082  T1518.001  T1005                               │
@@ -118,14 +104,14 @@ All queries are built for:
 | Tactic | Techniques Covered | Detections |
 |--------|-------------------|:----------:|
 | Initial Access | Exploitation for Client Execution, Supply Chain, Phishing | 4 |
-| Execution | PowerShell, Unix Shell, JavaScript, Malicious File | 5 |
-| Persistence | Registry Run Keys, Plist Modification, Valid Accounts | 3 |
-| Defense Evasion | Obfuscation, Masquerading, VM Detection, Disable Tools | 3 |
+| Execution | PowerShell, AppleScript, Unix Shell, JavaScript, Malicious File | 6 |
+| Persistence | Registry Run Keys, Plist Modification, LaunchAgent, Valid Accounts | 4 |
+| Defense Evasion | Obfuscation, Masquerading, VM Detection, Disable Tools, Gatekeeper Bypass | 4 |
 | Discovery | System Info Discovery, Software Discovery, Local Data | 2 |
-| Credential Access | Steal OAuth Token, Keychain, Browser Credentials | 2 |
+| Credential Access | Steal OAuth Token, Keychain, Browser Credentials, Crypto Wallets | 3 |
 | Collection | Data from Local System, Archive Collected Data | 2 |
-| Exfiltration | Exfiltration Over C2 Channel | 1 |
-| Command & Control | Web Protocols, Ingress Tool Transfer | 4 |
+| Exfiltration | Exfiltration Over C2 Channel | 2 |
+| Command & Control | Web Protocols, Ingress Tool Transfer | 5 |
 | Impact | Data Encrypted for Impact (Ransomware) | 1 |
 
 ---
@@ -135,6 +121,7 @@ All queries are built for:
 ```
 Threat-Hunting-/
 ├── README.md
+├── ClickFix macOS Script Editor - Atomic Stealer Delivery (April 2026)
 ├── Adobe Reader 0-Day PDF Exploit - Data Theft & System Fingerprinting (CVE-2026-27220)
 ├── ChipSoft HiX EHR - Supply Chain Ransomware Detection (CVE-2026-4404)
 ├── EvilTokens & AMOS Stealer - OAuth Hijacking & macOS Credential Theft (March 2026)
