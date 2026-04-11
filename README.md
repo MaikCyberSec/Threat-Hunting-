@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **April 2026**
+- `Cookie Theft & Session Hijacking` — With Google rolling out Device Bound Session Credentials (DBSC) in Chrome 146 to combat cookie theft, this detection hunts for the attacker side of session hijacking. Targets infostealers (Lumma, RedLine, Raccoon, Vidar, AMOS) reading browser credential stores, Local State encryption keys, DPAPI master keys, and cookie databases. 12 queries covering non-browser credential access, encryption key extraction, DPAPI abuse, staging/archiving, SQLite direct queries, multi-browser-vendor correlation, Entra ID token replay, impossible travel, C2 exfiltration, and full kill-chain correlation.
 - `ClickFix macOS Script Editor` — New ClickFix social-engineering campaign bypassing Terminal entirely by abusing macOS Script Editor (osascript) to deliver Atomic Stealer (AMOS). Victims lured via fake CAPTCHAs and browser error dialogs. Steals Keychain credentials, browser passwords, cookies, crypto wallets, and session tokens. 12 queries covering browser-to-osascript execution, encoded payloads, curl-pipe-to-shell delivery, Keychain harvesting, browser credential theft, crypto wallet access, LaunchAgent persistence, Gatekeeper bypass, DMG execution chains, C2 exfiltration, and full kill-chain correlation.
 - `Adobe Reader 0-Day PDF Exploit` — Active zero-day (CVE-2026-27220) discovered by EXPMON on March 26. Malicious PDF abuses JavaScript APIs (util.readFileIntoStream, RSS.addFeed) to steal local files and fingerprint systems. No user interaction beyond opening the PDF. C2: 169.40.2.68:45191. 12 queries covering C2 communication, vulnerable version detection, suspicious child processes, file read anomalies, and multi-signal correlation.
 - `ChipSoft HiX EHR` — Following the April 7 ransomware attack on ChipSoft, the dominant Dutch healthcare EHR provider (~70% market share). Includes 9 queries covering software inventory, process detection, VPN connections, post-compromise indicators, and lateral movement. Z-CERT advisory: disconnect VPN immediately.
@@ -93,7 +94,7 @@ All queries are built for:
  │ Privilege Esc.     │ T1078                                                 │
  │ Defense Evasion    │ T1027  T1027.013  T1036.005  T1497  T1562.001        │
  │ Discovery          │ T1082  T1518.001  T1005                               │
- │ Credential Access  │ T1528  T1550.001  T1555.001  T1555.003               │
+ │ Credential Access  │ T1528  T1539  T1550.001  T1555.001  T1555.003  T1185 │
  │ Collection         │ T1005  T1560.001                                      │
  │ Exfiltration       │ T1041                                                 │
  │ C2                 │ T1071.001  T1105                                      │
@@ -108,7 +109,7 @@ All queries are built for:
 | Persistence | Registry Run Keys, Plist Modification, LaunchAgent, Valid Accounts | 4 |
 | Defense Evasion | Obfuscation, Masquerading, VM Detection, Disable Tools, Gatekeeper Bypass | 4 |
 | Discovery | System Info Discovery, Software Discovery, Local Data | 2 |
-| Credential Access | Steal OAuth Token, Keychain, Browser Credentials, Crypto Wallets | 3 |
+| Credential Access | Steal OAuth Token, Steal Web Session Cookie, Keychain, Browser Credentials, Crypto Wallets, Man-in-the-Browser | 4 |
 | Collection | Data from Local System, Archive Collected Data | 2 |
 | Exfiltration | Exfiltration Over C2 Channel | 2 |
 | Command & Control | Web Protocols, Ingress Tool Transfer | 5 |
@@ -121,6 +122,7 @@ All queries are built for:
 ```
 Threat-Hunting-/
 ├── README.md
+├── Cookie Theft & Session Hijacking - Infostealer Browser Credential Hunting (April 2026)
 ├── ClickFix macOS Script Editor - Atomic Stealer Delivery (April 2026)
 ├── Adobe Reader 0-Day PDF Exploit - Data Theft & System Fingerprinting (CVE-2026-27220)
 ├── ChipSoft HiX EHR - Supply Chain Ransomware Detection (CVE-2026-4404)
