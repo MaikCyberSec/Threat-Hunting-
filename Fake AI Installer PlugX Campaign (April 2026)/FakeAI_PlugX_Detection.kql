@@ -1,0 +1,258 @@
+// ============================================================
+// Fake AI-Installer PlugX Campaign — DLL Sideloading via G DATA
+// Source:  Malwarebytes / Security Boulevard / Trend Micro / 7AI
+//          Lab52 ("PlugX Meeting Invitation via MSBuild and GDATA")
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1574.002, T1204.002, T1140, T1071.001, T1112,
+//               T1608.001, T1583.001, T1027, T1562.001
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// An active campaign distributes trojanized installers of a
+// well-known AI developer tool via typosquatted / lookalike
+// domains and malicious search ads. Victims receive a working
+// front-end application while the installer silently deploys a
+// PlugX RAT through DLL sideloading.
+//
+// The sideloading chain abuses a legitimately signed G DATA
+// updater binary:
+//     NOVUpdate.exe       (signed G DATA updater — loader host)
+//     avk.dll             (malicious sideloaded DLL — PlugX loader)
+//     NOVUpdate.exe.dat   (XOR-encrypted PlugX payload)
+//
+// Within ~22 seconds of first execution the loader beacons to
+// 8.217.190.58:443 and modifies TCP/IP registry keys. The same
+// sideloading pattern was previously documented by Lab52 (Feb
+// 2026) as a PlugX delivery method abusing MSBuild + G DATA.
+//
+// Parallel vectors in the same campaign cluster (Trend Micro / 7AI):
+//   * Trojanized VS Code extensions beaconing to
+//     claude-code.official-version[.]com (wildcard: *.official-version[.]com)
+//   * macOS MacSync infostealer via fake installer DMGs calling
+//     a2abotnet[.]com/dynamic and a2abotnet[.]com/gate
+//
+// INDICATORS OF COMPROMISE
+// ---------------------------------------------------------------
+//   SHA256
+//     d5590802bf0926ac30d8e31c0911439c35aead82bf17771cfd1f9a785a7bf143  (avk.dll)
+//     8ac88aeecd19d842729f000c6ab732261cb11dd15cdcbb2dd137dc768b2f12bc  (NOVUpdate.exe.dat)
+//
+//   Network
+//     8.217.190.58            (PlugX C2)
+//     *.official-version[.]com (trojanized VS Code extension C2)
+//     a2abotnet[.]com          (MacSync macOS stealer C2)
+//
+//   File / archive names
+//     Claude-Pro-windows-x64.zip
+//     CrossMark2-Setup.exe
+//     NOVUpdate.exe / avk.dll / NOVUpdate.exe.dat
+//     /tmp/osalogging.zip        (macOS staging)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+// - Legitimate G DATA endpoint installations will load avk.dll
+//   from the signed G DATA install path (Program Files\G DATA\).
+//   Rules #2 and #3 restrict to non-standard paths to avoid this.
+// - Developers testing VS Code extensions may briefly resolve
+//   *.official-version[.]com — any hit should still be escalated.
+// - IT-managed software deployment platforms dropping ZIPs into
+//   %TEMP% are expected; pivot on process lineage and hash.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+// - https://www.malwarebytes.com/blog/scams/2026/04/fake-claude-site-installs-malware-that-gives-attackers-access-to-your-computer
+// - https://www.trendmicro.com/en_us/research/26/d/weaponizing-trust-claude-code-lures-and-github-release-payloads.html
+// - https://blog.7ai.com/claude-fraud-malware-campaign-ai-developer-tools
+// - https://gbhackers.com/claude-code-leak/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN IOC HASHES — HIGH CONFIDENCE
+// ------------------------------------------------------------
+union DeviceFileEvents, DeviceProcessEvents, DeviceImageLoadEvents
+| where Timestamp > ago(90d)
+| where SHA256 in~ (
+    "d5590802bf0926ac30d8e31c0911439c35aead82bf17771cfd1f9a785a7bf143",
+    "8ac88aeecd19d842729f000c6ab732261cb11dd15cdcbb2dd137dc768b2f12bc"
+  )
+| project Timestamp, DeviceName, ActionType, FileName, FolderPath,
+          SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DLL SIDELOADING — avk.dll OUTSIDE LEGITIMATE G DATA PATH
+//    Legit avk.dll ships under Program Files\G DATA\. Any load
+//    from user-writable locations is the sideload signal.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(60d)
+| where FileName =~ "avk.dll"
+| where not (FolderPath startswith @"C:\Program Files\G DATA"
+          or FolderPath startswith @"C:\Program Files (x86)\G DATA")
+| project Timestamp, DeviceName, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. NOVUpdate.exe FROM USER-WRITABLE PATH (loader host)
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName =~ "NOVUpdate.exe"
+| where FolderPath has_any (
+    @"\AppData\", @"\Temp\", @"\Downloads\", @"\Users\Public\",
+    @"\ProgramData\", @"\PerfLogs\"
+  )
+    or not (FolderPath startswith @"C:\Program Files\G DATA"
+         or FolderPath startswith @"C:\Program Files (x86)\G DATA")
+| project Timestamp, DeviceName, AccountName, FileName, FolderPath,
+          SHA256, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessParentFileName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. XOR-ENCRYPTED PAYLOAD ARTIFACT (NOVUpdate.exe.dat)
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where FileName =~ "NOVUpdate.exe.dat"
+   or FileName endswith ".exe.dat"
+| project Timestamp, DeviceName, ActionType, FileName, FolderPath,
+          SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. KNOWN C2 — 8.217.190.58 (PlugX)
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteIP == "8.217.190.58"
+    or RemoteUrl has "8.217.190.58"
+| project Timestamp, DeviceName, ActionType, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, RemoteIP, RemotePort,
+          RemoteUrl, Protocol
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. CAMPAIGN DOMAINS — VS Code extension + macOS stealer C2
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteUrl has_any (
+    "official-version.com",
+    "a2abotnet.com"
+  )
+| project Timestamp, DeviceName, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. SUSPICIOUS AI-INSTALLER ARCHIVE NAMES DROPPED FROM BROWSER
+//    Typosquatted / impersonating installers. Pivot point.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType == "FileCreated"
+| where FileName matches regex @"(?i)(claude[-_ ]?pro|claude[-_ ]?code|anthropic[-_ ]?claude|crossmark2[-_ ]?setup).*\.(zip|exe|msi|dmg)$"
+    or FileName in~ ("Claude-Pro-windows-x64.zip","CrossMark2-Setup.exe")
+| where InitiatingProcessFileName in~ (
+    "chrome.exe","msedge.exe","firefox.exe","brave.exe",
+    "opera.exe","iexplore.exe","AcroRd32.exe","outlook.exe"
+  )
+| project Timestamp, DeviceName, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. TCP/IP REGISTRY TAMPERING IMMEDIATELY AFTER LOADER RUN
+//    PlugX loader modifies TCP/IP-related keys within seconds
+//    of first execution.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where RegistryKey has_any (
+    @"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
+    @"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters",
+    @"SYSTEM\CurrentControlSet\Services\NetBT\Parameters"
+  )
+| where InitiatingProcessFileName in~ ("NOVUpdate.exe","rundll32.exe","regsvr32.exe")
+    or InitiatingProcessFolderPath has_any (
+        @"\AppData\", @"\Temp\", @"\Users\Public\", @"\ProgramData\"
+      )
+| project Timestamp, DeviceName, ActionType, RegistryKey,
+          RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. DEFENDER EXCLUSION ABUSE — C:\temp add (campaign TTP)
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("powershell.exe","pwsh.exe","cmd.exe")
+| where ProcessCommandLine has_all ("Add-MpPreference","-ExclusionPath")
+    or ProcessCommandLine has_all ("Set-MpPreference","-ExclusionPath")
+| project Timestamp, DeviceName, AccountName, FileName,
+          ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessParentFileName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Same host within 1 hour:
+//       (a) typosquatted installer ZIP/EXE dropped from a browser
+//       (b) NOVUpdate.exe or avk.dll loaded from non-G-DATA path
+//       (c) outbound to 8.217.190.58 OR *.official-version.com
+// ------------------------------------------------------------
+let Drop =
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where ActionType == "FileCreated"
+    | where (FileName matches regex @"(?i)(claude[-_ ]?pro|claude[-_ ]?code|crossmark2).*\.(zip|exe|msi)$")
+         or FileName in~ ("Claude-Pro-windows-x64.zip","CrossMark2-Setup.exe",
+                          "NOVUpdate.exe","avk.dll","NOVUpdate.exe.dat")
+    | project DeviceId, DeviceName, DropTime=Timestamp,
+              DroppedFile=FileName, DropPath=FolderPath;
+let Side =
+    union
+    (DeviceImageLoadEvents
+        | where Timestamp > ago(30d)
+        | where FileName =~ "avk.dll"
+        | where not (FolderPath startswith @"C:\Program Files\G DATA"
+                  or FolderPath startswith @"C:\Program Files (x86)\G DATA")
+        | project DeviceId, SideTime=Timestamp, SideSignal=strcat("load:", FolderPath, "\\", FileName)),
+    (DeviceProcessEvents
+        | where Timestamp > ago(30d)
+        | where FileName =~ "NOVUpdate.exe"
+        | where not (FolderPath startswith @"C:\Program Files\G DATA"
+                  or FolderPath startswith @"C:\Program Files (x86)\G DATA")
+        | project DeviceId, SideTime=Timestamp, SideSignal=strcat("exec:", FolderPath, "\\", FileName));
+let Net =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where RemoteIP == "8.217.190.58"
+         or RemoteUrl has_any ("official-version.com","a2abotnet.com")
+    | project DeviceId, NetTime=Timestamp,
+              NetSignal=strcat(InitiatingProcessFileName, " -> ",
+                               coalesce(RemoteUrl, tostring(RemoteIP)));
+Drop
+| join kind=inner Side on DeviceId
+| where datetime_diff('minute', SideTime, DropTime) between (0 .. 60)
+| join kind=inner Net on DeviceId
+| where datetime_diff('minute', NetTime, SideTime) between (0 .. 60)
+| project DeviceName, DroppedFile, DropPath, DropTime,
+          SideSignal, SideTime, NetSignal, NetTime
+| sort by DropTime desc
