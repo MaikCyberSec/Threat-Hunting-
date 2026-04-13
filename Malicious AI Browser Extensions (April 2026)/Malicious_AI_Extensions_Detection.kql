@@ -46,17 +46,70 @@
 // dynamic <script src="https://attacker/"> inside a content
 // script is the #1 behavioural red flag.
 //
-// KNOWN-BAD EXTENSION IDs (Cyberhaven cluster + related)
+// KNOWN-BAD EXTENSION IDs — CONSOLIDATED IOC LIST
 // ---------------------------------------------------------------
-//   nnpnnpemnckcfdebeekibpiijlicmpom   (Cyberhaven original)
+// Cyberhaven cluster (Dec 2024, ~2.6M users):
+//   nnpnnpemnckcfdebeekibpiijlicmpom   (Cyberhaven v24.10.4)
 //   acmacodkjbdgmoleebolmdjonilkdbch   (Reader Mode)
 //   oaikpkmjciadfpddlpjjdapglcihgdle   (Internxt VPN)
 //   dpggmcodlahmljkhlmpgpdcffdaoccni   (VPNCity)
 //   cedgndijpacnfbdggppddacngjfdkaca   (ChatGPT Quick Access)
-//   fellcphjglholofndfmmjmheeivoahbc   (Search Copilot AI)
+//   fellcphjglholofndfmmjmheeivoahbc   (Search Copilot AI for Chrome)
 //   bibjgkidgpfbblifamdlkdlhgihmfohh   (Bard AI Chat)
 //   eanofdhdfbcalhflpbdipkjjkoimeeod   (Bookmark Favicon Changer)
 //   mnhffkhmpnefgklngfmlndmkimimbphc   (Castorus)
+//   bbdnohkpnbkdkmnkddobeafboooinpla   (Uvoice)
+//   pajkjnmeojmbapicmbpliphjmcekeaac   (Wayin AI)
+//   lbneaaedflankmgmfbmaplggbmjjmbae   (VidHelper — Video Downloader)
+//   ekpkdmohpdnebfedjjfklhpefgpgaaji   (Primus)
+//   jadlecleiheomelmoijnibdpopdcfaaa   (ParrotTalks)
+//   omkhlbdnhpbjjjkjbcahndppkaenmhbl   (VaultCrypto)
+//
+// GitLab Feb 2025 cluster (>=3.2M users):
+//   mdaboflcmhejfihjcbmdiebgfchigjcf   (Blipshot)
+//   gaoflciahikhligngeccdecgfjngejlh   (Emojis - Emoji Keyboard)
+//   fedimamkpgiemhacbdhkkaihgofncola   (WAToolkit)
+//   jlhgcomgldfapimdboelilfcipigkgik   (Color Changer for YouTube)
+//   jdjldbengpgdcfkljfdmakdgmfpneldd   (Video Effects for YouTube + Audio Enhancer)
+//   deljjimclpnhngmikaiiodgggdniaooh   (Themes for Chrome and YT PiP)
+//   giaoehhefkmchjbbdnahgeppblbdejmj   (Mike Adblock fur Chrome)
+//   hmooaemjmediafeacjplpbpenjnpcneg   (Page Refresh)
+//   acbiaofoeebeinacmcknopaikmecdehl   (Wistia Video Downloader)
+//   nlgphodeccebbcnkgmokeegopgpnjfkc   (Super Dark Mode)
+//   fbcgkphadgmbalmlklhbdagcicajenei   (Emoji keyboard emojis for chrome)
+//   alplpnakfeabeiebipdmaenpmbgknjce   (Adblocker for Chrome - NoAds)
+//   ogcaehilgakehloljjmajoempaflmdci   (Adblock for You)
+//   onomjaelhagjjojbkcafidnepbfkpnee   (Adblock for Chrome)
+//   bpconcjcammlapcogcnnelfmaeghhagj   (Nimble capture)
+//   gdocgbfmddcfnlnpmnghmjicjognhonm   (KProxy)
+//
+// C2 INFRASTRUCTURE (Cyberhaven + Team Axon + Feb 2025 clusters)
+// ---------------------------------------------------------------
+//   Domains:
+//     cyberhavenext.pro, api.cyberhavenext.pro
+//     chatgpt.forassistant.com, chatgptforsearch.com
+//     geminiforads.com, savegptforchrome.com
+//     openaigptforgg.site, gosiridersite.com
+//     graphqlnetwork.pro, internetdownloadmanager.pro
+//     plutonile.com, tkpartner.pro
+//     seasonaldroughtwatch.site, seasonalweatherdatapro.site
+//     seasonalweatheroutlookpro.site, seasonalweatherstatspro.site
+//     seasonalwindtracker.site
+//     blipshotextension.com, emojikeyboardextension.com
+//     watoolkit.com, colorchanger.net
+//     ytvideoeffectsextension.com, themesforytextension.com
+//     adblockforytextension.com, pagerefresh-extension.com
+//     wistiaextension.com, sdmextension.com
+//     emojikeyboardforchrome.com, noadsadblocker.com
+//     abu-xt.com, abfc-extension.com
+//     nimblecapture.com, kproxyservers.site
+//
+//   IPs:
+//     149.248.2.160, 149.28.124.84  (Cyberhaven C2)
+//     140.82.50.201, 140.82.45.42   (Axon cluster)
+//     149.28.71.39, 149.248.56.63
+//     144.202.101.155
+//
 //   (Hunt wider than this list — update from your TI feed.)
 //
 // FALSE POSITIVES
@@ -84,20 +137,45 @@
 //    the extension ID. Hunt for those folders directly.
 // ------------------------------------------------------------
 let BadIds = dynamic([
-    "nnpnnpemnckcfdebeekibpiijlicmpom",
-    "acmacodkjbdgmoleebolmdjonilkdbch",
-    "oaikpkmjciadfpddlpjjdapglcihgdle",
-    "dpggmcodlahmljkhlmpgpdcffdaoccni",
-    "cedgndijpacnfbdggppddacngjfdkaca",
-    "fellcphjglholofndfmmjmheeivoahbc",
-    "bibjgkidgpfbblifamdlkdlhgihmfohh",
-    "eanofdhdfbcalhflpbdipkjjkoimeeod",
-    "mnhffkhmpnefgklngfmlndmkimimbphc"
+    // --- Cyberhaven cluster (Dec 2024) ---
+    "nnpnnpemnckcfdebeekibpiijlicmpom",  // Cyberhaven (v24.10.4)
+    "acmacodkjbdgmoleebolmdjonilkdbch",  // Reader Mode
+    "oaikpkmjciadfpddlpjjdapglcihgdle",  // Internxt VPN
+    "dpggmcodlahmljkhlmpgpdcffdaoccni",  // VPNCity
+    "cedgndijpacnfbdggppddacngjfdkaca",  // ChatGPT Quick Access
+    "fellcphjglholofndfmmjmheeivoahbc",  // Search Copilot AI
+    "bibjgkidgpfbblifamdlkdlhgihmfohh",  // Bard AI Chat
+    "eanofdhdfbcalhflpbdipkjjkoimeeod",  // Bookmark Favicon Changer
+    "mnhffkhmpnefgklngfmlndmkimimbphc",  // Castorus
+    "bbdnohkpnbkdkmnkddobeafboooinpla",  // Uvoice
+    "pajkjnmeojmbapicmbpliphjmcekeaac",  // Wayin AI
+    "lbneaaedflankmgmfbmaplggbmjjmbae",  // VidHelper Video Downloader
+    "ekpkdmohpdnebfedjjfklhpefgpgaaji",  // Primus
+    "jadlecleiheomelmoijnibdpopdcfaaa",  // ParrotTalks
+    "omkhlbdnhpbjjjkjbcahndppkaenmhbl",  // VaultCrypto
+    // --- GitLab Feb 2025 cluster (3.2M users) ---
+    "mdaboflcmhejfihjcbmdiebgfchigjcf",  // Blipshot
+    "gaoflciahikhligngeccdecgfjngejlh",  // Emojis Keyboard
+    "fedimamkpgiemhacbdhkkaihgofncola",  // WAToolkit
+    "jlhgcomgldfapimdboelilfcipigkgik",  // Color Changer for YouTube
+    "jdjldbengpgdcfkljfdmakdgmfpneldd",  // Video Effects + Audio Enhancer
+    "deljjimclpnhngmikaiiodgggdniaooh",  // Themes for Chrome / YT PiP
+    "giaoehhefkmchjbbdnahgeppblbdejmj",  // Mike Adblock fur Chrome
+    "hmooaemjmediafeacjplpbpenjnpcneg",  // Page Refresh
+    "acbiaofoeebeinacmcknopaikmecdehl",  // Wistia Video Downloader
+    "nlgphodeccebbcnkgmokeegopgpnjfkc",  // Super Dark Mode
+    "fbcgkphadgmbalmlklhbdagcicajenei",  // Emoji keyboard emojis
+    "alplpnakfeabeiebipdmaenpmbgknjce",  // Adblocker NoAds
+    "ogcaehilgakehloljjmajoempaflmdci",  // Adblock for You
+    "onomjaelhagjjojbkcafidnepbfkpnee",  // Adblock for Chrome
+    "bpconcjcammlapcogcnnelfmaeghhagj",  // Nimble capture
+    "gdocgbfmddcfnlnpmnghmjicjognhonm"   // KProxy
 ]);
 DeviceFileEvents
 | where Timestamp > ago(90d)
 | where FolderPath has_any (BadIds)
-| project Timestamp, DeviceName, ActionType, FileName, FolderPath,
+| extend MatchedId = extract(@"Extensions\\([a-p]{32})\\", 1, FolderPath)
+| project Timestamp, DeviceName, ActionType, MatchedId, FileName, FolderPath,
           SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine
 | sort by Timestamp desc
 
@@ -204,6 +282,41 @@ DeviceNetworkEvents
         by DeviceName, InitiatingProcessFileName, Host
 | where Hits > 5
 | sort by Hits desc
+
+
+// ------------------------------------------------------------
+// 5b. KNOWN-BAD C2 DOMAINS / IPs (Cyberhaven + Axon + Feb 2025)
+// ------------------------------------------------------------
+let BadDomains = dynamic([
+    "cyberhavenext.pro","api.cyberhavenext.pro",
+    "chatgpt.forassistant.com","chatgptforsearch.com",
+    "geminiforads.com","savegptforchrome.com",
+    "openaigptforgg.site","gosiridersite.com",
+    "graphqlnetwork.pro","internetdownloadmanager.pro",
+    "plutonile.com","tkpartner.pro",
+    "seasonaldroughtwatch.site","seasonalweatherdatapro.site",
+    "seasonalweatheroutlookpro.site","seasonalweatherstatspro.site",
+    "seasonalwindtracker.site",
+    "blipshotextension.com","emojikeyboardextension.com",
+    "watoolkit.com","colorchanger.net",
+    "ytvideoeffectsextension.com","themesforytextension.com",
+    "adblockforytextension.com","pagerefresh-extension.com",
+    "wistiaextension.com","sdmextension.com",
+    "emojikeyboardforchrome.com","noadsadblocker.com",
+    "abu-xt.com","abfc-extension.com",
+    "nimblecapture.com","kproxyservers.site"
+]);
+let BadIPs = dynamic([
+    "149.248.2.160","149.28.124.84",
+    "140.82.50.201","140.82.45.42",
+    "149.28.71.39","149.248.56.63","144.202.101.155"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteUrl has_any (BadDomains) or RemoteIP in (BadIPs)
+| project Timestamp, DeviceName, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
 
 
 // ------------------------------------------------------------
