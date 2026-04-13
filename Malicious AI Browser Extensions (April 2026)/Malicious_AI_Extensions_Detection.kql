@@ -1,0 +1,345 @@
+// ============================================================
+// Malicious / Risky AI Browser Extensions — Hunting Pack
+// Source:  The Hacker News / LayerX Research (April 11, 2026)
+//          "Browser Extensions Are the New AI Consumption Channel"
+//          + Cyberhaven / 36-extension supply-chain cluster (Dec 2024)
+//          + Huntress "CrashFix" extension RAT campaign (Jan 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1176, T1539, T1555.003, T1005, T1071.001,
+//               T1059.007, T1204.002, T1074.001, T1041
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// LayerX's April 2026 study shows AI-focused browser extensions
+// have become one of the fastest-growing and least-governed
+// attack surfaces in the enterprise:
+//   * 99% of users run >= 1 extension
+//   * AI extensions are 60% more likely to carry a CVE
+//   * 3x  more likely to access cookies
+//   * 2.5x more likely to execute remote scripts
+//   * 6x  more likely to request elevated permissions
+//
+// Recent in-the-wild abuse of this surface:
+//   * Dec 2024 "Cyberhaven cluster": attackers bought or phished
+//     extension publishers, then pushed malicious updates to 36+
+//     extensions (~2.6M users) that stole cookies, OAuth tokens
+//     and Facebook/Ads session material.
+//   * Jan 2026 "CrashFix" campaign (Huntress): store-listed
+//     extension launched a fake browser-crash page that baited
+//     users into pasting `mshta`/`powershell` into Run, leading
+//     to RAT install.
+//   * Sleeper extensions: dormant for months, then flip to
+//     exfiltration via a silent manifest update.
+//
+// HIGH-PERMISSION SIGNALS TO HUNT
+// ---------------------------------------------------------------
+// Dangerous permissions in an extension manifest:
+//   "cookies"          - read auth cookies from any site
+//   "<all_urls>"       - run content scripts everywhere
+//   "webRequest" /
+//   "webRequestBlocking" - intercept + modify network traffic
+//   "tabs"             - read tab URLs / titles
+//   "storage" + "identity" + "scripting"
+//   "declarativeNetRequest" (redirect / rewrite)
+// Remote script loading via chrome.scripting.executeScript or
+// dynamic <script src="https://attacker/"> inside a content
+// script is the #1 behavioural red flag.
+//
+// KNOWN-BAD EXTENSION IDs (Cyberhaven cluster + related)
+// ---------------------------------------------------------------
+//   nnpnnpemnckcfdebeekibpiijlicmpom   (Cyberhaven original)
+//   acmacodkjbdgmoleebolmdjonilkdbch   (Reader Mode)
+//   oaikpkmjciadfpddlpjjdapglcihgdle   (Internxt VPN)
+//   dpggmcodlahmljkhlmpgpdcffdaoccni   (VPNCity)
+//   cedgndijpacnfbdggppddacngjfdkaca   (ChatGPT Quick Access)
+//   fellcphjglholofndfmmjmheeivoahbc   (Search Copilot AI)
+//   bibjgkidgpfbblifamdlkdlhgihmfohh   (Bard AI Chat)
+//   eanofdhdfbcalhflpbdipkjjkoimeeod   (Bookmark Favicon Changer)
+//   mnhffkhmpnefgklngfmlndmkimimbphc   (Castorus)
+//   (Hunt wider than this list — update from your TI feed.)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+// - Legitimate enterprise extensions (1Password, Bitwarden,
+//   Grammarly Business, Okta Verify) hold cookies/all_urls
+//   permissions. Maintain an allowlist by extension ID.
+// - DevTools / SRE tooling may load remote scripts into tabs.
+// - Browser auto-update writes to the Extensions\ folder in
+//   normal operation — pivot on sudden manifest changes or
+//   new extension IDs, not all writes.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+// - https://thehackernews.com/2026/04/browser-extensions-are-new-ai.html
+// - https://www.govinfosecurity.com/36-chrome-extensions-compromised-in-supply-chain-attack-a-27207
+// - https://www.darktrace.com/blog/cyberhaven-supply-chain-attack-exploiting-browser-extensions
+// - https://blog.hunterstrategy.net/malicious-browser-extensions-on-the-rise/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN-BAD EXTENSION IDs ON DISK (Cyberhaven cluster etc.)
+//    Chrome/Edge store extensions under a folder named after
+//    the extension ID. Hunt for those folders directly.
+// ------------------------------------------------------------
+let BadIds = dynamic([
+    "nnpnnpemnckcfdebeekibpiijlicmpom",
+    "acmacodkjbdgmoleebolmdjonilkdbch",
+    "oaikpkmjciadfpddlpjjdapglcihgdle",
+    "dpggmcodlahmljkhlmpgpdcffdaoccni",
+    "cedgndijpacnfbdggppddacngjfdkaca",
+    "fellcphjglholofndfmmjmheeivoahbc",
+    "bibjgkidgpfbblifamdlkdlhgihmfohh",
+    "eanofdhdfbcalhflpbdipkjjkoimeeod",
+    "mnhffkhmpnefgklngfmlndmkimimbphc"
+]);
+DeviceFileEvents
+| where Timestamp > ago(90d)
+| where FolderPath has_any (BadIds)
+| project Timestamp, DeviceName, ActionType, FileName, FolderPath,
+          SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. NEW EXTENSION INSTALL — manifest.json written under a
+//    Chrome/Edge/Brave Extensions folder by a non-browser parent
+//    (forced-install via admx, sideload, or dropper).
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated","FileModified")
+| where FileName =~ "manifest.json"
+| where FolderPath has_any (
+    @"\Google\Chrome\User Data\Default\Extensions\",
+    @"\Google\Chrome\User Data\Profile ",
+    @"\Microsoft\Edge\User Data\Default\Extensions\",
+    @"\Microsoft\Edge\User Data\Profile ",
+    @"\BraveSoftware\Brave-Browser\User Data\Default\Extensions\",
+    @"\Mozilla\Firefox\Profiles\"
+  )
+| where InitiatingProcessFileName !in~ (
+    "chrome.exe","msedge.exe","brave.exe","firefox.exe",
+    "GoogleUpdate.exe","MicrosoftEdgeUpdate.exe"
+  )
+| project Timestamp, DeviceName, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. FORCED-INSTALL POLICY REGISTRY — attacker planting
+//    ExtensionInstallForcelist / ExtensionSettings to silently
+//    push an extension to every user.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where RegistryKey has_any (
+    @"SOFTWARE\Policies\Google\Chrome\ExtensionInstallForcelist",
+    @"SOFTWARE\Policies\Google\Chrome\ExtensionSettings",
+    @"SOFTWARE\Policies\Microsoft\Edge\ExtensionInstallForcelist",
+    @"SOFTWARE\Policies\Microsoft\Edge\ExtensionSettings",
+    @"SOFTWARE\Policies\BraveSoftware\Brave\ExtensionInstallForcelist",
+    @"SOFTWARE\Policies\Mozilla\Firefox\Extensions"
+  )
+| where ActionType in ("RegistryValueSet","RegistryKeyCreated")
+| project Timestamp, DeviceName, ActionType, RegistryKey,
+          RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. DANGEROUS PERMISSIONS IN A NEW / UPDATED MANIFEST
+//    Reads manifest.json content for cookies / all_urls /
+//    webRequest / scripting combinations. (File-content search
+//    requires Defender XDR advanced hunting with FileProfile,
+//    or alternatively pair with DeviceFileCertificateInfo +
+//    AdditionalFields.)
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "manifest.json"
+| where FolderPath has_any (
+    @"\Chrome\User Data\", @"\Edge\User Data\",
+    @"\BraveSoftware\Brave-Browser\User Data\",
+    @"\Mozilla\Firefox\Profiles\"
+  )
+// AdditionalFields may carry snippets in some XDR schemas;
+// otherwise treat this as a pivot list for manual inspection.
+| extend ExtId = extract(@"Extensions\\([a-p]{32})\\", 1, FolderPath)
+| summarize FirstSeen=min(Timestamp), LastSeen=max(Timestamp),
+            Writers=make_set(InitiatingProcessFileName, 5),
+            Paths=make_set(FolderPath, 5)
+        by DeviceName, ExtId
+| where isnotempty(ExtId)
+| sort by LastSeen desc
+
+
+// ------------------------------------------------------------
+// 5. BROWSER PROCESS LOADING REMOTE SCRIPT INTO TAB
+//    chrome.scripting.executeScript / debugger attach or raw
+//    http(s):// script resource fetched by an extension content
+//    script. Hunt network telemetry for browser -> non-CDN JS.
+// ------------------------------------------------------------
+let KnownCDN = dynamic([
+    "googleusercontent.com","gstatic.com","googleapis.com",
+    "googlesyndication.com","google-analytics.com",
+    "microsoft.com","msedge.net","bing.com","office.net",
+    "github.io","githubusercontent.com","jsdelivr.net",
+    "cloudflare.com","cloudfront.net","unpkg.com","cdnjs.cloudflare.com"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe")
+| where RemoteUrl endswith ".js"
+    or RemoteUrl matches regex @"(?i)/[a-z0-9]{6,}\.js(\?|$)"
+| where RemoteIPType !in ("Private","Loopback","LinkLocal")
+| extend Host = tostring(split(RemoteUrl, "/")[2])
+| where not (Host has_any (KnownCDN))
+| summarize Hits = count(), Urls = make_set(RemoteUrl, 10)
+        by DeviceName, InitiatingProcessFileName, Host
+| where Hits > 5
+| sort by Hits desc
+
+
+// ------------------------------------------------------------
+// 6. EXTENSION-ADJACENT COOKIE / LOCAL STATE ACCESS
+//    Non-browser processes reading Chrome/Edge Cookies or Login
+//    Data is classic infostealer; here we also want to see the
+//    browser itself opening those files via an unusual child.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileRead","FileAccessed","FileCopied")
+| where FileName in~ ("Cookies","Cookies-journal","Login Data",
+                      "Login Data-journal","Local State","Web Data",
+                      "cookies.sqlite","logins.json","key4.db")
+| where InitiatingProcessFileName !in~ (
+    "chrome.exe","msedge.exe","brave.exe","firefox.exe",
+    "MsMpEng.exe","MpCmdRun.exe","SenseIR.exe"
+  )
+| project Timestamp, DeviceName, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. "CRASHFIX" / "CLICKFIX" LURE — extension opens a fake
+//    crash page that asks the user to paste a Run-dialog
+//    command. Catch mshta / powershell launched by explorer
+//    shortly after a browser visit.
+// ------------------------------------------------------------
+let BrowserSpawn =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where InitiatingProcessFileName in~ ("explorer.exe")
+    | where FileName in~ ("mshta.exe","powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe")
+    | where ProcessCommandLine has_any (
+        "http://","https://","FromBase64String","-enc",
+        "IEX","Invoke-Expression","DownloadString","hidden","bypass"
+      )
+    | project DeviceId, DeviceName, SpawnTime=Timestamp,
+              SpawnFile=FileName, SpawnCmd=ProcessCommandLine;
+let BrowserVisit =
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe")
+    | project DeviceId, VisitTime=Timestamp, RemoteUrl;
+BrowserSpawn
+| join kind=inner BrowserVisit on DeviceId
+| where datetime_diff('minute', SpawnTime, VisitTime) between (0 .. 10)
+| project DeviceName, VisitTime, RemoteUrl, SpawnTime, SpawnFile, SpawnCmd
+| sort by SpawnTime desc
+
+
+// ------------------------------------------------------------
+// 8. NEW EXTENSION + OUTBOUND TO NEW HOST WITHIN 1 HOUR
+//    Behavioural detection for sleeper activation and freshly
+//    installed malicious extensions.
+// ------------------------------------------------------------
+let NewExt =
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where ActionType == "FileCreated"
+    | where FileName =~ "manifest.json"
+    | where FolderPath has_any (
+        @"\Chrome\User Data\", @"\Edge\User Data\",
+        @"\BraveSoftware\Brave-Browser\User Data\",
+        @"\Mozilla\Firefox\Profiles\"
+      )
+    | extend ExtId = extract(@"Extensions\\([a-p]{32})\\", 1, FolderPath)
+    | project DeviceId, DeviceName, ExtTime=Timestamp, ExtId, ExtPath=FolderPath;
+let BrowserNet =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe")
+    | where RemoteIPType !in ("Private","Loopback","LinkLocal")
+    | summarize FirstSeen = min(Timestamp) by DeviceId, RemoteUrl, RemoteIP;
+NewExt
+| join kind=inner BrowserNet on DeviceId
+| where datetime_diff('minute', FirstSeen, ExtTime) between (0 .. 60)
+| project DeviceName, ExtId, ExtPath, ExtTime, RemoteUrl, RemoteIP, FirstSeen
+| sort by ExtTime desc
+
+
+// ------------------------------------------------------------
+// 9. EXTENSION-DRIVEN DATA EXFIL — burst of POST traffic from
+//    browser after a specific extension was installed/updated.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe")
+| where RemoteIPType !in ("Private","Loopback","LinkLocal")
+| summarize Posts = count(),
+            Destinations = dcount(RemoteIP),
+            Hosts = make_set(tostring(split(RemoteUrl,"/")[2]), 25)
+        by DeviceName, InitiatingProcessFileName, bin(Timestamp, 10m)
+| where Posts > 250 and Destinations < 5
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Same host within 2 hours:
+//       (a) new extension manifest written OR known-bad ID on disk
+//       (b) browser loads remote script from non-CDN host
+//       (c) browser or explorer spawns a LOLBin / scripting host
+// ------------------------------------------------------------
+let Install =
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("FileCreated","FileModified")
+    | where FileName =~ "manifest.json"
+    | where FolderPath has_any (
+        @"\Chrome\User Data\", @"\Edge\User Data\",
+        @"\BraveSoftware\Brave-Browser\User Data\",
+        @"\Mozilla\Firefox\Profiles\"
+      )
+    | extend ExtId = extract(@"Extensions\\([a-p]{32})\\", 1, FolderPath)
+    | project DeviceId, DeviceName, InstallTime=Timestamp, ExtId;
+let Remote =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe")
+    | where RemoteUrl endswith ".js"
+    | extend Host = tostring(split(RemoteUrl,"/")[2])
+    | where Host !has_any ("google","microsoft","bing","github","cloudflare","jsdelivr","unpkg")
+    | project DeviceId, RemoteTime=Timestamp, RemoteUrl, RemoteIP;
+let Exec =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe","explorer.exe")
+    | where FileName in~ ("powershell.exe","pwsh.exe","cmd.exe","mshta.exe","rundll32.exe","regsvr32.exe","wscript.exe","cscript.exe")
+    | project DeviceId, ExecTime=Timestamp, ExecFile=FileName, ExecCmd=ProcessCommandLine;
+Install
+| join kind=inner Remote on DeviceId
+| where datetime_diff('minute', RemoteTime, InstallTime) between (0 .. 120)
+| join kind=inner Exec on DeviceId
+| where datetime_diff('minute', ExecTime, RemoteTime) between (0 .. 120)
+| project DeviceName, ExtId, InstallTime, RemoteUrl, RemoteIP, RemoteTime, ExecFile, ExecCmd, ExecTime
+| sort by InstallTime desc
