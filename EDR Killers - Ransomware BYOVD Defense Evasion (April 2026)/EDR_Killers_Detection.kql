@@ -1,0 +1,325 @@
+// ============================================================
+// EDR Killers — Ransomware BYOVD Defense Evasion Hunting
+// Source: ESET Research / CyberSecurity News (April 2026)
+//         https://cybersecuritynews.com/ransomware-gangs-expand-use-of-edr-killers/
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1562.001, T1068, T1543.003, T1014, T1070.004,
+//               T1489, T1218, T1036.005
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// EDR killers are purpose-built tools used by ransomware operators
+// in the pre-encryption phase to disable, unhook, or terminate
+// endpoint security products (Defender, CrowdStrike, SentinelOne,
+// Sophos, Trellix, Carbon Black, Cylance, etc.). ESET reports
+// their usage has gone from a niche capability to a standard
+// component of modern intrusions.
+//
+// The dominant technique is BYOVD (Bring Your Own Vulnerable
+// Driver): the attacker drops a legitimately-signed but
+// vulnerable kernel driver, loads it as a service, and then
+// abuses its IOCTLs to kill protected security processes from
+// kernel space — bypassing user-mode PPL protections.
+//
+// KNOWN EDR KILLERS
+// ---------------------------------------------------------------
+//   EDRKillShifter        (RansomHub / affiliates)
+//   AvNeutralizer / AuKill (FIN7 — sold to multiple gangs)
+//   Terminator / Spyboy   (public/commoditized)
+//   HRSword abuse         (BlackCat/ALPHV)
+//   GhostDriver / Poortry (LockBit, BlackCat, Cuba)
+//   KillAV / Backstab     (LockBit affiliates)
+//   RealBlindingEDR       (open-source, widely reused)
+//
+// COMMON VULNERABLE DRIVERS (BYOVD indicators)
+// ---------------------------------------------------------------
+//   rtcore64.sys           - MSI Afterburner (CVE-2019-16098)
+//   gdrv.sys               - Gigabyte
+//   zam64.sys / zamguard64 - Zemana AntiMalware
+//   procexp152.sys         - Sysinternals (abused)
+//   truesight.sys          - Adlice RogueKiller
+//   aswarpot.sys           - Avast Anti-Rootkit
+//   mhyprot2.sys           - Genshin Impact anti-cheat
+//   viragt64.sys / viragt  - Vir.IT eXplorer
+//   dbutil_2_3.sys         - Dell (CVE-2021-21551)
+//   PROCEXP152.sys         - masqueraded variants
+//   daxin.sys, kprocesshacker.sys, gmer.sys
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+// - Legitimate installs of MSI Afterburner, Gigabyte utilities,
+//   Process Explorer, Avast, Dell BIOS tools may drop these
+//   drivers. Validate ImageLoadedFromPath + signer + parent proc.
+// - AV/EDR vendors may themselves load some listed drivers during
+//   remediation. Correlate with Defender/service-stop events.
+// - Admin troubleshooting with Sysinternals can trigger rule #4.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+// - https://cybersecuritynews.com/ransomware-gangs-expand-use-of-edr-killers/
+// - https://www.loldrivers.io/
+// - https://www.welivesecurity.com/en/eset-research/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. VULNERABLE DRIVER LOAD — BYOVD Core Signal
+//    Detects kernel load of drivers commonly abused by EDR
+//    killers. Tune exclusions for legitimate vendor tooling.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(30d)
+| where FileName has_any (
+    "rtcore64.sys", "gdrv.sys", "zam64.sys", "zamguard64.sys",
+    "procexp152.sys", "truesight.sys", "aswarpot.sys",
+    "mhyprot2.sys", "mhyprot3.sys", "viragt64.sys", "viragt.sys",
+    "dbutil_2_3.sys", "dbutildrv2.sys", "daxin.sys",
+    "kprocesshacker.sys", "gmer.sys", "iqvw64.sys", "nlrbwhbu.sys",
+    "ene.sys", "wnbios.sys", "winring0x64.sys", "speedfan.sys",
+    "asrdrv101.sys", "asrdrv102.sys", "asrdrv103.sys",
+    "glckio2.sys", "stdcdrv64.sys", "pcdsrvc_x64.pkms"
+  )
+| extend DriverPath = FolderPath
+| project Timestamp, DeviceName, DeviceId, FileName, SHA256,
+          DriverPath, InitiatingProcessFileName,
+          InitiatingProcessAccountName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DRIVER DROPPED TO USER-WRITABLE PATH
+//    Legit drivers ship via MSI/EXE to Program Files or
+//    System32\drivers. A .sys written to %TEMP%, %PUBLIC%,
+//    %APPDATA%, or ProgramData is highly suspicious.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileModified")
+| where FileName endswith ".sys"
+| where FolderPath has_any (
+    @"\Users\Public\",
+    @"\AppData\Local\Temp\",
+    @"\AppData\Roaming\",
+    @"\ProgramData\",
+    @"\Windows\Temp\",
+    @"\PerfLogs\",
+    @"\Downloads\"
+  )
+| project Timestamp, DeviceName, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. KERNEL SERVICE CREATION FOR UNSIGNED / NON-STANDARD DRIVER
+//    EDR killers install the vulnerable driver as a kernel
+//    service (sc.exe create / CreateServiceW). Watch for
+//    driver service creation from unusual parents.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "sc.exe"
+| where ProcessCommandLine has_all ("create", "type=")
+    and ProcessCommandLine has_any ("kernel", "type= kernel", "type=kernel")
+| extend ServiceName = extract(@"create\s+([\w\-]+)", 1, ProcessCommandLine)
+| project Timestamp, DeviceName, AccountName, ServiceName,
+          ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessParentFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. KNOWN EDR KILLER BINARY NAMES / HASH PATTERNS
+//    Static names observed across EDRKillShifter, AuKill,
+//    Terminator, Backstab, RealBlindingEDR builds.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any (
+    "edrkillshifter", "aukill", "terminator", "zemana",
+    "backstab", "realblindingedr", "kaspersky_killer",
+    "defendernot", "defenderoff", "killav", "av-killer",
+    "ghostdriver", "poortry", "stonestop", "edrsandblast",
+    "processhacker.exe", "pchunter", "gmer.exe"
+  )
+    or ProcessCommandLine has_any (
+        "EDRKillShifter", "AvNeutralizer", "Terminator.exe",
+        "--kill-defender", "-disableAV", "RealBlindingEDR"
+    )
+| project Timestamp, DeviceName, AccountName, FileName, SHA256,
+          ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessParentFileName, FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. DEFENDER / EDR SERVICE TAMPERING
+//    Direct attempts to stop, disable, or uninstall the local
+//    EDR — often immediately before ransomware detonation.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where (FileName in~ ("sc.exe","net.exe","powershell.exe","pwsh.exe","cmd.exe","taskkill.exe","wmic.exe"))
+| where ProcessCommandLine has_any (
+    "Set-MpPreference -DisableRealtimeMonitoring",
+    "Set-MpPreference -DisableBehaviorMonitoring",
+    "Set-MpPreference -DisableIOAVProtection",
+    "Add-MpPreference -ExclusionPath",
+    "Uninstall-WindowsFeature Windows-Defender",
+    "stop WinDefend", "delete WinDefend",
+    "stop Sense", "delete Sense",
+    "stop SentinelAgent", "stop CSFalconService",
+    "stop SophosAgent", "stop TrellixEndpoint",
+    "MsMpEng", "MpCmdRun.exe -RemoveDefinitions",
+    "sc config WinDefend start= disabled",
+    "sc config Sense start= disabled"
+  )
+| project Timestamp, DeviceName, AccountName, FileName,
+          ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessParentFileName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. MASS SECURITY PROCESS TERMINATION BURST
+//    EDR killers typically kill many security processes in a
+//    short window. >= 3 distinct sec processes killed on one
+//    host within 5 minutes is a strong signal.
+// ------------------------------------------------------------
+let SecProcs = dynamic([
+    "MsMpEng.exe","SenseIR.exe","SenseNdr.exe","MsSense.exe",
+    "SenseCnCProxy.exe","MpCmdRun.exe","NisSrv.exe",
+    "CSFalconService.exe","CSAgent.sys","SentinelAgent.exe",
+    "SentinelServiceHost.exe","elastic-agent.exe","HealthService.exe",
+    "ccSvcHst.exe","SAVService.exe","SophosFS.exe","SophosHealth.exe",
+    "mfeesp.exe","mcshield.exe","TrellixEndpointAgent.exe",
+    "cb.exe","CarbonBlack.exe","cyserver.exe","CylanceSvc.exe",
+    "ekrn.exe","egui.exe"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ProcessCreated"
+| where FileName in~ ("taskkill.exe","wmic.exe","powershell.exe","pwsh.exe","cmd.exe")
+| where ProcessCommandLine has_any (SecProcs)
+| extend KilledProc = extract(@"(?i)(MsMpEng|SenseIR|SenseNdr|MsSense|SentinelAgent|CSFalcon|SophosFS|mcshield|Trellix|CarbonBlack|CylanceSvc|ekrn|egui|NisSrv|MpCmdRun)\.exe", 1, ProcessCommandLine)
+| summarize KillCount = dcount(KilledProc),
+            Procs = make_set(KilledProc, 10),
+            Cmds = make_set(ProcessCommandLine, 10)
+        by DeviceName, AccountName, bin(Timestamp, 5m)
+| where KillCount >= 3
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. SUSPICIOUS DRIVER SIGNER / UNSIGNED KERNEL LOAD
+//    Any .sys loading where signer is empty or self-signed
+//    and path is outside System32\drivers\.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(14d)
+| where FileName endswith ".sys"
+| where FolderPath !startswith @"C:\Windows\System32\drivers\"
+    and FolderPath !startswith @"C:\Windows\System32\DriverStore\"
+| project Timestamp, DeviceName, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. REGISTRY-BASED DEFENDER TAMPERING
+//    DisableAntiSpyware / DisableRealtimeMonitoring flips in
+//    HKLM\SOFTWARE\Policies\Microsoft\Windows Defender.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(14d)
+| where RegistryKey has_any (
+    @"SOFTWARE\Policies\Microsoft\Windows Defender",
+    @"SOFTWARE\Microsoft\Windows Defender\Real-Time Protection",
+    @"SYSTEM\CurrentControlSet\Services\WinDefend",
+    @"SYSTEM\CurrentControlSet\Services\Sense",
+    @"SYSTEM\CurrentControlSet\Services\SentinelAgent",
+    @"SYSTEM\CurrentControlSet\Services\CSAgent"
+  )
+| where (RegistryValueName has_any (
+      "DisableAntiSpyware","DisableRealtimeMonitoring",
+      "DisableBehaviorMonitoring","DisableIOAVProtection",
+      "DisableScanOnRealtimeEnable","TamperProtection","Start"
+    ))
+| project Timestamp, DeviceName, ActionType, RegistryKey,
+          RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    Same host within 1 hour:
+//      (a) vulnerable driver dropped OR loaded
+//      (b) kernel service created
+//      (c) security process killed or Defender tampered
+// ------------------------------------------------------------
+let window = 1h;
+let Drivers =
+    DeviceImageLoadEvents
+    | where Timestamp > ago(30d)
+    | where FileName has_any (
+        "rtcore64.sys","gdrv.sys","zam64.sys","procexp152.sys",
+        "truesight.sys","aswarpot.sys","mhyprot2.sys","dbutil_2_3.sys",
+        "viragt64.sys","daxin.sys","kprocesshacker.sys","gmer.sys"
+      )
+    | project DeviceId, DeviceName, DriverTime=Timestamp, Driver=FileName;
+let Services =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName =~ "sc.exe"
+      and ProcessCommandLine has "create"
+      and ProcessCommandLine has "kernel"
+    | project DeviceId, SvcTime=Timestamp, SvcCmd=ProcessCommandLine;
+let Kills =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has_any (
+        "MsMpEng","Sense","SentinelAgent","CSFalcon","Sophos",
+        "Trellix","CarbonBlack","CylanceSvc","MpCmdRun -RemoveDefinitions",
+        "DisableRealtimeMonitoring","stop WinDefend","delete WinDefend"
+      )
+    | project DeviceId, KillTime=Timestamp, KillCmd=ProcessCommandLine;
+Drivers
+| join kind=inner Services on DeviceId
+| where abs(datetime_diff('minute', SvcTime, DriverTime)) <= 60
+| join kind=inner Kills on DeviceId
+| where abs(datetime_diff('minute', KillTime, DriverTime)) <= 60
+| project DeviceName, Driver, DriverTime, SvcCmd, SvcTime, KillCmd, KillTime
+| sort by DriverTime desc
+
+
+// ------------------------------------------------------------
+// 10. HASH-FREE BEHAVIOURAL CATCH-ALL
+//     Any process that (1) is unsigned or signed by a fresh cert,
+//     (2) opens a handle to a .sys in its own directory,
+//     (3) then calls sc.exe create — in 60s.
+// ------------------------------------------------------------
+let LoaderBins =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where (ProcessVersionInfoCompanyName == "" or isempty(ProcessVersionInfoCompanyName))
+      and FolderPath has_any (@"\Temp\", @"\Users\Public\", @"\ProgramData\", @"\AppData\")
+    | project DeviceId, DeviceName, LoaderTime=Timestamp,
+              LoaderPath=FolderPath, LoaderFile=FileName,
+              LoaderPid=ProcessId;
+let SvcCreate =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where InitiatingProcessFileName =~ "sc.exe"
+       or (FileName =~ "sc.exe" and ProcessCommandLine has "create")
+    | project DeviceId, SvcTime=Timestamp, SvcCmd=ProcessCommandLine,
+              SvcParent=InitiatingProcessParentFileName;
+LoaderBins
+| join kind=inner SvcCreate on DeviceId
+| where datetime_diff('second', SvcTime, LoaderTime) between (0 .. 60)
+| project DeviceName, LoaderFile, LoaderPath, LoaderTime, SvcCmd, SvcTime, SvcParent
+| sort by LoaderTime desc

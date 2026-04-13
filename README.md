@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **April 2026**
+- `EDR Killers - Ransomware BYOVD Defense Evasion` — ESET reports EDR killers have become a standard component of modern ransomware intrusions (EDRKillShifter, AvNeutralizer/AuKill, Terminator, RealBlindingEDR, GhostDriver/Poortry). Attackers drop legitimately-signed but vulnerable kernel drivers (rtcore64.sys, gdrv.sys, truesight.sys, dbutil_2_3.sys, mhyprot2.sys, procexp152.sys) and abuse their IOCTLs to kill protected security processes from kernel space. 10 queries covering vulnerable driver loads, driver drops to user-writable paths, kernel service creation, known EDR-killer binaries, Defender/EDR tampering, mass security-process termination, unsigned kernel loads, registry-based tampering, full kill-chain correlation, and a hash-free behavioural catch-all.
 - `Cookie Theft & Session Hijacking` — With Google rolling out Device Bound Session Credentials (DBSC) in Chrome 146 to combat cookie theft, this detection hunts for the attacker side of session hijacking. Targets infostealers (Lumma, RedLine, Raccoon, Vidar, AMOS) reading browser credential stores, Local State encryption keys, DPAPI master keys, and cookie databases. 12 queries covering non-browser credential access, encryption key extraction, DPAPI abuse, staging/archiving, SQLite direct queries, multi-browser-vendor correlation, Entra ID token replay, impossible travel, C2 exfiltration, and full kill-chain correlation.
 - `ClickFix macOS Script Editor` — New ClickFix social-engineering campaign bypassing Terminal entirely by abusing macOS Script Editor (osascript) to deliver Atomic Stealer (AMOS). Victims lured via fake CAPTCHAs and browser error dialogs. Steals Keychain credentials, browser passwords, cookies, crypto wallets, and session tokens. 12 queries covering browser-to-osascript execution, encoded payloads, curl-pipe-to-shell delivery, Keychain harvesting, browser credential theft, crypto wallet access, LaunchAgent persistence, Gatekeeper bypass, DMG execution chains, C2 exfiltration, and full kill-chain correlation.
 - `Adobe Reader 0-Day PDF Exploit` — Active zero-day (CVE-2026-27220) discovered by EXPMON on March 26. Malicious PDF abuses JavaScript APIs (util.readFileIntoStream, RSS.addFeed) to steal local files and fingerprint systems. No user interaction beyond opening the PDF. C2: 169.40.2.68:45191. 12 queries covering C2 communication, vulnerable version detection, suspicious child processes, file read anomalies, and multi-signal correlation.
@@ -98,7 +99,7 @@ All queries are built for:
  │ Collection         │ T1005  T1560.001                                      │
  │ Exfiltration       │ T1041                                                 │
  │ C2                 │ T1071.001  T1105                                      │
- │ Impact             │ T1486                                                 │
+ │ Impact             │ T1486  T1489                                          │
  └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -122,6 +123,7 @@ All queries are built for:
 ```
 Threat-Hunting-/
 ├── README.md
+├── EDR Killers - Ransomware BYOVD Defense Evasion (April 2026)
 ├── Cookie Theft & Session Hijacking - Infostealer Browser Credential Hunting (April 2026)
 ├── ClickFix macOS Script Editor - Atomic Stealer Delivery (April 2026)
 ├── Adobe Reader 0-Day PDF Exploit - Data Theft & System Fingerprinting (CVE-2026-27220)
