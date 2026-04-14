@@ -48,10 +48,10 @@ All queries are built for:
 - `EvilTokens & AMOS Stealer` — Dual campaign: OAuth Device Code phishing hijacking enterprise M365 accounts (180+ phishing URLs/week), and AMOS macOS stealer targeting AI developers via ClickFix lures. 12 queries covering OAuth anomalies, C2 domains, behavioral patterns, persistence, credential harvesting, and multi-signal correlation.
 
 **March 2026**
-- `PureLog Stealer` — Copyright-themed lure campaign delivering fileless .NET stealer via renamed Python interpreter, AMSI bypass, and registry persistence.
-- `MuddyWater` — Iranian APT targeting government and telecom sectors.
-- `FoxKitsune` — Espionage-focused malware with sophisticated C2 communication.
-- `Authentication Bypass` — API key abuse in Better Auth plugin.
+- `PureLog Stealer - Copyright Lure Fileless .NET Campaign` — Copyright-themed lure campaign delivering fileless .NET stealer via renamed Python interpreter, AMSI bypass, and registry persistence.
+- `MuddyWater - MENA Phishing-to-Backdoor Campaign` — Iranian APT targeting government and telecom sectors via spear-phishing with malicious Office documents, staged payload delivery, and long-term persistence.
+- `FoxKitsune - Cloud-Staged Malware Loader` — Malware loader leveraging trusted cloud infrastructure (Cloudflare Pages, Netlify, Discord) for payload staging, in-memory execution, process masquerading, and Defender tampering.
+- `Authentication Bypass - API Key Abuse Better Auth Plugin` — API key abuse vulnerability in Better Auth plugin enabling authentication bypass, account impersonation, and privilege escalation.
 
 ---
 
@@ -127,20 +127,35 @@ All queries are built for:
 ```
 Threat-Hunting-/
 ├── README.md
-├── Fake Proxifier ClipBanker - GitHub Supply Chain (April 2026)
-├── Malicious AI Browser Extensions (April 2026)
-├── Fake AI Installer PlugX Campaign (April 2026)
-├── Adobe Acrobat Reader Prototype Pollution RCE (CVE-2026-34621)
-├── EDR Killers - Ransomware BYOVD Defense Evasion (April 2026)
-├── Cookie Theft & Session Hijacking - Infostealer Browser Credential Hunting (April 2026)
-├── ClickFix macOS Script Editor - Atomic Stealer Delivery (April 2026)
-├── Adobe Reader 0-Day PDF Exploit - Data Theft & System Fingerprinting (CVE-2026-27220)
-├── ChipSoft HiX EHR - Supply Chain Ransomware Detection (CVE-2026-4404)
-├── EvilTokens & AMOS Stealer - OAuth Hijacking & macOS Credential Theft (March 2026)
-├── PureLog Stealer
-├── FoxKitsune Malware Activity Detection
-├── MuddyWater
-└── Authentication Bypass via API Key Abuse (Better Auth Plugin)
+│
+├── Fake Proxifier ClipBanker - GitHub Supply Chain (April 2026)/
+│   └── ClipBanker_Proxifier_Detection.kql
+├── Malicious AI Browser Extensions (April 2026)/
+│   └── Malicious_AI_Extensions_Detection.kql
+├── Fake AI Installer PlugX Campaign (April 2026)/
+│   └── FakeAI_PlugX_Detection.kql
+├── Adobe Acrobat Reader Prototype Pollution RCE (CVE-2026-34621)/
+│   └── CVE-2026-34621_Detection.kql
+├── EDR Killers - Ransomware BYOVD Defense Evasion (April 2026)/
+│   └── EDR_Killers_Detection.kql
+├── Cookie Theft & Session Hijacking - Infostealer Browser Credential Hunting (April 2026)/
+│   └── Cookie_Theft_Session_Hijacking_Detection.kql
+├── ClickFix macOS Script Editor - Atomic Stealer Delivery (April 2026)/
+│   └── ClickFix_AtomicStealer_Detection.kql
+├── Adobe Reader 0-Day PDF Exploit - Data Theft & System Fingerprinting (CVE-2026-27220)/
+│   └── CVE-2026-27220_Detection.kql
+├── ChipSoft HiX EHR - Supply Chain Ransomware Detection (CVE-2026-4404)/
+│   └── CVE-2026-4404_Detection.kql
+├── EvilTokens & AMOS Stealer - OAuth Hijacking & macOS Credential Theft (March 2026)/
+│   └── EvilTokens_AMOS_Detection.kql
+├── PureLog Stealer - Copyright Lure Fileless .NET Campaign (March 2026)/
+│   └── PureLog_Stealer_Detection.kql
+├── FoxKitsune - Cloud-Staged Malware Loader (March 2026)/
+│   └── FoxKitsune_Detection.md
+├── MuddyWater - MENA Phishing-to-Backdoor Campaign (March 2026)/
+│   └── MuddyWater_Detection.md
+└── Authentication Bypass - API Key Abuse Better Auth Plugin (March 2026)/
+    └── BetterAuth_Detection.md
 ```
 
 Each detection file is self-contained with:
