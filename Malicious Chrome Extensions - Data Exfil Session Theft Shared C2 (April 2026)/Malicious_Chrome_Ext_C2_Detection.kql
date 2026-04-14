@@ -1,0 +1,380 @@
+// ============================================================
+// 108 Malicious Chrome Extensions — Data Exfiltration,
+// Session Theft & Shared C2 Infrastructure
+// Source:  Socket Threat Research (April 2026)
+//         "108 Chrome Extensions Linked to Data Exfil,
+//          Session Theft & Shared C2"
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1176, T1539, T1528, T1005, T1041, T1071.001,
+//               T1059.007, T1185, T1557, T1074.001
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Socket's Threat Research Team identified 108 malicious Chrome
+// extensions (~20,000 installs) published under five front
+// identities: Yana Project, GameGen, SideGames, Rodeo Games,
+// and InterAlt.
+//
+//   * 54 extensions harvested Google account identities via
+//     OAuth2 (chrome.identity.getAuthToken), transmitting email,
+//     name, profile picture, and subject ID to C2.
+//   * A "Telegram Multi-account" extension stole user_auth
+//     tokens from localStorage every 15 seconds, enabling full
+//     Telegram Web session hijack (and reverse session injection).
+//   * 45 extensions had a universal backdoor opening arbitrary
+//     URLs at browser startup via chrome.tabs.create.
+//   * 78 extensions contained content injection via unsanitized
+//     innerHTML assignments, enabling arbitrary script execution.
+//   * Two extensions stripped YouTube security headers using the
+//     declarativeNetRequest API; one targeted TikTok.
+//
+// All activity routed through a single primary C2 server at
+// 144.126.135.238 (Contabo GmbH VPS). Main domain:
+// cloudapi[.]stream (registered April 2022, Hosting Ukraine LLC)
+// with subdomains serving specific functions:
+//   - tg.cloudapi[.]stream         (Telegram exfil)
+//   - mines.cloudapi[.]stream      (identity theft / C2 beacon)
+//   - topup.cloudapi[.]stream      (payment portal)
+//   - multiaccount.cloudapi[.]stream (ad injection)
+// Backend: Strapi CMS on port 1337 with PostgreSQL.
+//
+// ATTRIBUTION INDICATORS
+// ---------------------------------------------------------------
+// - Russian-language comments in authentication code
+// - Emails: kiev3381917@gmail[.]com, nadejdin/nadiezhdin variants
+// - Google Cloud project numbers: 1096126762051, 170835003632
+//   shared across dozens of OAuth2 client IDs
+// - Reused privacy policy HTML with copy-paste artifacts
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+// - Legitimate enterprise extensions with identity/cookies perms
+//   (1Password, Bitwarden, Grammarly, Okta Verify)
+// - Browser sync / auto-update writing to Extensions\ folder
+// - Maintain an allowlist by extension ID for your environment
+// - DevTools extensions may contact non-CDN hosts
+//
+// REFERENCES
+// ---------------------------------------------------------------
+// - https://socket.dev/blog/108-chrome-ext-linked-to-data-exfil-session-theft-shared-c2
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN C2 INFRASTRUCTURE — DOMAIN & IP BEACON DETECTION
+//    Detects any outbound connection to the cloudapi[.]stream
+//    C2 domain or the primary C2 IP 144.126.135.238 (Contabo).
+// ------------------------------------------------------------
+let C2Domains = dynamic([
+    "cloudapi.stream",
+    "tg.cloudapi.stream",
+    "mines.cloudapi.stream",
+    "topup.cloudapi.stream",
+    "multiaccount.cloudapi.stream"
+]);
+let C2IPs = dynamic([
+    "144.126.135.238"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (C2Domains) or RemoteIP in (C2IPs)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. STRAPI CMS BACKEND PORT 1337 — C2 MANAGEMENT ACCESS
+//    The campaign's C2 backend runs Strapi on port 1337.
+//    Any outbound connection to this port from a browser or
+//    extension process is highly suspicious.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemotePort == 1337
+| where InitiatingProcessFileName in~ (
+    "chrome.exe", "msedge.exe", "brave.exe", "firefox.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. OAUTH2 TOKEN HARVESTING — chrome.identity.getAuthToken
+//    Detects browser processes making OAuth2 token requests to
+//    Google accounts API. Malicious extensions abuse this to
+//    silently harvest Google identity data.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ (
+    "chrome.exe", "msedge.exe", "brave.exe"
+)
+| where RemoteUrl has_any (
+    "accounts.google.com/o/oauth2/token",
+    "oauth2.googleapis.com/token",
+    "www.googleapis.com/oauth2/v1/userinfo",
+    "www.googleapis.com/oauth2/v3/userinfo",
+    "people.googleapis.com/v1/people/me"
+)
+| summarize TokenRequests = count(),
+            DistinctEndpoints = dcount(RemoteUrl),
+            Endpoints = make_set(RemoteUrl, 10)
+        by DeviceName, AccountName,
+           InitiatingProcessFileName, bin(Timestamp, 1h)
+| where TokenRequests > 20
+| sort by TokenRequests desc
+
+
+// ------------------------------------------------------------
+// 4. TELEGRAM WEB SESSION THEFT — localStorage EXFILTRATION
+//    Detects browser connections to known Telegram session
+//    theft C2 endpoints, or rapid repeated access patterns
+//    consistent with the 15-second polling interval.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ (
+    "chrome.exe", "msedge.exe", "brave.exe"
+)
+| where RemoteUrl has "tg.cloudapi.stream"
+    or (RemoteUrl has "user_auth" and RemoteUrl has_any ("telegram", "web.telegram"))
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. HIGH-FREQUENCY BEACON PATTERN — 15-SECOND POLLING
+//    The Telegram stealer extension polls every 15 seconds.
+//    Detect any browser process making rapid-fire connections
+//    to the same non-CDN host (>200 per hour).
+// ------------------------------------------------------------
+let KnownCDN = dynamic([
+    "googleapis.com", "gstatic.com", "google.com",
+    "googleusercontent.com", "microsoft.com", "msedge.net",
+    "bing.com", "office.net", "cloudflare.com",
+    "cloudfront.net", "jsdelivr.net", "unpkg.com",
+    "github.com", "githubusercontent.com"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ (
+    "chrome.exe", "msedge.exe", "brave.exe", "firefox.exe"
+)
+| where RemoteIPType !in ("Private", "Loopback", "LinkLocal")
+| extend Host = tostring(split(RemoteUrl, "/")[2])
+| where not (Host has_any (KnownCDN))
+| where isnotempty(Host)
+| summarize Hits = count(),
+            FirstSeen = min(Timestamp),
+            LastSeen = max(Timestamp)
+        by DeviceName, Host, bin(Timestamp, 1h)
+| where Hits > 200
+| extend AvgIntervalSeconds = 3600.0 / Hits
+| where AvgIntervalSeconds between (10 .. 20)
+| project DeviceName, Host, Hits, AvgIntervalSeconds,
+          FirstSeen, LastSeen
+| sort by Hits desc
+
+
+// ------------------------------------------------------------
+// 6. BROWSER STARTUP URL INJECTION — chrome.tabs.create ABUSE
+//    45 extensions opened arbitrary URLs at browser startup.
+//    Detect browser launching and immediately connecting to
+//    suspicious non-CDN hosts within the first 30 seconds.
+// ------------------------------------------------------------
+let BrowserStart =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ ("chrome.exe", "msedge.exe", "brave.exe")
+    | where InitiatingProcessFileName in~ (
+        "explorer.exe", "userinit.exe", "sihost.exe", "svchost.exe"
+    )
+    | project DeviceId, DeviceName, StartTime = Timestamp;
+let EarlyConnect =
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where InitiatingProcessFileName in~ (
+        "chrome.exe", "msedge.exe", "brave.exe"
+    )
+    | where RemoteIPType !in ("Private", "Loopback", "LinkLocal")
+    | extend Host = tostring(split(RemoteUrl, "/")[2])
+    | where not (Host has_any (
+        "google", "microsoft", "bing", "mozilla",
+        "cloudflare", "gstatic", "googleapis"
+    ))
+    | project DeviceId, ConnectTime = Timestamp, RemoteUrl, RemoteIP;
+BrowserStart
+| join kind=inner EarlyConnect on DeviceId
+| where datetime_diff('second', ConnectTime, StartTime) between (0 .. 30)
+| project DeviceName, StartTime, ConnectTime, RemoteUrl, RemoteIP
+| sort by StartTime desc
+
+
+// ------------------------------------------------------------
+// 7. DECLARATIVENETREQUEST SECURITY HEADER STRIPPING
+//    Two extensions used declarativeNetRequest to strip
+//    YouTube/TikTok security headers. Hunt for registry or file
+//    artifacts indicating declarativeNetRequest rules targeting
+//    video platform domains.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ (
+    "chrome.exe", "msedge.exe", "brave.exe"
+)
+| where RemoteUrl has_any (
+    "youtube.com", "tiktok.com", "googlevideo.com"
+)
+| summarize Requests = count(),
+            DistinctIPs = dcount(RemoteIP)
+        by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+| where Requests > 500 and DistinctIPs > 10
+| sort by Requests desc
+
+
+// ------------------------------------------------------------
+// 8. IDENTITY DATA EXFILTRATION — POST TO /user_info ENDPOINT
+//    Malicious extensions POST harvested identity data to a
+//    /user_info endpoint with the extension ID as identifier.
+//    Hunt for this exact exfil pattern.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ (
+    "chrome.exe", "msedge.exe", "brave.exe"
+)
+| where RemoteUrl has "/user_info"
+| where RemoteUrl !has_any (
+    "google.com", "microsoft.com", "facebook.com",
+    "apple.com", "github.com", "linkedin.com"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. KNOWN THREAT ACTOR EMAIL / PROJECT ARTIFACTS
+//    Hunt for Google Cloud project numbers and known email
+//    artifacts associated with this campaign appearing in
+//    browser traffic or file content.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (
+    "1096126762051", "170835003632",
+    "kiev3381917", "nadejdin", "nadiezhdin"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. EXTENSION MANIFEST WRITES — BULK INSTALL DETECTION
+//     This campaign uses five front identities pushing many
+//     extensions. Detect a device receiving multiple new
+//     extension installs in a short window (>3 in 1 hour).
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified")
+| where FileName =~ "manifest.json"
+| where FolderPath has_any (
+    @"\Chrome\User Data\Default\Extensions\",
+    @"\Chrome\User Data\Profile ",
+    @"\Edge\User Data\Default\Extensions\",
+    @"\Edge\User Data\Profile "
+)
+| extend ExtId = extract(@"Extensions\\([a-p]{32})\\", 1, FolderPath)
+| summarize ExtCount = dcount(ExtId),
+            Extensions = make_set(ExtId, 20),
+            FirstInstall = min(Timestamp),
+            LastInstall = max(Timestamp)
+        by DeviceName, bin(Timestamp, 1h)
+| where ExtCount > 3
+| sort by ExtCount desc
+
+
+// ------------------------------------------------------------
+// 11. CONTENT INJECTION — innerHTML ABUSE INDICATORS
+//     78 extensions used unsanitized innerHTML for content
+//     injection. Hunt for browser spawning unusual child
+//     processes or loading suspicious inline scripts after
+//     visiting attacker-controlled pages.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ (
+    "chrome.exe", "msedge.exe", "brave.exe", "firefox.exe"
+)
+| where FileName in~ (
+    "powershell.exe", "pwsh.exe", "cmd.exe",
+    "mshta.exe", "wscript.exe", "cscript.exe",
+    "rundll32.exe", "regsvr32.exe", "certutil.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName,
+          InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Links the complete attack chain on a single host:
+//       (a) New extension manifest installed
+//       (b) OAuth2 token request or identity API hit
+//       (c) Outbound to C2 domain/IP or /user_info endpoint
+//     All within 2 hours — strong indicator of this campaign.
+// ------------------------------------------------------------
+let C2_Indicators = dynamic([
+    "cloudapi.stream", "tg.cloudapi.stream",
+    "mines.cloudapi.stream", "topup.cloudapi.stream",
+    "multiaccount.cloudapi.stream",
+    "144.126.135.238", "/user_info"
+]);
+let Stage1_Install =
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("FileCreated", "FileModified")
+    | where FileName =~ "manifest.json"
+    | where FolderPath has_any (
+        @"\Chrome\User Data\", @"\Edge\User Data\"
+    )
+    | extend ExtId = extract(@"Extensions\\([a-p]{32})\\", 1, FolderPath)
+    | project DeviceId, DeviceName, InstallTime = Timestamp, ExtId;
+let Stage2_OAuth =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName in~ ("chrome.exe", "msedge.exe", "brave.exe")
+    | where RemoteUrl has_any (
+        "accounts.google.com/o/oauth2",
+        "googleapis.com/oauth2",
+        "googleapis.com/v1/people/me"
+    )
+    | project DeviceId, OAuthTime = Timestamp, OAuthUrl = RemoteUrl;
+let Stage3_Exfil =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where RemoteUrl has_any (C2_Indicators) or RemoteIP == "144.126.135.238"
+    | project DeviceId, ExfilTime = Timestamp,
+              ExfilUrl = RemoteUrl, ExfilIP = RemoteIP;
+Stage1_Install
+| join kind=inner Stage2_OAuth on DeviceId
+| where datetime_diff('minute', OAuthTime, InstallTime) between (0 .. 120)
+| join kind=inner Stage3_Exfil on DeviceId
+| where datetime_diff('minute', ExfilTime, OAuthTime) between (0 .. 120)
+| project DeviceName, ExtId, InstallTime,
+          OAuthTime, OAuthUrl,
+          ExfilTime, ExfilUrl, ExfilIP
+| sort by InstallTime desc
