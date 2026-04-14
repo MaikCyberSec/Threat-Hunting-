@@ -1,0 +1,332 @@
+// ============================================================
+// Fake Proxifier ClipBanker — GitHub Supply-Chain Distribution
+// Source:  Kaspersky Securelist / CyberSecurity News (April 2026)
+//          "ClipBanker Trojan masquerades as Proxifier software"
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1195.002, T1204.002, T1055.012, T1059.001,
+//               T1112, T1562.001, T1053.005, T1036.005,
+//               T1140, T1115, T1027
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Since early 2025, attackers host a trojanized Proxifier
+// installer on the GitHub repo lukecodix/Proxifier (Releases
+// section). Victims searching for "Proxifier" find this repo
+// near the top of search results. The archive contains a
+// malicious wrapper alongside activation keys. 2,000+ victims
+// confirmed (primarily India / Vietnam).
+//
+// INFECTION CHAIN
+// ---------------------------------------------------------------
+//   1) proxifier.exe (trojanized) → adds Defender exclusions
+//      for TMP, own dir, "powershell", "conhost"
+//   2) Creates stub Proxifier<??>.tmp (~1.5 KB) → injects
+//      api_updater.exe (.NET) to handle Defender exclusion
+//   3) Runs real Proxifier installer (cover)
+//   4) Second donor → injects proxifierupdater.exe
+//   5) conhost.exe → injects bin.exe (PowerShell in-memory
+//      via PSObject, no interpreter spawned)
+//   6) fontdrvhost.exe → shellcode injection → final C++
+//      ClipBanker payload (clipboard address replacement)
+//
+// PAYLOAD HOSTING (multi-stage, encoded)
+// ---------------------------------------------------------------
+//   pastebin[.]com/raw/FmpsDAtQ
+//   snippet[.]host/aaxniv/raw
+//   chiaselinks[.]com/raw/nkkywvmhux
+//   rlim[.]com/55Dfq32kaR/raw
+//   paste.kealper[.]com/raw/k3K5aPJQ
+//   git.parat[.]swiss/rogers7/dev-api/raw/master/cpzn
+//   pinhole[.]rootcode[.]ru/rogers7/dev-api/raw/master/cpzn
+//   gist.github[.]com/msfcon5ol3/107484d66423cb601f418344cd648f12
+//
+// TELEMETRY / TRACKING
+// ---------------------------------------------------------------
+//   maper[.]info/2X5tF5  (IP Logger)
+//
+// PERSISTENCE
+// ---------------------------------------------------------------
+//   Registry:  HKLM\SOFTWARE\System::Config → Base64 PowerShell
+//   Scheduled task → launches PowerShell reading the registry key
+//
+// IOC HASHES (MD5)
+// ---------------------------------------------------------------
+//   34a0f70ab100c47caaba7a5c85448e3d
+//   7528bf597fd7764fcb7ec06512e073e0
+//   8354223cd6198b05904337b5dff7772b
+//
+// ATTACKER CRYPTO WALLETS (partial list)
+// ---------------------------------------------------------------
+//   BTC: bc1q88r38gk8ynrhdfur7yefwf5hrn2y56s90vlrvq
+//   ETH: 0x97c16182d2e91a9370d5590b670f6b8dc755680552e40218a2b28ec7ad105071
+//   (26+ blockchain networks targeted including SOL, XRP, DOGE,
+//    LTC, XMR, ADA, ALGO, BNB, ATOM, DASH, FIL, NEO, etc.)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+// - Legitimate Proxifier installations from proxifier.com will
+//   match some filename rules; pivot on download source (GitHub
+//   release vs official site) and parent process.
+// - IT tools adding Defender exclusions (SCCM, Intune) will
+//   match rule #3; correlate with admin context.
+// - conhost.exe and fontdrvhost.exe are legitimate OS binaries;
+//   rule #6 focuses on anomalous injection behaviour.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+// - https://cybersecuritynews.com/hackers-use-fake-proxifier-installer-on-github/
+// - https://securelist.com/clipbanker-malware-distributed-via-trojanized-proxifier/119341/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN IOC HASHES (MD5) — HIGH CONFIDENCE
+// ------------------------------------------------------------
+union DeviceFileEvents, DeviceProcessEvents, DeviceImageLoadEvents
+| where Timestamp > ago(90d)
+| where MD5 in~ (
+    "34a0f70ab100c47caaba7a5c85448e3d",
+    "7528bf597fd7764fcb7ec06512e073e0",
+    "8354223cd6198b05904337b5dff7772b"
+  )
+| project Timestamp, DeviceName, ActionType, FileName, FolderPath,
+          MD5, SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. TROJANIZED PROXIFIER BINARY NAMES
+//    Hunt for the specific process names from the infection
+//    chain. api_updater.exe and proxifierupdater.exe are NOT
+//    part of the legitimate Proxifier install.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ (
+    "api_updater.exe",
+    "proxifierupdater.exe",
+    "bin.exe"
+  )
+| where FolderPath has_any (
+    @"\Temp\", @"\AppData\", @"\Users\Public\",
+    @"\ProgramData\", @"\Downloads\"
+  )
+| project Timestamp, DeviceName, AccountName, FileName, FolderPath,
+          MD5, SHA256, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessParentFileName,
+          InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. DEFENDER EXCLUSION ABUSE — TMP extension + powershell +
+//    conhost exclusions (campaign TTP signature)
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("powershell.exe","pwsh.exe")
+| where ProcessCommandLine has "Add-MpPreference"
+    and ProcessCommandLine has "-Exclusion"
+    and ProcessCommandLine has_any (
+        ".tmp", "powershell", "conhost",
+        "Proxifier", "api_updater", "proxifierupdater"
+    )
+| project Timestamp, DeviceName, AccountName, FileName,
+          ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessParentFileName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. REGISTRY PERSISTENCE — HKLM\SOFTWARE\System::Config
+//    Base64-encoded PowerShell stager stored in registry.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where RegistryKey has @"SOFTWARE\System"
+    and RegistryValueName =~ "Config"
+| where ActionType in ("RegistryValueSet","RegistryKeyCreated")
+| project Timestamp, DeviceName, ActionType, RegistryKey,
+          RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. SCHEDULED TASK READING REGISTRY + POWERSHELL
+//    The persistence chain uses a schtask that launches
+//    PowerShell to read the registry-stored payload.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where InitiatingProcessFileName =~ "schtasks.exe"
+     or InitiatingProcessParentFileName =~ "taskeng.exe"
+     or InitiatingProcessParentFileName =~ "taskhostw.exe"
+| where FileName in~ ("powershell.exe","pwsh.exe")
+| where ProcessCommandLine has_any (
+    "HKLM:\\SOFTWARE\\System",
+    "HKLM\\SOFTWARE\\System",
+    "Get-ItemProperty",
+    "Get-ItemPropertyValue",
+    "[System.Convert]::FromBase64String",
+    "FromBase64String"
+  )
+| project Timestamp, DeviceName, AccountName, FileName,
+          ProcessCommandLine, InitiatingProcessFileName,
+          InitiatingProcessParentFileName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. PROCESS INJECTION — HOLLOWING INTO OS BINARIES
+//    conhost.exe and fontdrvhost.exe should NOT be loading
+//    foreign DLLs or spawning children from user-writable paths.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("conhost.exe","fontdrvhost.exe")
+| where FileName in~ (
+    "powershell.exe","pwsh.exe","cmd.exe","mshta.exe",
+    "rundll32.exe","regsvr32.exe","wscript.exe","cscript.exe",
+    "bin.exe","api_updater.exe","proxifierupdater.exe"
+  )
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, ProcessCommandLine, FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. KNOWN C2 / PAYLOAD HOSTING DOMAINS + IPs
+// ------------------------------------------------------------
+let BadDomains = dynamic([
+    "snippet.host","chiaselinks.com","rlim.com",
+    "paste.kealper.com","parat.swiss",
+    "rootcode.ru","maper.info"
+]);
+// Note: pastebin.com and gist.github.com are legitimate services
+// — these are handled separately in query #8 with path-specific
+// matching to avoid mass false positives.
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteUrl has_any (BadDomains)
+| project Timestamp, DeviceName, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. PASTEBIN / GIST PAYLOAD RETRIEVAL — specific known paths
+//    Catches the exact encoded-payload URLs from Securelist IOCs.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteUrl has_any (
+    "pastebin.com/raw/FmpsDAtQ",
+    "gist.github.com/msfcon5ol3/107484d66423cb601f418344cd648f12",
+    "rogers7/dev-api/raw/master/cpzn",
+    "maper.info/2X5tF5"
+  )
+| project Timestamp, DeviceName, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. CLIPBOARD MONITORING / CRYPTO ADDRESS REPLACEMENT
+//    ClipBanker reads clipboard at high frequency. Hunt for
+//    processes with excessive clipboard access or known attacker
+//    wallet strings in process telemetry.
+// ------------------------------------------------------------
+// 9a. fontdrvhost.exe or conhost.exe with network activity
+//     (these should NEVER have outbound connections normally)
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("fontdrvhost.exe","conhost.exe")
+| where RemoteIPType !in ("Private","Loopback","LinkLocal")
+| project Timestamp, DeviceName, InitiatingProcessFileName,
+          InitiatingProcessCommandLine, RemoteIP, RemoteUrl, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. PROXIFIER*.TMP STUB FILES — initial donor process
+//     The trojan creates Proxifier<??>.tmp (~1.5 KB) in %TEMP%
+//     as the injection donor. Hunt for this pattern.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated","FileModified")
+| where FileName matches regex @"(?i)^proxifier.{0,4}\.tmp$"
+| where FolderPath has @"\Temp\"
+| project Timestamp, DeviceName, FileName, FolderPath, FileSize,
+          SHA256, MD5, InitiatingProcessFileName,
+          InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. GITHUB RELEASE DOWNLOAD → PROXIFIER INSTALLER EXECUTION
+//     Browser downloads archive from GitHub release, then
+//     proxifier.exe runs from Downloads/Temp within minutes.
+// ------------------------------------------------------------
+let GitHubDown =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName in~ ("chrome.exe","msedge.exe","firefox.exe","brave.exe")
+    | where RemoteUrl has "github.com" and RemoteUrl has_any ("releases","download")
+    | where RemoteUrl has_any ("proxifier","Proxifier")
+    | project DeviceId, DeviceName, DlTime=Timestamp, DlUrl=RemoteUrl;
+let ProxRun =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName has_any ("proxifier","Proxifier")
+    | where FolderPath has_any (@"\Downloads\", @"\Temp\", @"\AppData\")
+    | project DeviceId, RunTime=Timestamp, RunFile=FileName,
+              RunPath=FolderPath, RunCmd=ProcessCommandLine;
+GitHubDown
+| join kind=inner ProxRun on DeviceId
+| where datetime_diff('minute', RunTime, DlTime) between (0 .. 30)
+| project DeviceName, DlUrl, DlTime, RunFile, RunPath, RunCmd, RunTime
+| sort by DlTime desc
+
+
+// ------------------------------------------------------------
+// 12. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Same host within 1 hour:
+//       (a) Defender exclusion added for TMP / powershell
+//       (b) Proxifier*.tmp stub created in Temp
+//       (c) conhost or fontdrvhost makes outbound connection
+//           OR registry key SOFTWARE\System::Config written
+// ------------------------------------------------------------
+let DefExcl =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has "Add-MpPreference"
+        and ProcessCommandLine has_any (".tmp","powershell","conhost")
+    | project DeviceId, DeviceName, ExclTime=Timestamp;
+let Stub =
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FileName matches regex @"(?i)^proxifier.{0,4}\.tmp$"
+    | project DeviceId, StubTime=Timestamp, StubFile=FileName;
+let BadSignal =
+    union
+    (DeviceNetworkEvents
+        | where Timestamp > ago(30d)
+        | where InitiatingProcessFileName in~ ("fontdrvhost.exe","conhost.exe")
+        | where RemoteIPType !in ("Private","Loopback","LinkLocal")
+        | project DeviceId, BadTime=Timestamp, Signal=strcat("net:", InitiatingProcessFileName, "->", RemoteIP)),
+    (DeviceRegistryEvents
+        | where Timestamp > ago(30d)
+        | where RegistryKey has @"SOFTWARE\System" and RegistryValueName =~ "Config"
+        | project DeviceId, BadTime=Timestamp, Signal="reg:SOFTWARE\\System::Config");
+DefExcl
+| join kind=inner Stub on DeviceId
+| where abs(datetime_diff('minute', StubTime, ExclTime)) <= 60
+| join kind=inner BadSignal on DeviceId
+| where datetime_diff('minute', BadTime, StubTime) between (0 .. 60)
+| project DeviceName, ExclTime, StubFile, StubTime, Signal, BadTime
+| sort by ExclTime desc
