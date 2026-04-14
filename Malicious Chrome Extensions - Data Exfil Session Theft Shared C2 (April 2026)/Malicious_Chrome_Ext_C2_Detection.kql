@@ -378,3 +378,39 @@ Stage1_Install
           OAuthTime, OAuthUrl,
           ExfilTime, ExfilUrl, ExfilIP
 | sort by InstallTime desc
+
+
+// ------------------------------------------------------------
+// 13. EXTERNAL THREAT FEED — MALICIOUS EXTENSION SENTRY
+//     Joins local DeviceFileEvents against a live community
+//     threat intel feed of known-malicious Chrome/Edge extension
+//     IDs. Auto-updates as new extensions are reported.
+//     Feed: https://malext.toborrm.com/
+// ------------------------------------------------------------
+let days_ago = ago(30d);
+let feed_lookback_time = ago(365d);
+let ExtensionThreatFeed = externaldata(indicators:dynamic)
+    [@"https://raw.githubusercontent.com/toborrm9/malicious_extension_sentry/main/threat-intel-feeds/malext_feed.json"]
+    with (format="multijson")
+    | mv-expand indicators
+    | extend
+        feed_insert_date  = todatetime(indicators.insert_date),
+        feed_extension_id = tostring(indicators.extension_id),
+        feed_ext_name     = tostring(indicators.name),
+        feed_store_url    = tostring(indicators.chrome_store_url),
+        feed_source       = tostring(indicators.source)
+    | where feed_insert_date > feed_lookback_time
+    | project feed_insert_date, feed_extension_id, feed_ext_name, feed_store_url, feed_source;
+DeviceFileEvents
+| where Timestamp > days_ago
+| where ActionType in~ ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has_any ("Google\\Chrome\\User Data", "Microsoft\\Edge\\User Data") and FolderPath has @"\Extensions\"
+// Extract the ExtensionId after the "\Extensions\" FolderPath
+| extend ExtensionId = tolower(extract(@"\\Extensions\\([a-z]{32})\\", 1, FolderPath))
+| where isnotempty(ExtensionId)
+| join kind=inner ExtensionThreatFeed on $left.ExtensionId == $right.feed_extension_id
+| project Timestamp, feed_insert_date, feed_extension_id, feed_ext_name,
+          DeviceId, DeviceName, InitiatingProcessAccountUpn,
+          ActionType, FileName, FolderPath, ExtensionId,
+          feed_store_url, feed_source
+| sort by Timestamp desc
