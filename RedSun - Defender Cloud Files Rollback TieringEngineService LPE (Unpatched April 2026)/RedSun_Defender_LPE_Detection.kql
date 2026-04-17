@@ -1,0 +1,481 @@
+// ============================================================
+// RedSun — Microsoft Defender Cloud Files Rollback LPE
+// Unpatched 0-day | Public PoC April 15, 2026
+// Target: C:\Windows\System32\TieringEngineService.exe
+// Source:  CybersecurityNews / BleepingComputer / Picus /
+//          Cybernews / SecurityOnline / DataBreaches.net
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1068, T1211, T1134, T1574.005, T1547.006,
+//               T1055, T1036.005
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// RedSun is an UNPATCHED Microsoft Defender 0-day disclosed
+// via public PoC on April 15, 2026 by researcher Chaotic
+// Eclipse (GitHub: Nightmare-Eclipse) — the same author who
+// dropped BlueHammer (CVE-2026-33825) twelve days earlier.
+//
+// Where BlueHammer abused Defender's THREAT REMEDIATION engine,
+// RedSun abuses Defender's CLOUD-FILE ROLLBACK mechanism.
+// Both yield NT AUTHORITY\SYSTEM from a standard user context.
+//
+// EXPLOITATION CHAIN
+// ---------------------------------------------------------------
+//   1. Attacker writes an EICAR test file into a directory via
+//      the Cloud Files API so it carries a cloud placeholder /
+//      reparse tag (CfCreatePlaceholders, CfConvertToPlaceholder).
+//   2. Defender detects EICAR, quarantines, then "rewrites" the
+//      file back to its original location because of the cloud
+//      placeholder tag — WITHOUT validating the target path.
+//   3. Attacker acquires an NTFS opportunistic lock (oplock) on
+//      a path reachable via the volume shadow copy to win a
+//      race condition.
+//   4. Attacker swaps the original directory with an NTFS
+//      junction / reparse point redirecting the rollback write
+//      to C:\Windows\System32\.
+//   5. Defender (running as SYSTEM via the Cloud Files
+//      Infrastructure Service) overwrites:
+//        C:\Windows\System32\TieringEngineService.exe
+//   6. On the next invocation of the Storage Tiers Management
+//      service, the attacker-planted binary executes as SYSTEM.
+//
+// STATUS
+// ---------------------------------------------------------------
+//   * UNPATCHED as of April 17, 2026
+//   * No CVE assigned yet at time of writing
+//   * PoC public: https://github.com/Nightmare-Eclipse/RedSun
+//   * Not known to be exploited in the wild (yet)
+//   * BlueHammer's April 15 patch (platform 4.18.26050.3011)
+//     does NOT mitigate RedSun
+//
+// KEY IOC — TARGET BINARY
+// ---------------------------------------------------------------
+//   C:\Windows\System32\TieringEngineService.exe
+//   (legitimate: Storage Tiers Management service binary,
+//    signed by Microsoft. Any unsigned modification =
+//    high-confidence compromise indicator.)
+//
+// RELATED SERVICE / REGISTRY
+// ---------------------------------------------------------------
+//   Service name: TieringEngineService
+//   Service display: Storage Tiers Management
+//   Registry:     HKLM\SYSTEM\CurrentControlSet\Services\
+//                 TieringEngineService\ImagePath
+//
+// DIFFERENTIATING FROM BLUEHAMMER
+// ---------------------------------------------------------------
+//   BlueHammer: THREAT REMEDIATION engine + VSS snapshot abuse
+//               targeting SAM/SYSTEM/SECURITY hive read
+//   RedSun:     CLOUD-FILE ROLLBACK + NTFS junction abuse
+//               targeting TieringEngineService.exe overwrite
+//   Shared:     Same researcher, same oplock primitive,
+//               same EICAR trigger pattern, both => SYSTEM
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   * Windows Update / SFC may legitimately replace
+//     TieringEngineService.exe — correlate with the update
+//     session and TrustedInstaller parent.
+//   * Legitimate sync clients (OneDrive, SharePoint, Dropbox,
+//     Box, iCloud, Google Drive) call Cloud Files API daily —
+//     allowlist by InitiatingProcessFileName.
+//   * Some developer tooling creates reparse points (npm,
+//     Docker Desktop) — combine with file-path filters.
+//
+// MITIGATION (until patched)
+// ---------------------------------------------------------------
+//   1. Monitor TieringEngineService.exe integrity continuously
+//   2. Restrict Cloud Files API usage to known sync clients
+//   3. Remove write access to cloud-synced directories for
+//      low-privilege users on critical servers
+//   4. Audit for NTFS junction / reparse point creation by
+//      non-admin users
+//   5. Deploy the detection queries below as real-time rules
+//
+// REFERENCES
+// ---------------------------------------------------------------
+// - https://cybersecuritynews.com/defender-0-day-redsun/
+// - https://www.bleepingcomputer.com/news/microsoft/new-microsoft-defender-redsun-zero-day-poc-grants-system-privileges/
+// - https://www.picussecurity.com/resource/blog/bluehammer-redsun-windows-defender-cve-2026-33825-zero-day-vulnerability-explained
+// - https://cybernews.com/security/second-public-windows-defender-exploit-released/
+// - https://securityonline.info/redsun-windows-defender-zero-day-elevation-of-privilege-poc/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. TIERINGENGINESERVICE.EXE MODIFICATION — PRIMARY IOC
+//    Any modification to C:\Windows\System32\TieringEngineService.exe
+//    outside of Windows Update / TrustedInstaller is the highest
+//    fidelity RedSun exploitation indicator.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "TieringEngineService.exe"
+| where FolderPath has @"\Windows\System32"
+| where ActionType in ("FileCreated", "FileModified",
+                        "FileRenamed", "FileOverwritten")
+| where InitiatingProcessFileName !in~ (
+    "TrustedInstaller.exe", "TiWorker.exe",
+    "MoUsoCoreWorker.exe", "wuauclt.exe",
+    "WUDFHost.exe", "sfc.exe", "DISM.exe",
+    "MsMpEng.exe", "MsSense.exe"
+)
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath, SHA256, MD5,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName,
+          InitiatingProcessIntegrityLevel
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. TIERINGENGINESERVICE REGISTRY IMAGEPATH TAMPERING
+//    If the attacker can't overwrite the binary, they may
+//    redirect the service to a new path via ImagePath.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(30d)
+| where RegistryKey has @"\CurrentControlSet\Services\TieringEngineService"
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryValueName in~ ("ImagePath", "ServiceDll", "Start",
+                                "Type", "FailureActions")
+| where InitiatingProcessFileName !in~ (
+    "TrustedInstaller.exe", "TiWorker.exe",
+    "services.exe", "MsMpEng.exe"
+)
+| project Timestamp, DeviceName, ActionType,
+          RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. TIERINGENGINESERVICE UNEXPECTED EXECUTION / CHILD PROCS
+//    Post-exploitation TieringEngineService.exe will spawn the
+//    attacker's code as SYSTEM. Any non-standard child process
+//    from this binary is a clear indicator.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName =~ "TieringEngineService.exe"
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "wscript.exe", "cscript.exe", "mshta.exe",
+    "rundll32.exe", "regsvr32.exe", "certutil.exe",
+    "bitsadmin.exe", "net.exe", "net1.exe",
+    "whoami.exe", "nltest.exe", "notepad.exe",
+    "conhost.exe", "taskmgr.exe", "curl.exe", "wget.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ParentProcess = InitiatingProcessFileName,
+          ChildProcess = FileName,
+          ProcessCommandLine,
+          InitiatingProcessCommandLine,
+          ProcessIntegrityLevel,
+          InitiatingProcessIntegrityLevel
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. EICAR DROPS IN CLOUD-SYNCED DIRECTORIES
+//    RedSun requires an EICAR file dropped into a directory
+//    carrying a Cloud Files placeholder tag. EICAR appearing
+//    outside AV-testing workflows is always suspicious.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified")
+| where FileName has_any ("eicar", "EICAR")
+    or AdditionalFields has "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR"
+| where InitiatingProcessFileName !in~ (
+    "MsMpEng.exe", "MsSense.exe", "SenseIR.exe",
+    "MpCmdRun.exe", "MpDlpService.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. CLOUD FILES API ABUSE — cldapi.dll BY UNTRUSTED CALLER
+//    The exploit calls Cloud Files API functions to create
+//    placeholder files (CfCreatePlaceholders, CfConvertToPlaceholder).
+//    Only legitimate sync clients should load cldapi.dll.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "cldapi.dll"
+| where InitiatingProcessFileName !in~ (
+    "OneDrive.exe", "Dropbox.exe", "explorer.exe",
+    "FileCoAuth.exe", "FileSyncHelper.exe",
+    "BoxApp.exe", "Box.exe",
+    "iCloudDrive.exe", "iCloudServices.exe",
+    "GoogleDriveFS.exe",
+    "MsMpEng.exe", "SenseIR.exe",
+    "svchost.exe", "System", "dllhost.exe"
+)
+| project Timestamp, DeviceName,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. NTFS JUNCTION / REPARSE POINT CREATION IN SUSPICIOUS PATHS
+//    The junction swap redirects Defender's write to System32.
+//    Hunt for reparse-point creation commands from non-admin
+//    contexts or targeting System32.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any (
+    "mklink /J", "mklink /D",
+    "New-Item -ItemType Junction",
+    "New-Item -ItemType SymbolicLink",
+    "CreateSymbolicLink", "FSCTL_SET_REPARSE_POINT",
+    "fsutil reparsepoint", "junction.exe"
+)
+| where ProcessCommandLine has_any (
+    @"\System32", @"\SysWOW64",
+    @"\Program Files", @"\ProgramData",
+    "TieringEngineService",
+    @"\AppData\Local\Temp", @"\Downloads",
+    @"\Users\Public"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName,
+          InitiatingProcessIntegrityLevel
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. DEFENDER ROLLBACK EVENTS + JUNCTION ON SAME PATH
+//    Correlate Defender threat remediation / rollback telemetry
+//    with junction creation on the same path in the same minute.
+// ------------------------------------------------------------
+let DefenderEvents =
+    DeviceEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in~ (
+        "AntivirusDetection", "AntivirusRemediation",
+        "AntivirusScanCompleted", "AntivirusDefinitionsUpdateFailed",
+        "ThreatRemediated", "AntivirusDetectionByEngine"
+    )
+    | where AdditionalFields has_any ("EICAR", "eicar",
+                                       "Win32/EICAR_Test_File")
+    | project DefTime = Timestamp, DeviceName,
+              DefAction = ActionType,
+              DefFolder = FolderPath, DefFile = FileName;
+let Junctions =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has_any (
+        "mklink /J", "New-Item -ItemType Junction",
+        "CreateSymbolicLink", "FSCTL_SET_REPARSE_POINT"
+    )
+    | project JctTime = Timestamp, DeviceName,
+              JctCmd = ProcessCommandLine,
+              JctProc = InitiatingProcessFileName;
+DefenderEvents
+| join kind=inner Junctions on DeviceName
+| where datetime_diff('minute', JctTime, DefTime) between (-5 .. 10)
+| project DeviceName, DefTime, DefAction, DefFolder, DefFile,
+          JctTime, JctCmd, JctProc
+| sort by DefTime desc
+
+
+// ------------------------------------------------------------
+// 8. REDSUN POC ARTIFACTS — FILENAMES / PATHS
+//    Catches unsophisticated operators running the public PoC
+//    directly without modification.
+// ------------------------------------------------------------
+union DeviceFileEvents, DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName has_any (
+        "RedSun", "redsun",
+        "Nightmare-Eclipse", "NightmareEclipse"
+    )
+    or FolderPath has_any (
+        "RedSun", "Nightmare-Eclipse"
+    )
+    or ProcessCommandLine has_any (
+        "RedSun", "Nightmare-Eclipse",
+        "github.com/Nightmare-Eclipse/RedSun"
+    )
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath, SHA256,
+          ProcessCommandLine,
+          InitiatingProcessFileName,
+          InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. TIERINGENGINESERVICE RESTART / SERVICE STATE CHANGE
+//    After the binary overwrite, the attacker triggers a
+//    restart of the Storage Tiers Management service to gain
+//    SYSTEM execution. Watch for Event 7045 / 7036 equivalents.
+// ------------------------------------------------------------
+DeviceEvents
+| where Timestamp > ago(30d)
+| where ActionType in~ ("ServiceInstalled", "ServiceStopped",
+                         "ServiceStarted", "ServiceRegistered")
+| where AdditionalFields has_any (
+    "TieringEngineService", "Storage Tiers Management"
+)
+| where InitiatingProcessFileName !in~ (
+    "services.exe", "TrustedInstaller.exe", "TiWorker.exe",
+    "MsMpEng.exe", "svchost.exe"
+)
+| project Timestamp, DeviceName, ActionType,
+          AdditionalFields,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. UNSIGNED / ANOMALOUS TIERINGENGINESERVICE.EXE ON DISK
+//     If the legitimate binary has been swapped, its signature
+//     will no longer validate. Pivot on file profile / signer.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "TieringEngineService.exe"
+| where FolderPath has @"\Windows\System32"
+| join kind=leftouter (
+    DeviceFileCertificateInfo
+    | project SHA1, Signer, SignerHash, IsSigned, IsTrusted
+) on $left.SHA1 == $right.SHA1
+| where IsSigned == false
+    or IsTrusted == false
+    or Signer !has "Microsoft"
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath,
+          SHA1, SHA256, Signer, IsSigned, IsTrusted,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. LOW-INTEGRITY PROCESS SPAWNING SYSTEM CHILD
+//     Classic post-LPE signature shared with BlueHammer: a
+//     medium/low integrity parent spawns a SYSTEM integrity
+//     child. Strong evidence of successful privilege escalation.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe",
+                      "conhost.exe", "wsl.exe")
+| where ProcessIntegrityLevel in~ ("System", "High")
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low", "Untrusted")
+| where InitiatingProcessAccountName !in~ (
+    "SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "TrustedInstaller"
+)
+| project Timestamp, DeviceName,
+          ParentProcess = InitiatingProcessFileName,
+          ParentIntegrity = InitiatingProcessIntegrityLevel,
+          ParentAccount = InitiatingProcessAccountName,
+          ChildProcess = FileName,
+          ChildIntegrity = ProcessIntegrityLevel,
+          ChildAccount = AccountName,
+          ProcessCommandLine, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Links the complete RedSun chain on a single host within
+//     30 minutes:
+//       (a) Cloud Files API (cldapi.dll) loaded by untrusted
+//           caller
+//       (b) EICAR file dropped OR junction creation observed
+//       (c) TieringEngineService.exe modified OR its process
+//           spawns an unexpected child
+// ------------------------------------------------------------
+let Stage1_CloudFiles =
+    DeviceImageLoadEvents
+    | where Timestamp > ago(30d)
+    | where FileName =~ "cldapi.dll"
+    | where InitiatingProcessFileName !in~ (
+        "OneDrive.exe", "Dropbox.exe", "explorer.exe",
+        "FileCoAuth.exe", "FileSyncHelper.exe",
+        "BoxApp.exe", "Box.exe", "iCloudDrive.exe",
+        "iCloudServices.exe", "GoogleDriveFS.exe",
+        "MsMpEng.exe", "SenseIR.exe", "svchost.exe"
+    )
+    | project DeviceId, DeviceName, CldTime = Timestamp,
+              CldProc = InitiatingProcessFileName;
+
+let Stage2_Trigger =
+    union
+    (
+        DeviceFileEvents
+        | where Timestamp > ago(30d)
+        | where FileName has_any ("eicar", "EICAR")
+        | where InitiatingProcessFileName !in~ (
+            "MsMpEng.exe", "MsSense.exe", "MpCmdRun.exe"
+        )
+        | project DeviceId, TrigTime = Timestamp,
+                  TrigType = "EICAR",
+                  TrigDetail = strcat(FileName, " @ ", FolderPath)
+    ),
+    (
+        DeviceProcessEvents
+        | where Timestamp > ago(30d)
+        | where ProcessCommandLine has_any (
+            "mklink /J", "New-Item -ItemType Junction",
+            "CreateSymbolicLink", "FSCTL_SET_REPARSE_POINT"
+        )
+        | project DeviceId, TrigTime = Timestamp,
+                  TrigType = "Junction",
+                  TrigDetail = ProcessCommandLine
+    );
+
+let Stage3_Impact =
+    union
+    (
+        DeviceFileEvents
+        | where Timestamp > ago(30d)
+        | where FileName =~ "TieringEngineService.exe"
+        | where FolderPath has @"\Windows\System32"
+        | where ActionType in ("FileCreated", "FileModified",
+                                "FileRenamed", "FileOverwritten")
+        | where InitiatingProcessFileName !in~ (
+            "TrustedInstaller.exe", "TiWorker.exe",
+            "MoUsoCoreWorker.exe"
+        )
+        | project DeviceId, ImpactTime = Timestamp,
+                  ImpactType = "BinaryOverwrite",
+                  ImpactDetail = strcat(FolderPath, "\\", FileName)
+    ),
+    (
+        DeviceProcessEvents
+        | where Timestamp > ago(30d)
+        | where InitiatingProcessFileName =~ "TieringEngineService.exe"
+        | where FileName in~ (
+            "cmd.exe", "powershell.exe", "pwsh.exe",
+            "rundll32.exe", "regsvr32.exe"
+        )
+        | project DeviceId, ImpactTime = Timestamp,
+                  ImpactType = "SuspiciousChild",
+                  ImpactDetail = ProcessCommandLine
+    );
+
+Stage1_CloudFiles
+| join kind=inner Stage2_Trigger on DeviceId
+| where datetime_diff('minute', TrigTime, CldTime) between (-5 .. 30)
+| join kind=inner Stage3_Impact on DeviceId
+| where datetime_diff('minute', ImpactTime, TrigTime) between (0 .. 30)
+| project DeviceName,
+          CldTime, CldProc,
+          TrigTime, TrigType, TrigDetail,
+          ImpactTime, ImpactType, ImpactDetail
+| sort by CldTime desc
