@@ -1,0 +1,384 @@
+// ============================================================
+// Vercel Supply Chain Breach — Context.ai OAuth Compromise &
+// Environment Variable Theft (ShinyHunters)
+// Disclosed: April 19–20, 2026
+// Source:  CybersecurityNews / Vercel KB / The Hacker News /
+//          BleepingComputer / Coindesk / iTnews / CyberInsider
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+//           + Microsoft Sentinel (CloudAppEvents / AADSignInEvents)
+// MITRE ATT&CK: T1195.002, T1528, T1550.001, T1078.004,
+//               T1552.001, T1552.007, T1213, T1567, T1098.005
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// On April 19–20, 2026 Vercel disclosed unauthorized access to
+// internal systems following a supply-chain compromise of
+// Context.ai (a third-party AI SaaS used by a Vercel employee).
+//
+// ATTACK CHAIN
+// ---------------------------------------------------------------
+//   1. Context.ai compromise (upstream third-party SaaS)
+//   2. Malicious / compromised Google Workspace OAuth app tied
+//      to Context.ai grants persistent access
+//   3. Google Workspace account takeover of Vercel employee
+//   4. Lateral movement into Vercel internal environments
+//   5. Enumeration of environment variables NOT marked
+//      "sensitive" (encrypted-at-rest but enumerable)
+//   6. Data exfiltration; ShinyHunters listed data on
+//      BreachForums for $2M ransom (April 20)
+//
+// ACTOR: ShinyHunters (Vercel characterises as "highly
+//        sophisticated, possibly AI-accelerated")
+//
+// SCOPE
+// ---------------------------------------------------------------
+//   AFFECTED:
+//     - Certain internal Vercel environments
+//     - Environment variables NOT marked "sensitive"
+//     - Deployment Protection tokens (rotation advised)
+//     - Claimed: 580 employee records, API/npm/GitHub tokens,
+//       internal DB, source code, enterprise dashboard screens
+//
+//   NOT AFFECTED:
+//     - Next.js, Turbopack, Vercel OSS release paths
+//     - Environment variables marked "sensitive"
+//
+// PRIMARY IOC — MALICIOUS GOOGLE OAUTH CLIENT ID
+// ---------------------------------------------------------------
+//   110671459871-30f1spbu0hptbs60cb4vsmv79i7bbvqj.apps.googleusercontent.com
+//
+// DOWNSTREAM CUSTOMER RISK
+// ---------------------------------------------------------------
+// Stolen non-sensitive env vars may contain:
+//   - DB connection strings / credentials
+//   - GitHub PATs, npm tokens
+//   - AWS / GCP / Azure access keys
+//   - NextAuth / JWT signing keys
+//   - Webhook secrets, payment processor keys
+// These enable pivot into customer cloud infra, source repos,
+// CI/CD pipelines, and package registries.
+//
+// KEY SERVICE HOSTS TO BASELINE
+// ---------------------------------------------------------------
+//   api.vercel.com, vercel.com/api
+//   *.vercel.app, *.now.sh
+//   context.ai (upstream compromise source)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+// - Developers legitimately use Vercel CLI, import env vars,
+//   and run `vercel pull` / `vercel env` commands daily
+// - CI/CD integrations make high-volume Vercel API calls
+// - OAuth app grants are normal — hunt is for the SPECIFIC
+//   malicious client ID plus anomalous scope grants
+// - Maintain allowlists for approved Vercel CLI hosts
+//
+// REFERENCES
+// ---------------------------------------------------------------
+// - https://cybersecuritynews.com/vercel-data-breach/
+// - https://vercel.com/kb/bulletin/vercel-april-2026-security-incident
+// - https://thehackernews.com/2026/04/vercel-breach-tied-to-context-ai-hack.html
+// - https://www.bleepingcomputer.com/news/security/vercel-confirms-breach-as-hackers-claim-to-be-selling-stolen-data/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. MALICIOUS GOOGLE OAUTH CLIENT ID — PRIMARY IOC
+//    The specific OAuth client ID used to pivot from Context.ai
+//    into Vercel's Google Workspace. Highest-fidelity indicator.
+//    Requires CloudAppEvents (Defender for Cloud Apps) or
+//    OfficeActivity / GoogleWorkspace log ingestion.
+// ------------------------------------------------------------
+let BadOAuthClientId =
+    "110671459871-30f1spbu0hptbs60cb4vsmv79i7bbvqj.apps.googleusercontent.com";
+CloudAppEvents
+| where Timestamp > ago(90d)
+| where RawEventData has BadOAuthClientId
+    or ActivityObjects has BadOAuthClientId
+    or AccountObjectId has BadOAuthClientId
+| project Timestamp, Application, ActionType,
+          AccountDisplayName, AccountObjectId,
+          IPAddress, UserAgent, RawEventData,
+          ActivityObjects
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. CONTEXT.AI OAUTH GRANTS & CONSENT EVENTS
+//    Any OAuth consent / authorization event referencing
+//    Context.ai is worth triaging. Revoke and audit scopes.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(180d)
+| where ActionType has_any (
+    "Add OAuth2 authorization", "Consent to application",
+    "Add application", "Authorize application",
+    "Update application", "Grant"
+)
+| where RawEventData has_any ("context.ai", "Context.ai", "ContextAI")
+    or ActivityObjects has_any ("context.ai", "ContextAI")
+| project Timestamp, Application, ActionType,
+          AccountDisplayName, AccountObjectId,
+          IPAddress, UserAgent,
+          ActivityObjects, RawEventData
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. VERCEL API / INFRASTRUCTURE ACCESS FROM ENDPOINTS
+//    Baseline which hosts in your estate connect to Vercel
+//    control-plane endpoints. Correlate with known developer
+//    workstations; investigate unexpected sources.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (
+    "api.vercel.com", "vercel.com/api",
+    "vercel.com/oauth", "api-frankfurt.vercel.com",
+    "api-sfo1.vercel.com", "api-iad1.vercel.com"
+)
+| summarize ConnectionCount = count(),
+            FirstSeen = min(Timestamp),
+            LastSeen  = max(Timestamp),
+            Endpoints = make_set(RemoteUrl, 25),
+            Processes = make_set(InitiatingProcessFileName, 10)
+        by DeviceName, AccountName
+| sort by ConnectionCount desc
+
+
+// ------------------------------------------------------------
+// 4. CONTEXT.AI NETWORK CONNECTIONS FROM ENDPOINTS
+//    Identify any host in the estate that has communicated
+//    with context.ai — potential upstream exposure requiring
+//    credential rotation on that user's accounts.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(180d)
+| where RemoteUrl has_any (
+    "context.ai", "api.context.ai",
+    "app.context.ai", "auth.context.ai"
+)
+| summarize Connections = count(),
+            FirstSeen = min(Timestamp),
+            LastSeen  = max(Timestamp),
+            Processes = make_set(InitiatingProcessFileName, 10),
+            Users     = make_set(AccountName, 10)
+        by DeviceName
+| sort by LastSeen desc
+
+
+// ------------------------------------------------------------
+// 5. VERCEL CLI USAGE & ENVIRONMENT VARIABLE PULLS
+//    Detect `vercel env pull`, `vercel env ls`, `vercel pull`
+//    activity. Legitimate but worth baselining — attackers
+//    with stolen tokens will run these to exfiltrate secrets.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("vercel.exe", "vercel", "now.exe", "now",
+                      "node.exe", "node")
+| where ProcessCommandLine has_any (
+    "vercel env", "vercel pull", "vercel secrets",
+    "vercel login", "vercel whoami",
+    "vercel teams", "vercel deploy",
+    "@vercel/cli", "@now/cli"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. VERCEL AUTH TOKEN FILE ACCESS
+//    The Vercel CLI stores tokens in auth.json /
+//    credentials.json. Any non-Vercel / non-developer process
+//    touching these files is a credential-access indicator.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileRead", "FileAccessed", "FileCopied",
+                        "FileCreated", "FileModified")
+| where (FolderPath has_any (
+    @"\.vercel\", @"\.now\",
+    @"\.local\share\com.vercel.cli\",
+    @"\Library\Application Support\com.vercel.cli\",
+    @"\AppData\Roaming\com.vercel.cli\"
+) and FileName in~ ("auth.json", "credentials.json",
+                    "config.json", ".authTokenHost"))
+| where InitiatingProcessFileName !in~ (
+    "vercel.exe", "vercel", "node.exe", "node",
+    "npm.exe", "npm", "pnpm.exe", "yarn.exe",
+    "Code.exe", "cursor.exe",
+    "MsMpEng.exe", "MsSense.exe", "SenseIR.exe"
+)
+| project Timestamp, DeviceName, AccountName, ActionType,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. .ENV / SECRET FILE ACCESS BY UNEXPECTED PROCESSES
+//    Supply-chain compromises frequently target .env files
+//    containing the same classes of secrets stolen from Vercel
+//    (DB strings, GitHub PATs, AWS keys, npm tokens).
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileRead", "FileAccessed", "FileCopied")
+| where FileName in~ (
+    ".env", ".env.local", ".env.production",
+    ".env.development", ".env.staging",
+    ".env.vercel", ".npmrc", ".pypirc",
+    "credentials", "config", "service-account.json",
+    "gcloud-credentials.json", "aws-credentials"
+)
+    or FileName matches regex @"^\.env\..+"
+| where InitiatingProcessFileName !in~ (
+    "node.exe", "node", "npm.exe", "pnpm.exe", "yarn.exe",
+    "vercel.exe", "python.exe", "python", "python3",
+    "Code.exe", "cursor.exe", "idea64.exe", "pycharm64.exe",
+    "webstorm64.exe", "devenv.exe", "git.exe",
+    "docker.exe", "docker-compose.exe",
+    "MsMpEng.exe", "MsSense.exe", "SenseIR.exe", "Bash.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. ANOMALOUS OAUTH TOKEN USE — IMPOSSIBLE TRAVEL
+//    Stolen OAuth tokens replay from attacker infrastructure.
+//    Hunt for the same user authenticating from geographically
+//    distant locations within an impossible time window.
+// ------------------------------------------------------------
+let SignIns = AADSignInEventsBeta
+| where Timestamp > ago(14d)
+| where ErrorCode == 0
+| project Timestamp, AccountUpn, IPAddress, Country,
+          Application, SessionId, UserAgent;
+SignIns
+| join kind=inner (SignIns) on AccountUpn
+| where Timestamp1 > Timestamp
+| where Country != Country1
+| where (Timestamp1 - Timestamp) < 2h
+| project AccountUpn,
+          Time1 = Timestamp,  Country1 = Country,  IP1 = IPAddress,
+          UA1 = UserAgent,    App1 = Application,
+          Time2 = Timestamp1, Country2 = Country1, IP2 = IPAddress1,
+          UA2 = UserAgent1,   App2 = Application1,
+          TimeDelta = Timestamp1 - Timestamp
+| order by TimeDelta asc
+
+
+// ------------------------------------------------------------
+// 9. NEW / UNUSUAL OAUTH APP CONSENT GRANTS
+//    Hunt for consent grants to newly registered or high-risk
+//    third-party applications — the Context.ai → Vercel chain
+//    started with exactly this kind of app authorization.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(90d)
+| where ActionType has_any (
+    "Consent to application", "Add OAuth2 authorization",
+    "Add application", "Authorize application"
+)
+| extend Scope = tostring(RawEventData.Scope),
+         AppId = tostring(RawEventData.ApplicationId),
+         AppDisplayName = tostring(RawEventData.ApplicationDisplayName)
+| where Scope has_any (
+    "Gmail", "Drive", "Directory",
+    "admin.directory", "mail.google.com",
+    "drive.readonly", "drive.metadata",
+    "https://mail.google.com/",
+    "admin.directory.user"
+)
+| summarize Grants = count(),
+            Apps = make_set(AppDisplayName, 10),
+            Scopes = make_set(Scope, 10),
+            IPs = make_set(IPAddress, 5)
+        by AccountDisplayName, bin(Timestamp, 1d)
+| sort by Grants desc
+
+
+// ------------------------------------------------------------
+// 10. CREDENTIAL-SCANNER / SECRET-SEARCH TOOL EXECUTION
+//     Attackers with a foothold will scan for secrets using
+//     tools like trufflehog, gitleaks, detect-secrets. Their
+//     execution from unexpected contexts is a hunting signal.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any (
+    "trufflehog", "gitleaks", "detect-secrets",
+    "shhgit", "secretscanner", "ggshield",
+    "whispers", "repo-supervisor"
+)
+    or ProcessCommandLine has_any (
+        "trufflehog", "gitleaks detect",
+        "detect-secrets scan", "ggshield secret scan",
+        "git log -p | grep -E"
+    )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. HIGH-VOLUME VERCEL API CALLS — TOKEN ABUSE PATTERN
+//     Stolen Vercel tokens being abused will generate bursts
+//     of API calls (env var reads, project listings,
+//     deployment enumeration). Detect anomalous volume.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any (
+    "api.vercel.com", "vercel.com/api"
+)
+| summarize ApiCalls = count(),
+            DistinctPaths = dcount(RemoteUrl),
+            FirstSeen = min(Timestamp),
+            LastSeen  = max(Timestamp)
+        by DeviceName, InitiatingProcessFileName,
+           bin(Timestamp, 1h)
+| where ApiCalls > 500 or DistinctPaths > 50
+| sort by ApiCalls desc
+
+
+// ------------------------------------------------------------
+// 12. FULL CORRELATION — CONTEXT.AI EXPOSURE + VERCEL ACCESS
+//     Identifies any user/device that has BOTH:
+//       (a) communicated with context.ai at any point, AND
+//       (b) accessed Vercel (api.vercel.com) since Apr 1
+//     These users are priority candidates for credential
+//     rotation and access audit.
+// ------------------------------------------------------------
+let ContextAIUsers =
+    DeviceNetworkEvents
+    | where Timestamp > ago(365d)
+    | where RemoteUrl has_any ("context.ai", "api.context.ai",
+                                "app.context.ai")
+    | summarize ContextFirstSeen = min(Timestamp),
+                ContextLastSeen  = max(Timestamp)
+            by DeviceName, AccountName;
+let VercelUsers =
+    DeviceNetworkEvents
+    | where Timestamp > datetime(2026-04-01)
+    | where RemoteUrl has_any ("api.vercel.com", "vercel.com/api")
+    | summarize VercelFirstSeen = min(Timestamp),
+                VercelLastSeen  = max(Timestamp),
+                VercelHits      = count()
+            by DeviceName, AccountName;
+ContextAIUsers
+| join kind=inner VercelUsers on DeviceName, AccountName
+| project DeviceName, AccountName,
+          ContextFirstSeen, ContextLastSeen,
+          VercelFirstSeen, VercelLastSeen, VercelHits
+| sort by VercelLastSeen desc
