@@ -143,7 +143,7 @@ DeviceNetworkEvents
             LastSeen  = max(Timestamp),
             Endpoints = make_set(RemoteUrl, 25),
             Processes = make_set(InitiatingProcessFileName, 10)
-        by DeviceName, AccountName
+        by DeviceName, InitiatingProcessAccountName
 | sort by ConnectionCount desc
 
 
@@ -163,7 +163,7 @@ DeviceNetworkEvents
             FirstSeen = min(Timestamp),
             LastSeen  = max(Timestamp),
             Processes = make_set(InitiatingProcessFileName, 10),
-            Users     = make_set(AccountName, 10)
+            Users     = make_set(InitiatingProcessAccountName, 10)
         by DeviceName
 | sort by LastSeen desc
 
@@ -367,7 +367,7 @@ let ContextAIUsers =
                                 "app.context.ai")
     | summarize ContextFirstSeen = min(Timestamp),
                 ContextLastSeen  = max(Timestamp)
-            by DeviceName, AccountName;
+            by DeviceName, InitiatingProcessAccountName;
 let VercelUsers =
     DeviceNetworkEvents
     | where Timestamp > datetime(2026-04-01)
@@ -375,10 +375,10 @@ let VercelUsers =
     | summarize VercelFirstSeen = min(Timestamp),
                 VercelLastSeen  = max(Timestamp),
                 VercelHits      = count()
-            by DeviceName, AccountName;
+            by DeviceName, InitiatingProcessAccountName;
 ContextAIUsers
-| join kind=inner VercelUsers on DeviceName, AccountName
-| project DeviceName, AccountName,
+| join kind=inner VercelUsers on DeviceName, InitiatingProcessAccountName
+| project DeviceName, InitiatingProcessAccountName,
           ContextFirstSeen, ContextLastSeen,
           VercelFirstSeen, VercelLastSeen, VercelHits
 | sort by VercelLastSeen desc
