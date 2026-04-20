@@ -4,8 +4,8 @@
 // Disclosed: April 19–20, 2026
 // Source:  CybersecurityNews / Vercel KB / The Hacker News /
 //          BleepingComputer / Coindesk / iTnews / CyberInsider
-// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
-//           + Microsoft Sentinel (CloudAppEvents / AADSignInEvents)
+// Platform: Microsoft Defender XDR (Advanced Hunting)
+//           + Microsoft Sentinel (CloudAppEvents / AADSignInEventsBeta)
 // MITRE ATT&CK: T1195.002, T1528, T1550.001, T1078.004,
 //               T1552.001, T1552.007, T1213, T1567, T1098.005
 // ============================================================
@@ -65,6 +65,19 @@
 //   *.vercel.app, *.now.sh
 //   context.ai (upstream compromise source)
 //
+// SCHEMA NOTES (validated against MDE / Defender XDR)
+// ---------------------------------------------------------------
+// - DeviceNetworkEvents has NO `AccountName` column. Use
+//   `InitiatingProcessAccountName`.
+// - DeviceFileEvents has NO `AccountName` column. Use
+//   `InitiatingProcessAccountName` or `RequestAccountName`.
+// - DeviceProcessEvents DOES have both `AccountName` (subject)
+//   and `InitiatingProcessAccountName` (parent).
+// - DeviceRegistryEvents has only `InitiatingProcessAccountName`.
+// - CloudAppEvents: user identity via `AccountDisplayName` +
+//   `AccountObjectId` (the latter is a GUID — do NOT use it to
+//   match OAuth client IDs).
+//
 // FALSE POSITIVES
 // ---------------------------------------------------------------
 // - Developers legitimately use Vercel CLI, import env vars,
@@ -72,7 +85,6 @@
 // - CI/CD integrations make high-volume Vercel API calls
 // - OAuth app grants are normal — hunt is for the SPECIFIC
 //   malicious client ID plus anomalous scope grants
-// - Maintain allowlists for approved Vercel CLI hosts
 //
 // REFERENCES
 // ---------------------------------------------------------------
@@ -87,20 +99,19 @@
 // 1. MALICIOUS GOOGLE OAUTH CLIENT ID — PRIMARY IOC
 //    The specific OAuth client ID used to pivot from Context.ai
 //    into Vercel's Google Workspace. Highest-fidelity indicator.
-//    Requires CloudAppEvents (Defender for Cloud Apps) or
-//    OfficeActivity / GoogleWorkspace log ingestion.
+//    Requires CloudAppEvents (Defender for Cloud Apps) with
+//    Google Workspace / Microsoft 365 audit log ingestion.
 // ------------------------------------------------------------
 let BadOAuthClientId =
     "110671459871-30f1spbu0hptbs60cb4vsmv79i7bbvqj.apps.googleusercontent.com";
 CloudAppEvents
 | where Timestamp > ago(90d)
-| where RawEventData has BadOAuthClientId
-    or ActivityObjects has BadOAuthClientId
-    or AccountObjectId has BadOAuthClientId
+| where tostring(RawEventData) has BadOAuthClientId
+    or tostring(ActivityObjects) has BadOAuthClientId
 | project Timestamp, Application, ActionType,
           AccountDisplayName, AccountObjectId,
-          IPAddress, UserAgent, RawEventData,
-          ActivityObjects
+          IPAddress, UserAgent,
+          ActivityObjects, RawEventData
 | sort by Timestamp desc
 
 
@@ -116,8 +127,8 @@ CloudAppEvents
     "Add application", "Authorize application",
     "Update application", "Grant"
 )
-| where RawEventData has_any ("context.ai", "Context.ai", "ContextAI")
-    or ActivityObjects has_any ("context.ai", "ContextAI")
+| where tostring(RawEventData) has_any ("context.ai", "ContextAI", "Context.ai")
+    or tostring(ActivityObjects) has_any ("context.ai", "ContextAI")
 | project Timestamp, Application, ActionType,
           AccountDisplayName, AccountObjectId,
           IPAddress, UserAgent,
@@ -196,11 +207,13 @@ DeviceProcessEvents
 //    The Vercel CLI stores tokens in auth.json /
 //    credentials.json. Any non-Vercel / non-developer process
 //    touching these files is a credential-access indicator.
+//    NOTE: DeviceFileEvents has no `AccountName` — use
+//    `InitiatingProcessAccountName`.
 // ------------------------------------------------------------
 DeviceFileEvents
 | where Timestamp > ago(30d)
-| where ActionType in ("FileRead", "FileAccessed", "FileCopied",
-                        "FileCreated", "FileModified")
+| where ActionType in ("FileCreated", "FileModified",
+                        "FileRenamed")
 | where (FolderPath has_any (
     @"\.vercel\", @"\.now\",
     @"\.local\share\com.vercel.cli\",
@@ -214,8 +227,8 @@ DeviceFileEvents
     "Code.exe", "cursor.exe",
     "MsMpEng.exe", "MsSense.exe", "SenseIR.exe"
 )
-| project Timestamp, DeviceName, AccountName, ActionType,
-          FileName, FolderPath,
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath,
           InitiatingProcessFileName, InitiatingProcessCommandLine
 | sort by Timestamp desc
 
@@ -225,15 +238,17 @@ DeviceFileEvents
 //    Supply-chain compromises frequently target .env files
 //    containing the same classes of secrets stolen from Vercel
 //    (DB strings, GitHub PATs, AWS keys, npm tokens).
+//    NOTE: DeviceFileEvents has no `AccountName` — use
+//    `InitiatingProcessAccountName`.
 // ------------------------------------------------------------
 DeviceFileEvents
 | where Timestamp > ago(30d)
-| where ActionType in ("FileRead", "FileAccessed", "FileCopied")
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
 | where FileName in~ (
     ".env", ".env.local", ".env.production",
     ".env.development", ".env.staging",
     ".env.vercel", ".npmrc", ".pypirc",
-    "credentials", "config", "service-account.json",
+    "credentials", "service-account.json",
     "gcloud-credentials.json", "aws-credentials"
 )
     or FileName matches regex @"^\.env\..+"
@@ -243,9 +258,9 @@ DeviceFileEvents
     "Code.exe", "cursor.exe", "idea64.exe", "pycharm64.exe",
     "webstorm64.exe", "devenv.exe", "git.exe",
     "docker.exe", "docker-compose.exe",
-    "MsMpEng.exe", "MsSense.exe", "SenseIR.exe", "Bash.exe"
+    "MsMpEng.exe", "MsSense.exe", "SenseIR.exe", "bash.exe"
 )
-| project Timestamp, DeviceName, AccountName,
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
           FileName, FolderPath,
           InitiatingProcessFileName, InitiatingProcessCommandLine,
           InitiatingProcessFolderPath
@@ -257,31 +272,40 @@ DeviceFileEvents
 //    Stolen OAuth tokens replay from attacker infrastructure.
 //    Hunt for the same user authenticating from geographically
 //    distant locations within an impossible time window.
+//    NOTE: AADSignInEventsBeta is the validated schema in
+//    Microsoft Defender XDR Advanced Hunting.
 // ------------------------------------------------------------
 let SignIns = AADSignInEventsBeta
 | where Timestamp > ago(14d)
 | where ErrorCode == 0
 | project Timestamp, AccountUpn, IPAddress, Country,
-          Application, SessionId, UserAgent;
+          Application, SessionId;
 SignIns
-| join kind=inner (SignIns) on AccountUpn
-| where Timestamp1 > Timestamp
-| where Country != Country1
-| where (Timestamp1 - Timestamp) < 2h
+| join kind=inner (
+    SignIns
+    | project-rename Timestamp2 = Timestamp,
+                     IPAddress2 = IPAddress,
+                     Country2   = Country,
+                     Application2 = Application,
+                     SessionId2 = SessionId
+) on AccountUpn
+| where Timestamp2 > Timestamp
+| where Country != Country2
+| where (Timestamp2 - Timestamp) < 2h
 | project AccountUpn,
           Time1 = Timestamp,  Country1 = Country,  IP1 = IPAddress,
-          UA1 = UserAgent,    App1 = Application,
-          Time2 = Timestamp1, Country2 = Country1, IP2 = IPAddress1,
-          UA2 = UserAgent1,   App2 = Application1,
-          TimeDelta = Timestamp1 - Timestamp
+          App1 = Application,
+          Time2 = Timestamp2, Country2, IP2 = IPAddress2,
+          App2 = Application2,
+          TimeDelta = Timestamp2 - Timestamp
 | order by TimeDelta asc
 
 
 // ------------------------------------------------------------
 // 9. NEW / UNUSUAL OAUTH APP CONSENT GRANTS
-//    Hunt for consent grants to newly registered or high-risk
-//    third-party applications — the Context.ai → Vercel chain
-//    started with exactly this kind of app authorization.
+//    Hunt for consent grants to third-party applications with
+//    high-risk scopes — the Context.ai → Vercel chain started
+//    with exactly this kind of app authorization.
 // ------------------------------------------------------------
 CloudAppEvents
 | where Timestamp > ago(90d)
@@ -289,41 +313,41 @@ CloudAppEvents
     "Consent to application", "Add OAuth2 authorization",
     "Add application", "Authorize application"
 )
-| extend Scope = tostring(RawEventData.Scope),
-         AppId = tostring(RawEventData.ApplicationId),
-         AppDisplayName = tostring(RawEventData.ApplicationDisplayName)
-| where Scope has_any (
-    "Gmail", "Drive", "Directory",
-    "admin.directory", "mail.google.com",
-    "drive.readonly", "drive.metadata",
-    "https://mail.google.com/",
-    "admin.directory.user"
+| extend RawText = tostring(RawEventData),
+         ObjectsText = tostring(ActivityObjects)
+| where RawText has_any (
+    "Gmail", "mail.google.com",
+    "Drive", "drive.readonly", "drive.metadata",
+    "Directory", "admin.directory"
 )
+    or ObjectsText has_any (
+        "Gmail", "mail.google.com",
+        "drive.readonly", "admin.directory"
+    )
 | summarize Grants = count(),
-            Apps = make_set(AppDisplayName, 10),
-            Scopes = make_set(Scope, 10),
+            Apps = make_set(Application, 10),
+            ActionTypes = make_set(ActionType, 10),
             IPs = make_set(IPAddress, 5)
-        by AccountDisplayName, bin(Timestamp, 1d)
+        by AccountDisplayName, AccountObjectId,
+           bin(Timestamp, 1d)
 | sort by Grants desc
 
 
 // ------------------------------------------------------------
 // 10. CREDENTIAL-SCANNER / SECRET-SEARCH TOOL EXECUTION
-//     Attackers with a foothold will scan for secrets using
-//     tools like trufflehog, gitleaks, detect-secrets. Their
-//     execution from unexpected contexts is a hunting signal.
+//     Attackers with a foothold scan for secrets using tools
+//     like trufflehog, gitleaks, detect-secrets. Execution
+//     from unexpected contexts is a hunting signal.
 // ------------------------------------------------------------
 DeviceProcessEvents
 | where Timestamp > ago(30d)
 | where FileName has_any (
     "trufflehog", "gitleaks", "detect-secrets",
-    "shhgit", "secretscanner", "ggshield",
-    "whispers", "repo-supervisor"
+    "shhgit", "ggshield", "whispers"
 )
     or ProcessCommandLine has_any (
         "trufflehog", "gitleaks detect",
-        "detect-secrets scan", "ggshield secret scan",
-        "git log -p | grep -E"
+        "detect-secrets scan", "ggshield secret scan"
     )
 | project Timestamp, DeviceName, AccountName,
           FileName, ProcessCommandLine,
@@ -356,7 +380,7 @@ DeviceNetworkEvents
 // 12. FULL CORRELATION — CONTEXT.AI EXPOSURE + VERCEL ACCESS
 //     Identifies any user/device that has BOTH:
 //       (a) communicated with context.ai at any point, AND
-//       (b) accessed Vercel (api.vercel.com) since Apr 1
+//       (b) accessed Vercel (api.vercel.com) in the scope window
 //     These users are priority candidates for credential
 //     rotation and access audit.
 // ------------------------------------------------------------
@@ -370,14 +394,15 @@ let ContextAIUsers =
             by DeviceName, InitiatingProcessAccountName;
 let VercelUsers =
     DeviceNetworkEvents
-    | where Timestamp > datetime(2026-04-01)
+    | where Timestamp > ago(90d)
     | where RemoteUrl has_any ("api.vercel.com", "vercel.com/api")
     | summarize VercelFirstSeen = min(Timestamp),
                 VercelLastSeen  = max(Timestamp),
                 VercelHits      = count()
             by DeviceName, InitiatingProcessAccountName;
 ContextAIUsers
-| join kind=inner VercelUsers on DeviceName, InitiatingProcessAccountName
+| join kind=inner VercelUsers
+    on DeviceName, InitiatingProcessAccountName
 | project DeviceName, InitiatingProcessAccountName,
           ContextFirstSeen, ContextLastSeen,
           VercelFirstSeen, VercelLastSeen, VercelHits
