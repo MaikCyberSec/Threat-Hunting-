@@ -1,0 +1,435 @@
+// ============================================================
+// Anthropic "Mythos" Preview Model — Unauthorized Access via
+// Third-Party Contractor API Key / Shared Account Exposure
+// Disclosed:  April 21, 2026
+// Source:     CybersecurityNews / Bloomberg
+// Platform:   Microsoft Defender XDR (Advanced Hunting)
+//             + Microsoft Sentinel (CloudAppEvents / AAD / Email)
+// MITRE ATT&CK: T1078.004, T1528, T1552.001, T1552.005,
+//               T1213, T1567.002, T1589.002, T1087.004
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// On April 21, 2026 an unauthorized group demonstrated access to
+// "Mythos" — an internal Anthropic preview model the vendor had
+// publicly described as too dangerous to release. The intruders
+// did NOT breach Anthropic's core infrastructure directly.
+// Instead they abused:
+//
+//   1. SHARED API KEYS / CREDENTIALS belonging to an authorized
+//      third-party contractor working with Anthropic
+//   2. URL-INFERENCE: guessing the preview model's endpoint from
+//      Anthropic's known URL naming conventions for other models
+//   3. Distributed coordination via a private Discord channel
+//
+// KEY TAKE-AWAY FOR DEFENDERS
+// ---------------------------------------------------------------
+// This is an upstream third-party credential-exposure incident.
+// The defensive lessons for any enterprise using Anthropic (or
+// any other LLM vendor) API keys are:
+//
+//   (a) API keys stored in contractor / shared environments are
+//       a top-tier credential-theft target;
+//   (b) LLM API keys enable arbitrary data exfiltration over
+//       an *allowed* egress channel (HTTPS to a legitimate
+//       SaaS host), bypassing most DLP baselines;
+//   (c) Internal preview / staging endpoints are discoverable
+//       by naming convention — defenders should audit outbound
+//       traffic to non-public vendor sub-domains;
+//   (d) Contractor credential hygiene (rotation, MFA, scoping)
+//       is now a material part of the enterprise attack surface.
+//
+// PRIMARY HUNTING OBJECTIVES
+// ---------------------------------------------------------------
+//   1. Inventory ALL outbound traffic to Anthropic endpoints
+//      from the estate. Identify owners, sources, and purpose.
+//   2. Hunt for ANTHROPIC_API_KEY material touching disk,
+//      command-lines, scripts, repos, clipboard.
+//   3. Detect shared / contractor credential reuse patterns
+//      (same API key from multiple geographies / ASNs / hosts).
+//   4. Detect references to internal / preview / non-public
+//      Anthropic model names or sub-domains.
+//   5. Detect sensitive-data exfiltration to LLM endpoints.
+//
+// SCHEMA NOTES (validated against Microsoft Defender XDR)
+// ---------------------------------------------------------------
+//   - DeviceNetworkEvents has NO `AccountName` column. Use
+//     `InitiatingProcessAccountName`.
+//   - DeviceFileEvents has NO `AccountName` column. Use
+//     `InitiatingProcessAccountName` or `RequestAccountName`.
+//   - DeviceProcessEvents has BOTH `AccountName` (subject) and
+//     `InitiatingProcessAccountName` (parent).
+//   - DeviceRegistryEvents has only `InitiatingProcessAccountName`.
+//   - CloudAppEvents: identity via `AccountDisplayName` +
+//     `AccountObjectId`.
+//   - AADSignInEventsBeta is the validated schema in Microsoft
+//     Defender XDR Advanced Hunting (NOT SigninLogs).
+//   - EmailUrlInfo / EmailEvents: cross-table join on NetworkMessageId.
+//
+// KNOWN ANTHROPIC SERVICE HOSTS TO BASELINE
+// ---------------------------------------------------------------
+//   api.anthropic.com          — production API
+//   console.anthropic.com      — web console / key management
+//   claude.ai                  — consumer chat surface
+//   *.anthropic.com            — any other sub-domain (audit)
+//   *.claude.ai                — any other sub-domain (audit)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate developer use of Anthropic SDK (python-anthropic,
+//     @anthropic-ai/sdk) and Claude Code CLI.
+//   - Legitimate SOAR / automation that calls api.anthropic.com.
+//   - IDE assistants (Cursor, VS Code extensions) that embed
+//     Anthropic endpoints.
+// The hunts below are designed to baseline legitimate use FIRST,
+// then escalate on anomaly (new host, new process, new user,
+// credential material on the wire, or bulk-data patterns).
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   - https://cybersecuritynews.com/anthropic-mythos-access/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. OUTBOUND TRAFFIC TO ANTHROPIC ENDPOINTS — FULL BASELINE
+//    Inventory every host/user/process in the estate that
+//    communicates with Anthropic. First step of the hunt:
+//    know what "normal" looks like before chasing anomalies.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (
+    "api.anthropic.com",
+    "console.anthropic.com",
+    "claude.ai",
+    "anthropic.com"
+)
+| summarize ConnectionCount = count(),
+            FirstSeen       = min(Timestamp),
+            LastSeen        = max(Timestamp),
+            Endpoints       = make_set(RemoteUrl, 25),
+            Processes       = make_set(InitiatingProcessFileName, 10),
+            RemoteIPs       = make_set(RemoteIP, 10)
+        by DeviceName, InitiatingProcessAccountName
+| sort by ConnectionCount desc
+
+
+// ------------------------------------------------------------
+// 2. ANTHROPIC API CALLS FROM UNEXPECTED PROCESSES
+//    Legitimate Anthropic traffic normally originates from a
+//    small set of tools (python / node / curl in dev contexts,
+//    IDEs, official SDK helpers). Calls from uncommon binaries
+//    warrant review (stolen keys being replayed from malware,
+//    LOLBins, or office apps exfiltrating data to the LLM).
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any ("api.anthropic.com", "claude.ai",
+                           "console.anthropic.com")
+| where InitiatingProcessFileName !in~ (
+    "python.exe", "python3.exe", "python",
+    "node.exe", "node",
+    "curl.exe", "curl",
+    "pwsh.exe", "powershell.exe",
+    "Code.exe", "cursor.exe", "idea64.exe",
+    "pycharm64.exe", "webstorm64.exe",
+    "claude.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "safari", "Safari",
+    "MsSense.exe", "MsMpEng.exe", "SenseIR.exe"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. ANTHROPIC_API_KEY MATERIAL ON COMMAND LINES
+//    Hunts for plaintext API keys being passed on argv or via
+//    env assignment — a classic leakage path into process
+//    telemetry, shell history, CI logs, and crash dumps.
+//    Anthropic API keys follow the prefix `sk-ant-`.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    "sk-ant-api", "sk-ant-"
+)
+| where ProcessCommandLine matches regex @"sk-ant-[A-Za-z0-9_\-]{20,}"
+    or ProcessCommandLine has "ANTHROPIC_API_KEY="
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. ANTHROPIC_API_KEY LEAKAGE TO .ENV / CONFIG / SCRIPT FILES
+//    File writes that land Anthropic credentials on disk outside
+//    expected secret-manager paths. Couples cleanly with
+//    "third-party contractor exposure" — the Mythos breach
+//    vector.
+//    NOTE: DeviceFileEvents has no `AccountName` — use
+//    `InitiatingProcessAccountName`.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ (
+    ".env", ".env.local", ".env.production",
+    ".env.development", ".env.staging",
+    ".envrc", "config.json", "settings.json",
+    "credentials", "credentials.json",
+    "secrets.json", "secrets.yaml", "secrets.yml",
+    ".anthropic", "anthropic.json"
+)
+    or FileName matches regex @"(?i)^\.env\..+"
+    or FolderPath has_any (@"\.anthropic\", @"\.claude\",
+                           @"\.config\anthropic\")
+| where InitiatingProcessFileName !in~ (
+    "MsSense.exe", "MsMpEng.exe", "SenseIR.exe"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. INTERNAL / PREVIEW / NON-PUBLIC ANTHROPIC MODEL REFERENCES
+//    Mythos was discovered via URL-inference: attackers guessed
+//    the preview path from known naming conventions. If your
+//    estate is calling *internal* or *preview* Anthropic hosts
+//    (or referencing unreleased model names), that is a strong
+//    curiosity-driven anomaly.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteUrl has "anthropic.com" or RemoteUrl has "claude.ai"
+| where RemoteUrl has_any (
+    "mythos", "preview", "internal", "staging", "canary",
+    "experimental", "unreleased", "rc1", "rc2",
+    "opus-5", "opus-6", "sonnet-5", "sonnet-6", "haiku-5",
+    "next", "dev.anthropic", "dev.claude",
+    "private.", "test."
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, RemoteUrl, RemoteIP
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. MYTHOS / PREVIEW STRING REFERENCES IN PROCESS ARGUMENTS
+//    Captures command-lines, scripts, or SDK calls that pass
+//    a non-GA model identifier. Useful for catching lab or
+//    misrouted code that is reaching for internal endpoints.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any (
+    "claude-mythos", "mythos-preview", "claude-3-mythos",
+    "model=mythos", "\"model\":\"mythos",
+    "anthropic-preview", "--preview-model"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. HIGH-VOLUME / BULK-DATA EGRESS TO ANTHROPIC
+//    LLM endpoints are a blind-spot for DLP — traffic is TLS,
+//    to an allowlisted SaaS host, with legitimate business use.
+//    Hunt for volume anomalies indicating bulk exfiltration of
+//    source code, documents, or secrets to the model.
+//    (MDE populates `InitiatingProcessAccountName` on
+//    DeviceNetworkEvents — `AccountName` is not present.)
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where RemoteUrl has_any ("api.anthropic.com", "claude.ai")
+| summarize ApiCalls        = count(),
+            DistinctUrls    = dcount(RemoteUrl),
+            FirstSeen       = min(Timestamp),
+            LastSeen        = max(Timestamp)
+        by DeviceName, InitiatingProcessFileName,
+           InitiatingProcessAccountName,
+           bin(Timestamp, 1h)
+| where ApiCalls > 500 or DistinctUrls > 50
+| sort by ApiCalls desc
+
+
+// ------------------------------------------------------------
+// 8. CLOUDAPPEVENTS — ANTHROPIC / CLAUDE.AI SAAS ACTIVITY
+//    If Defender for Cloud Apps has Anthropic or claude.ai
+//    discovered as a shadow-IT app (or sanctioned), this hunt
+//    surfaces identity, IP, and action-level telemetry —
+//    including unusual geographies or user-agents.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(90d)
+| where Application has_any ("Anthropic", "Claude")
+    or tostring(RawEventData) has_any ("anthropic.com", "claude.ai")
+| project Timestamp, Application, ActionType,
+          AccountDisplayName, AccountObjectId,
+          IPAddress, UserAgent,
+          ActivityObjects, RawEventData
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. SAME ANTHROPIC ACCOUNT — MULTIPLE GEOGRAPHIES (IMPOSSIBLE TRAVEL)
+//    A stolen API key / shared contractor account being replayed
+//    shows up as the same user or key appearing from multiple
+//    countries inside a short window. Uses AAD sign-ins as the
+//    proxy when Anthropic is federated via SSO / Entra ID.
+// ------------------------------------------------------------
+let AnthropicSignIns = AADSignInEventsBeta
+| where Timestamp > ago(14d)
+| where Application has_any ("Anthropic", "Claude")
+| where ErrorCode == 0
+| project Timestamp, AccountUpn, IPAddress, Country,
+          Application, SessionId;
+AnthropicSignIns
+| join kind=inner (
+    AnthropicSignIns
+    | project-rename Timestamp2 = Timestamp,
+                     IPAddress2 = IPAddress,
+                     Country2   = Country,
+                     Application2 = Application,
+                     SessionId2   = SessionId
+) on AccountUpn
+| where Timestamp2 > Timestamp
+| where Country != Country2
+| where (Timestamp2 - Timestamp) < 2h
+| project AccountUpn,
+          Time1 = Timestamp,  Country1 = Country,  IP1 = IPAddress,
+          App1  = Application,
+          Time2 = Timestamp2, Country2, IP2 = IPAddress2,
+          App2  = Application2,
+          TimeDelta = Timestamp2 - Timestamp
+| order by TimeDelta asc
+
+
+// ------------------------------------------------------------
+// 10. SECRET-SCANNING / KEY-HARVESTING TOOL EXECUTION
+//     Attackers with a foothold will scan repos and filesystems
+//     for API keys. Trufflehog / gitleaks / detect-secrets being
+//     executed from unexpected contexts = credential-access
+//     signal directly relevant to the Mythos vector.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any (
+    "trufflehog", "gitleaks", "detect-secrets",
+    "shhgit", "ggshield", "whispers", "noseyparker"
+)
+    or ProcessCommandLine has_any (
+        "trufflehog", "gitleaks detect",
+        "detect-secrets scan", "ggshield secret scan",
+        "noseyparker scan"
+    )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. DISCORD EXFIL / COORDINATION CHANNEL (THREAT CONTEXT)
+//     The Mythos group coordinated through a private Discord.
+//     This alone is not malicious, but a workstation that (a)
+//     talks to discord.com / discordapp.com AND (b) touches
+//     Anthropic credential material is worth reviewing.
+// ------------------------------------------------------------
+let AnthropicHosts =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where RemoteUrl has_any ("api.anthropic.com", "console.anthropic.com")
+    | summarize AnthropicHits = count(),
+                AnthropicLastSeen = max(Timestamp)
+            by DeviceName;
+let DiscordHosts =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where RemoteUrl has_any ("discord.com", "discordapp.com",
+                                "discord.gg", "cdn.discordapp.com")
+    | summarize DiscordHits = count(),
+                DiscordLastSeen = max(Timestamp)
+            by DeviceName;
+AnthropicHosts
+| join kind=inner DiscordHosts on DeviceName
+| project DeviceName,
+          AnthropicHits, AnthropicLastSeen,
+          DiscordHits,  DiscordLastSeen
+| sort by AnthropicLastSeen desc
+
+
+// ------------------------------------------------------------
+// 12. FULL CORRELATION — UNSANCTIONED ANTHROPIC API USAGE
+//     Ties the high-signal indicators together: device with
+//     (a) Anthropic API traffic, (b) plaintext key exposure OR
+//     secret-scanner execution OR .env write, all within 7 days.
+//     Priority targets for credential rotation & investigation.
+// ------------------------------------------------------------
+let AnthropicTraffic =
+    DeviceNetworkEvents
+    | where Timestamp > ago(7d)
+    | where RemoteUrl has_any ("api.anthropic.com", "claude.ai",
+                                "console.anthropic.com")
+    | summarize NetFirstSeen = min(Timestamp),
+                NetLastSeen  = max(Timestamp),
+                NetHits      = count(),
+                NetProcs     = make_set(InitiatingProcessFileName, 10)
+            by DeviceName;
+let KeyOnCmdline =
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where ProcessCommandLine has_any ("ANTHROPIC_API_KEY",
+                                         "sk-ant-api", "sk-ant-")
+    | summarize KeyHits = count(),
+                KeyLastSeen = max(Timestamp)
+            by DeviceName;
+let SecretScanners =
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where FileName has_any ("trufflehog","gitleaks","detect-secrets",
+                               "ggshield","noseyparker")
+       or ProcessCommandLine has_any ("trufflehog","gitleaks detect",
+                                       "detect-secrets scan")
+    | summarize ScanHits = count(),
+                ScanLastSeen = max(Timestamp)
+            by DeviceName;
+let EnvWrites =
+    DeviceFileEvents
+    | where Timestamp > ago(7d)
+    | where ActionType in ("FileCreated","FileModified","FileRenamed")
+    | where FileName in~ (".env",".env.local",".env.production",
+                          ".env.staging",".envrc","secrets.json")
+        or FolderPath has @"\.anthropic\"
+    | summarize EnvHits = count(),
+                EnvLastSeen = max(Timestamp)
+            by DeviceName;
+AnthropicTraffic
+| join kind=leftouter KeyOnCmdline    on DeviceName
+| join kind=leftouter SecretScanners  on DeviceName
+| join kind=leftouter EnvWrites       on DeviceName
+| extend RiskSignals =
+      iff(isnotempty(KeyHits),      1, 0)
+    + iff(isnotempty(ScanHits),     1, 0)
+    + iff(isnotempty(EnvHits),      1, 0)
+| where RiskSignals >= 1
+| project DeviceName,
+          NetFirstSeen, NetLastSeen, NetHits, NetProcs,
+          KeyHits,  KeyLastSeen,
+          ScanHits, ScanLastSeen,
+          EnvHits,  EnvLastSeen,
+          RiskSignals
+| sort by RiskSignals desc, NetLastSeen desc
