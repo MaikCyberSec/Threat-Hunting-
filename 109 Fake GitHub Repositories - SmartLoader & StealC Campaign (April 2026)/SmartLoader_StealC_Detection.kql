@@ -1,0 +1,492 @@
+// ============================================================
+// 109 Fake GitHub Repositories — SmartLoader & StealC Campaign
+// Disclosed:  April 12, 2026 (active ≥ 7 weeks pre-disclosure)
+// Source:     CybersecurityNews / Hexastrike threat intel
+// Platform:   Microsoft Defender XDR (Advanced Hunting) —
+//             Windows-oriented (SmartLoader is Windows-specific)
+// MITRE ATT&CK: T1566, T1036, T1036.004, T1204.002, T1059.003,
+//               T1059.006, T1140, T1027, T1547.015 / T1053.005,
+//               T1102, T1071.001, T1105, T1113, T1005,
+//               T1041, T1555.003
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Hexastrike exposed a large-scale distribution operation that
+// used **109 fake GitHub repositories across 103 accounts** —
+// carefully cloned from legitimate open-source projects — to
+// deliver two payloads:
+//   1. SmartLoader  (obfuscated Lua stager, launched by LuaJIT
+//                    via a single-line `.bat`)
+//   2. StealC       (in-memory information stealer)
+//
+// The campaign:
+//   - Ships victims a ZIP file hidden deep inside a cloned
+//     repository's folder structure.
+//   - Pads descriptions with unrelated SEO keywords to boost
+//     GitHub search ranking.
+//   - Rotates payload download links by batch-editing repos.
+//   - Resolves live C2 servers through a **blockchain dead
+//     drop** — a Polygon smart contract queried via JSON-RPC at
+//     `polygon.drpc.org`, returning an IP address used by the
+//     stager for HTTP POST traffic.
+//
+// EXECUTION CHAIN
+// ---------------------------------------------------------------
+//   user extracts ZIP  →  .bat (single line)  →  LuaJIT.exe
+//     →  obfuscated Lua (SmartLoader)  →  console hidden via
+//     Win32 APIs  →  anti-debug shellcode  →  JSON-RPC to
+//     polygon.drpc.org to resolve live C2 IP  →  multipart POST
+//     to bare IP at `/api/` or `/task/` with host fingerprint
+//     + screenshot  →  server returns encrypted tasks  →
+//     StealC reflectively loaded in-memory (no disk write)
+//
+// PERSISTENCE
+// ---------------------------------------------------------------
+//   Two scheduled tasks with obfuscated names:
+//     - AudioManager_ODM3
+//     - OfficeClickToRunTask_7d7757
+//   Dual-path re-entry: locally cached Lua stage OR re-download
+//   of an encrypted stage from an attacker-controlled GitHub
+//   repository (raw.githubusercontent.com).
+//
+// SCHEMA NOTES (validated against Defender XDR Advanced Hunting)
+// ---------------------------------------------------------------
+//  - DeviceNetworkEvents / DeviceFileEvents / DeviceRegistryEvents
+//    have NO `AccountName` — use `InitiatingProcessAccountName`.
+//  - DeviceProcessEvents has BOTH `AccountName` and
+//    `InitiatingProcessAccountName`.
+//  - Scheduled task creation surfaces on Windows as
+//    `ActionType == "ScheduledTaskCreated"` in DeviceEvents,
+//    or as schtasks.exe / New-ScheduledTask invocations in
+//    DeviceProcessEvents — we cover BOTH for coverage.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//  - Game developers and Lua-heavy projects legitimately ship
+//    LuaJIT. The hunt filters on LuaJIT spawned from Downloads
+//    / %TEMP% / ZIP-extraction paths, not LuaJIT in general.
+//  - `raw.githubusercontent.com` is heavily used by CI, dev
+//    tooling, and package managers. We key off post-download
+//    execution rather than the download itself.
+//  - Legitimate scheduled tasks for Audio / Office components
+//    exist — the hunt matches the EXACT obfuscated names the
+//    actor used, which are not product-sanctioned strings.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//  - https://cybersecuritynews.com/109-fake-github-repositories-used/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN PERSISTENCE — EXACT OBFUSCATED SCHEDULED-TASK NAMES
+//    Highest-fidelity single indicator. The two names below are
+//    not product-sanctioned and appearing on any device in the
+//    estate = incident.
+//    NOTE: scheduled-task-create event surfaces via DeviceEvents.
+// ------------------------------------------------------------
+let BadTaskNames = dynamic([
+    "AudioManager_ODM3",
+    "OfficeClickToRunTask_7d7757"
+]);
+union
+(
+    DeviceEvents
+    | where Timestamp > ago(90d)
+    | where ActionType == "ScheduledTaskCreated"
+    | extend AF = parse_json(AdditionalFields)
+    | extend TaskName = tostring(AF.TaskName)
+    | where TaskName in~ (BadTaskNames)
+        or AdditionalFields has_any (BadTaskNames)
+    | project Timestamp, DeviceName, Source="DeviceEvents",
+              AccountName = InitiatingProcessAccountName,
+              TaskName,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where FileName in~ ("schtasks.exe", "powershell.exe",
+                           "pwsh.exe", "cmd.exe")
+    | where ProcessCommandLine has_any (BadTaskNames)
+    | project Timestamp, DeviceName, Source="ProcessCmd",
+              AccountName, TaskName = "",
+              InitiatingProcessFileName = FileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. POLYGON BLOCKCHAIN DEAD-DROP RESOLVER
+//    SmartLoader resolves its live C2 IP by querying a Polygon
+//    smart contract at polygon.drpc.org. ANY non-browser,
+//    non-wallet process reaching this endpoint is anomalous.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where RemoteUrl has_any ("polygon.drpc.org", "drpc.org")
+    or RemoteUrl has "polygon-rpc"
+| where InitiatingProcessFileName !in~ (
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "opera.exe", "iexplore.exe",
+    "MetaMask.exe", "Exodus.exe", "Ledger Live.exe",
+    "MsSense.exe", "MsMpEng.exe"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. LUA / LUAJIT INTERPRETER LAUNCHED FROM USER-WRITABLE PATHS
+//    The SmartLoader chain is Lua-based, launched by a
+//    single-line .bat invoking LuaJIT against an obfuscated Lua
+//    script. Legitimate LuaJIT in `Program Files` is excluded —
+//    we target execution from Downloads, %TEMP%, %LOCALAPPDATA%,
+//    %APPDATA%, Public, or any ZIP-extraction staging folder.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("luajit.exe", "lua.exe", "lua5.1.exe",
+                       "lua5.4.exe", "luajit-2.1.exe")
+    or InitiatingProcessFileName in~ ("luajit.exe", "lua.exe")
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\Tmp\",
+    @"\AppData\Local\Temp\", @"\AppData\Roaming\",
+    @"\AppData\Local\", @"\Users\Public\",
+    @"\Desktop\"
+)
+    or InitiatingProcessFolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp\",
+        @"\Users\Public\", @"\Desktop\"
+    )
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. BATCH → INTERPRETER CHAIN WITH .TXT / .LOG / .LUA SCRIPT
+//    The actor stages the Lua payload inside a text-like file
+//    extension to evade naive signature matching. Hunt for
+//    cmd.exe/.bat calling any interpreter with a non-standard
+//    script extension.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where InitiatingProcessFileName in~ ("cmd.exe")
+    or InitiatingProcessCommandLine has ".bat"
+| where FileName in~ ("luajit.exe", "lua.exe", "lua5.1.exe",
+                       "wscript.exe", "cscript.exe",
+                       "mshta.exe", "powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any (
+    ".txt", ".log", ".lua", ".dat", ".bin", ".ini", ".cfg"
+)
+| where ProcessCommandLine !has "\\Program Files"
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. SCHEDULED TASKS POINTING TO %LOCALAPPDATA% EXECUTABLES
+//    SmartLoader's persistence writes task actions that execute
+//    binaries stashed under %LOCALAPPDATA%. Legitimate tasks
+//    pointing there exist (OneDrive, Teams), so we exclude the
+//    common publishers and focus on unsigned / unknown binaries.
+// ------------------------------------------------------------
+DeviceEvents
+| where Timestamp > ago(60d)
+| where ActionType == "ScheduledTaskCreated"
+| extend AF = parse_json(AdditionalFields)
+| extend TaskName = tostring(AF.TaskName),
+         TaskExe  = tostring(AF.Command),
+         TaskArgs = tostring(AF.Arguments)
+| where TaskExe has_any (@"\AppData\Local\",
+                          @"\AppData\Roaming\",
+                          @"\Users\Public\",
+                          @"\ProgramData\")
+| where TaskExe !has "OneDrive"
+    and TaskExe !has "Teams"
+    and TaskExe !has "Microsoft\\Edge"
+    and TaskExe !has "GoogleUpdate"
+| project Timestamp, DeviceName,
+          AccountName = InitiatingProcessAccountName,
+          TaskName, TaskExe, TaskArgs,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. MULTIPART POST TO BARE IP WITH /api/ OR /task/ PATH
+//    Stager exfil pattern: multipart POST requests are sent to
+//    the resolved C2 IP directly (no hostname) on URI paths
+//    starting with `/api/` or `/task/`. MDE surfaces RemoteUrl
+//    populated with the IP string when DNS is bypassed.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl matches regex @"^https?://\d{1,3}(\.\d{1,3}){3}(/|$)"
+    or RemoteUrl matches regex @"^\d{1,3}(\.\d{1,3}){3}(/|$)"
+| where RemoteUrl has_any ("/api/", "/task/", "/tasks/",
+                            "/report", "/upload")
+| where InitiatingProcessFileName !in~ (
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "MsSense.exe", "MsMpEng.exe"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. raw.githubusercontent.com FETCH → RAPID EXECUTION
+//    Post-install re-entry path pulls an encrypted stage from
+//    an attacker-controlled raw.githubusercontent URL. Hunt for
+//    downloads followed by process execution on the same device
+//    within 10 minutes, filtering out legitimate dev tooling.
+// ------------------------------------------------------------
+let GithubPulls =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where RemoteUrl has "raw.githubusercontent.com"
+    | where InitiatingProcessFileName !in~ (
+        "git.exe", "git-remote-https.exe",
+        "Code.exe", "cursor.exe",
+        "node.exe", "npm.exe", "yarn.exe", "pnpm.exe",
+        "python.exe", "pip.exe",
+        "MsSense.exe", "MsMpEng.exe")
+    | project PullTime = Timestamp, DeviceName,
+              PullProc = InitiatingProcessFileName,
+              PullCmd  = InitiatingProcessCommandLine,
+              PullUrl  = RemoteUrl;
+let SuspExec =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp\",
+        @"\AppData\Roaming\", @"\AppData\Local\",
+        @"\Users\Public\", @"\Desktop\")
+    | project ExecTime = Timestamp, DeviceName,
+              ExecProc = FileName, ExecCmd = ProcessCommandLine,
+              ExecPath = FolderPath;
+GithubPulls
+| join kind=inner SuspExec on DeviceName
+| where ExecTime between (PullTime .. (PullTime + 10m))
+| project DeviceName, PullTime, PullProc, PullUrl,
+          ExecTime, ExecProc, ExecPath, ExecCmd,
+          Delta = ExecTime - PullTime
+| sort by PullTime desc
+
+
+// ------------------------------------------------------------
+// 8. schtasks.exe / New-ScheduledTask WITH OBFUSCATED NAME
+//    Heuristic sweep for scheduled-task creation whose name
+//    matches the `<word>_<alphanumeric-suffix>` pattern used
+//    by the actor (`AudioManager_ODM3`, `OfficeClickToRunTask_7d7757`).
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("schtasks.exe", "powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any (
+    "/Create", "New-ScheduledTask", "Register-ScheduledTask"
+)
+| where ProcessCommandLine matches regex
+    @"(?i)/TN\s+[""']?[A-Za-z][A-Za-z0-9]+_[A-Za-z0-9]{4,}[""']?"
+    or ProcessCommandLine matches regex
+    @"(?i)-TaskName\s+[""'][A-Za-z][A-Za-z0-9]+_[A-Za-z0-9]{4,}[""']"
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. ZIP EXTRACTION → .BAT LAUNCH CHAIN
+//    User double-clicks / extracts ZIP from a fake GitHub repo
+//    and shortly after a .bat fires off an interpreter. Hunt
+//    for compress-archive / Explorer extract followed by .bat
+//    execution in the same path within 2 minutes.
+// ------------------------------------------------------------
+let ZipExtract =
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("FileCreated", "FileModified")
+    | where FolderPath has_any (@"\Downloads\", @"\Desktop\",
+                                 @"\AppData\Local\Temp\")
+    | where FileName endswith ".bat"
+        or FileName endswith ".cmd"
+    | project ZipTime = Timestamp, DeviceName,
+              BatFile = FileName, BatPath = FolderPath,
+              InitiatingProcessFileName;
+let BatLaunch =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName in~ ("cmd.exe")
+        or InitiatingProcessCommandLine has ".bat"
+    | where FileName in~ ("luajit.exe", "lua.exe",
+                           "powershell.exe", "pwsh.exe",
+                           "wscript.exe", "mshta.exe")
+    | project LaunchTime = Timestamp, DeviceName,
+              LaunchProc = FileName,
+              LaunchCmd = ProcessCommandLine,
+              LaunchParent = InitiatingProcessCommandLine;
+ZipExtract
+| join kind=inner BatLaunch on DeviceName
+| where LaunchTime between (ZipTime .. (ZipTime + 2m))
+| project DeviceName, ZipTime, BatFile, BatPath,
+          LaunchTime, LaunchProc, LaunchCmd, LaunchParent,
+          Delta = LaunchTime - ZipTime
+| sort by ZipTime desc
+
+
+// ------------------------------------------------------------
+// 10. CONSOLE-HIDING API ABUSE (SUPPRESS VISIBLE WINDOW)
+//     SmartLoader's Lua stage hides its console via Win32 API
+//     (`ShowWindow(SW_HIDE)` or `FreeConsole`). Hunt for
+//     PowerShell / Lua / WSH command-lines explicitly invoking
+//     window-suppression patterns.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("powershell.exe", "pwsh.exe",
+                       "luajit.exe", "lua.exe",
+                       "wscript.exe", "cscript.exe", "mshta.exe")
+| where ProcessCommandLine has_any (
+    "-WindowStyle Hidden", "-w hidden",
+    "ShowWindow", "SW_HIDE",
+    "FreeConsole", "CreateNoWindow",
+    "Hidden ", "/b ", "-noninteractive"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp\",
+    @"\AppData\Roaming\", @"\AppData\Local\", @"\Users\Public\"
+)
+    or FolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp\",
+        @"\AppData\Roaming\", @"\Users\Public\"
+    )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. STEALC BEHAVIOURAL — BROWSER CREDENTIAL STORE READS
+//     StealC is reflectively loaded in-memory — no disk IOC.
+//     Hunt the *effect*: a process loaded from a user-writable
+//     path reading known infostealer targets (Login Data,
+//     Local State, Cookies SQLite).
+//     NOTE: DeviceFileEvents has no `AccountName` — use
+//     `InitiatingProcessAccountName`.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileAccessed", "FileCreated",
+                        "FileModified", "FileRenamed")
+| where FileName in~ (
+    "Login Data", "Login Data For Account",
+    "Local State", "Cookies", "Web Data",
+    "logins.json", "key4.db", "key3.db", "cookies.sqlite",
+    "wallet.dat"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp\",
+    @"\AppData\Roaming\", @"\AppData\Local\",
+    @"\Users\Public\", @"\Desktop\"
+)
+| where InitiatingProcessFileName !in~ (
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "opera.exe", "MsSense.exe", "MsMpEng.exe"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. FULL KILL-CHAIN CORRELATION
+//     Priority-ranked list of devices showing 2+ indicators
+//     within a 14-day window:
+//       (a) LuaJIT / Lua from user-writable path
+//       (b) polygon.drpc.org or drpc.org outbound
+//       (c) Bare-IP POST to /api/ or /task/
+//       (d) Scheduled task with obfuscated name pattern
+//       (e) StealC-style browser credential store read
+//     2+ signals = likely active SmartLoader infection.
+// ------------------------------------------------------------
+let LuaExec =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ ("luajit.exe", "lua.exe", "lua5.1.exe")
+    | where FolderPath has_any (@"\Downloads\", @"\Temp\",
+                                 @"\AppData\", @"\Users\Public\")
+    | summarize LuaHits=count(), LuaLast=max(Timestamp) by DeviceName;
+let PolygonDrop =
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where RemoteUrl has_any ("polygon.drpc.org", "drpc.org")
+    | where InitiatingProcessFileName !in~ (
+        "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe")
+    | summarize PolyHits=count(), PolyLast=max(Timestamp) by DeviceName;
+let BareIPPost =
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where RemoteUrl matches regex @"^https?://\d{1,3}(\.\d{1,3}){3}"
+    | where RemoteUrl has_any ("/api/", "/task/", "/report", "/upload")
+    | summarize C2Hits=count(), C2Last=max(Timestamp) by DeviceName;
+let ObfTask =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ ("schtasks.exe", "powershell.exe", "pwsh.exe")
+    | where ProcessCommandLine matches regex
+        @"(?i)(/TN\s+|TaskName\s+[""'])[A-Za-z][A-Za-z0-9]+_[A-Za-z0-9]{4,}"
+       or ProcessCommandLine has_any ("AudioManager_ODM3",
+                                       "OfficeClickToRunTask_7d7757")
+    | summarize TaskHits=count(), TaskLast=max(Timestamp) by DeviceName;
+let CredRead =
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ ("Login Data", "Local State", "Cookies",
+                          "logins.json", "key4.db")
+    | where InitiatingProcessFolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\", @"\Users\Public\")
+    | where InitiatingProcessFileName !in~ (
+        "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe")
+    | summarize CredHits=count(), CredLast=max(Timestamp) by DeviceName;
+LuaExec
+| join kind=fullouter PolygonDrop on DeviceName
+| join kind=fullouter BareIPPost  on DeviceName
+| join kind=fullouter ObfTask     on DeviceName
+| join kind=fullouter CredRead    on DeviceName
+| extend Device = coalesce(DeviceName, DeviceName1,
+                            DeviceName2, DeviceName3, DeviceName4)
+| extend RiskSignals =
+      iff(isnotempty(LuaHits),   1, 0)
+    + iff(isnotempty(PolyHits),  1, 0)
+    + iff(isnotempty(C2Hits),    1, 0)
+    + iff(isnotempty(TaskHits),  1, 0)
+    + iff(isnotempty(CredHits),  1, 0)
+| where RiskSignals >= 2
+| project Device, RiskSignals,
+          LuaHits,  LuaLast,
+          PolyHits, PolyLast,
+          C2Hits,   C2Last,
+          TaskHits, TaskLast,
+          CredHits, CredLast
+| sort by RiskSignals desc, C2Last desc
