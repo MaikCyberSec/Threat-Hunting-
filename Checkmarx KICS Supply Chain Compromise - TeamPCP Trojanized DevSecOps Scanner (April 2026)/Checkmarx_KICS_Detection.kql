@@ -1,0 +1,566 @@
+// ============================================================
+// Checkmarx KICS Supply Chain Compromise — TeamPCP
+// Trojanized DevSecOps Scanner (Docker Hub + VS Code Marketplace)
+// Detected: April 22, 2026 (Socket Research / Docker monitoring)
+// Public disclosure: April 23, 2026
+// Source:  CybersecurityNews / Socket / Checkmarx advisory
+// Platform: Microsoft Defender XDR (Advanced Hunting) —
+//           Windows + Linux (MDE for Linux) + Sentinel
+//           (CloudAppEvents for GitHub / Docker Hub audit)
+// MITRE ATT&CK: T1195.002, T1199, T1587.001, T1583.001,
+//               T1552.001, T1552.007, T1078.004, T1567,
+//               T1567.002, T1005, T1021.004, T1087, T1557.001
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// On April 22, 2026 the TeamPCP threat group poisoned multiple
+// distribution channels for Checkmarx KICS (Keeping Infrastructure
+// as Code Secure) — an open-source DevSecOps scanner used in
+// CI/CD pipelines for Terraform, CloudFormation, and Kubernetes.
+//
+// TeamPCP had previously attacked Checkmarx, Trivy, and LiteLLM
+// in March 2026. Public claim from the actor:
+//   "Thank you OSS distribution for another very successful day
+//    at PCP inc."
+//
+// POISONED DISTRIBUTION CHANNELS
+// ---------------------------------------------------------------
+//   (a) Docker Hub — checkmarx/kics
+//       Tags: v2.1.20-debian, v2.1.20, debian, alpine, latest
+//             + a fraudulent v2.1.21 (no upstream release exists)
+//   (b) VS Code Marketplace + Open VSX
+//       - cx-dev-assist v1.17.0, v1.19.0
+//       - ast-results   v2.63.0, v2.66.0
+//   (c) Checkmarx official GitHub repo — backdated commit
+//       `68ed490b` used to host the stage-2 JavaScript payload
+//
+// ATTACK CHAIN
+// ---------------------------------------------------------------
+//   1. Victim pulls trojanized KICS Docker image or installs the
+//      compromised VS Code extension.
+//   2. Modified KICS ELF binary (Go) produces legitimate-looking
+//      scan output while silently fetching a stage-2 payload.
+//   3. Bun runtime is dropped / invoked to execute `mcpAddon.js`
+//      (~10 MB obfuscated bundle) pulled from the backdated
+//      commit in the Checkmarx GitHub repo.
+//   4. `mcpAddon.js` harvests credentials:
+//        - GitHub tokens     - AWS keys
+//        - Azure tokens      - GCP tokens
+//        - .npmrc            - SSH keys
+//        - Environment variables
+//      Compressed + encrypted, exfiltrated to attacker C2.
+//   5. Stolen GitHub tokens used to inject malicious Actions
+//      workflow `.github/workflows/format-check.yml` into
+//      victim repos, abusing `${{ toJSON(secrets) }}` to
+//      serialize ALL repo secrets into a downloadable artifact.
+//   6. Stolen npm tokens used to locate packages the victim has
+//      write access to and republish poisoned versions
+//      downstream.
+//
+// PRIMARY IOCs
+// ---------------------------------------------------------------
+//   C2 URL         https://audit.checkmarx[.]cx/v1/telemetry
+//                  (NOTE: `.cx` TLD — NOT `.com`)
+//   C2 IP          94.154.172.43
+//   SHA256 (ELF)   2a6a35f06118ff7d61bfd36a5788557b695095e7c9a609b4a01956883f146f50
+//   SHA256 (JS)    24680027afadea90c7c713821e214b15cb6c922e67ac01109fb1edb3ee4741d9
+//   Backdoor commit  68ed490b (in checkmarx/kics GitHub repo)
+//   Stage-2 filename mcpAddon.js
+//   Workflow IOC   .github/workflows/format-check.yml
+//   Actions pattern  `${{ toJSON(secrets) }}` (abused for bulk
+//                  secret exfiltration as artifact)
+//   Repo pattern   name = <word>-<word>-<3 digits>
+//                  description = "Checkmarx Configuration Storage"
+//
+// SCHEMA NOTES (validated against Defender XDR Advanced Hunting)
+// ---------------------------------------------------------------
+//  - DeviceNetworkEvents has NO `AccountName` column — use
+//    `InitiatingProcessAccountName`.
+//  - DeviceFileEvents has NO `AccountName` column — use
+//    `InitiatingProcessAccountName` or `RequestAccountName`.
+//  - DeviceProcessEvents has BOTH `AccountName` (subject) and
+//    `InitiatingProcessAccountName` (parent).
+//  - DeviceImageLoadEvents does NOT have `AccountName` — use
+//    `InitiatingProcessAccountName`.
+//  - KICS runs predominantly on Linux CI runners — Windows and
+//    Linux MDE telemetry both flow into the same tables.
+//  - File-path separators in SHA-hash / filename hunts use
+//    forward slashes for Linux and `@"\x\y\z"` raw strings for
+//    Windows. Where both platforms are in scope we use `has`
+//    substring matches instead of exact path matches.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//  - Developers legitimately running KICS from safe image tags
+//    (pinned to SHA digests) — this hunt filters on compromised
+//    tag set + hash set, not "any KICS execution".
+//  - Bun runtime has legitimate uses (Next.js dev, test runs) —
+//    we flag Bun *spawned by KICS* or Bun downloading from the
+//    backdoored GitHub commit, not Bun in general.
+//  - `format-check.yml` is a common workflow filename — we join
+//    on the `toJSON(secrets)` serialization anti-pattern which
+//    is specific.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//  - https://cybersecuritynews.com/checkmarx-kics-compromised/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. PRIMARY C2 — audit.checkmarx[.]cx  /  94.154.172.43
+//    Highest-fidelity single indicator. Any outbound connection
+//    from any host in the estate is an incident.
+//    NOTE: the malicious domain uses `.cx` — NOT `.com`.
+//    Filter string intentionally written to avoid false matches
+//    on legitimate checkmarx.com traffic.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has "audit.checkmarx.cx"
+    or RemoteUrl has "checkmarx.cx/v1/telemetry"
+    or RemoteIP == "94.154.172.43"
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteUrl, RemoteIP, RemotePort, Protocol
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. KNOWN-BAD FILE HASHES
+//    Trojanized KICS ELF binary + mcpAddon.js stage-2 bundle.
+//    Hunt across process execution, file write, and DLL/image
+//    load telemetry to maximise coverage.
+// ------------------------------------------------------------
+let BadHashes = dynamic([
+    "2a6a35f06118ff7d61bfd36a5788557b695095e7c9a609b4a01956883f146f50",  // trojan KICS ELF (Go)
+    "24680027afadea90c7c713821e214b15cb6c922e67ac01109fb1edb3ee4741d9"   // mcpAddon.js
+]);
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where SHA256 in~ (BadHashes)
+    | project Timestamp, DeviceName, AccountName,
+              Source = "ProcessExec",
+              FileName, FolderPath, SHA256,
+              ProcessCommandLine,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where SHA256 in~ (BadHashes)
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "FileWrite",
+              FileName, FolderPath, SHA256,
+              ProcessCommandLine = InitiatingProcessCommandLine,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(30d)
+    | where SHA256 in~ (BadHashes)
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "ImageLoad",
+              FileName, FolderPath, SHA256,
+              ProcessCommandLine = InitiatingProcessCommandLine,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. COMPROMISED KICS DOCKER IMAGE PULL / RUN
+//    Detects `docker pull` / `docker run` / compose / kubectl
+//    references to the poisoned tag set. Works for shell-driven
+//    CI runners as well as interactive developer workstations.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("docker", "docker.exe",
+                       "podman", "podman.exe",
+                       "nerdctl", "kubectl", "kubectl.exe",
+                       "buildah", "skopeo")
+    or ProcessCommandLine has_any ("docker pull", "docker run",
+                                    "docker-compose", "podman pull",
+                                    "kubectl run", "kubectl apply")
+| where ProcessCommandLine has "checkmarx/kics"
+| where ProcessCommandLine has_any (
+    "checkmarx/kics:v2.1.20",
+    "checkmarx/kics:v2.1.20-debian",
+    "checkmarx/kics:v2.1.21",
+    "checkmarx/kics:debian",
+    "checkmarx/kics:alpine",
+    "checkmarx/kics:latest"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. COMPROMISED VS CODE EXTENSION ARTIFACTS ON DISK
+//    cx-dev-assist 1.17.0 / 1.19.0  and  ast-results 2.63.0 / 2.66.0.
+//    VS Code stores extensions under
+//      Windows: %USERPROFILE%\.vscode\extensions\<publisher>.<ext>-<ver>
+//      Linux/Mac: ~/.vscode/extensions/<publisher>.<ext>-<ver>
+//    Match by folder name regardless of platform.
+//    NOTE: DeviceFileEvents has no `AccountName` — use
+//    `InitiatingProcessAccountName`.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has ".vscode"
+    or FolderPath has ".vscode-server"
+    or FolderPath has "vscode/extensions"
+| where FolderPath has_any (
+    "cx-dev-assist-1.17.0", "cx-dev-assist-1.19.0",
+    "ast-results-2.63.0",   "ast-results-2.66.0",
+    "checkmarx.cx-dev-assist-1.17.0",
+    "checkmarx.cx-dev-assist-1.19.0",
+    "checkmarx.ast-results-2.63.0",
+    "checkmarx.ast-results-2.66.0"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. UNEXPECTED BUN RUNTIME EXECUTION SPAWNED BY KICS / VS CODE
+//    The stage-2 JS payload is launched via Bun. Legitimate Bun
+//    use is normal on JS-dev machines, but Bun invoked as a
+//    *child of* a KICS binary or spawned immediately before a
+//    network call to the backdoored GitHub URL is anomalous.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("bun", "bun.exe", "bunx", "bunx.exe")
+    or ProcessCommandLine has "bun run"
+    or ProcessCommandLine has "bunx "
+| where InitiatingProcessFileName has_any (
+    "kics", "kics.exe",                  // KICS binary
+    "cx-dev-assist", "ast-results",      // VS Code extensions
+    "Code.exe", "code",                  // VS Code itself (parent)
+    "node", "node.exe"                   // JS shim chain
+)
+    or ProcessCommandLine has_any ("mcpAddon", "mcpAddon.js")
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. mcpAddon.js DROP / EXECUTION
+//    The stage-2 JS file. Hunt for file write, process launch,
+//    and command-line references to the exact filename.
+// ------------------------------------------------------------
+union
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FileName =~ "mcpAddon.js" or FolderPath has "mcpAddon"
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "FileDrop",
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has "mcpAddon"
+    | project Timestamp, DeviceName, AccountName,
+              Source = "ProcRef",
+              FileName, FolderPath, SHA256 = tostring(SHA256),
+              InitiatingProcessFileName = FileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. BACKDOORED GITHUB COMMIT REFERENCE (68ed490b)
+//    The stage-2 payload is fetched from a specific backdated
+//    commit in the official Checkmarx GitHub repo. Any HTTP
+//    fetch, git checkout, or command line referencing that
+//    commit hash is investigation-worthy.
+// ------------------------------------------------------------
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has "68ed490b"
+    | project Timestamp, DeviceName, AccountName, Source="Process",
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceNetworkEvents
+    | where Timestamp > ago(60d)
+    | where RemoteUrl has "68ed490b"
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "Network",
+              FileName = InitiatingProcessFileName,
+              ProcessCommandLine = InitiatingProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine = RemoteUrl
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. CREDENTIAL FILE HARVEST BY KICS / BUN / mcpAddon
+//    The stage-2 payload reads .npmrc, .env, cloud credentials,
+//    and SSH keys. Hunt for the high-value credential files
+//    being touched by the trojan's likely process identities.
+//    NOTE: DeviceFileEvents has no `AccountName` column — use
+//    `InitiatingProcessAccountName`.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileAccessed", "FileModified",
+                        "FileCreated", "FileRenamed")
+| where FileName in~ (
+    ".npmrc",
+    ".env", ".env.local", ".env.production",
+    "credentials", "credentials.json",
+    "config", "config.json",
+    "id_rsa", "id_ed25519", "id_ecdsa",
+    "known_hosts",
+    "gcloud-credentials.json",
+    "azure.json",
+    "service-account.json"
+)
+    or FolderPath has_any (
+        @"\.aws\", "/.aws/",
+        @"\.azure\", "/.azure/",
+        @"\.config\gcloud", "/.config/gcloud",
+        @"\.ssh\", "/.ssh/",
+        @"\.docker\", "/.docker/"
+    )
+| where InitiatingProcessFileName in~ (
+    "kics", "kics.exe",
+    "bun", "bun.exe", "bunx", "bunx.exe",
+    "node", "node.exe",
+    "cx-dev-assist", "ast-results"
+)
+    or InitiatingProcessCommandLine has_any ("mcpAddon", "kics")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. MALICIOUS GITHUB ACTIONS WORKFLOW — format-check.yml +
+//    `toJSON(secrets)` SECRET SERIALIZATION
+//    Post-compromise the actor injects a workflow that writes
+//    the full JSON-serialized `secrets` context to a build
+//    artifact for later download. Hunt for the file write on
+//    any developer workstation or CI agent.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has ".github/workflows"
+    or FolderPath has @"\.github\workflows"
+| where FileName =~ "format-check.yml" or FileName =~ "format-check.yaml"
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath,
+          SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. `toJSON(secrets)` PATTERN ANYWHERE IN THE ESTATE
+//     Generic sweep — any file write or command line that
+//     embeds `toJSON(secrets)` is, in isolation, a detection
+//     anti-pattern regardless of the filename. Surfaces copy-
+//     cat campaigns reusing the same exfil trick.
+// ------------------------------------------------------------
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has "toJSON(secrets)"
+       or ProcessCommandLine has "toJson(secrets)"
+    | project Timestamp, DeviceName, AccountName, Source="Process",
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where ActionType in ("FileCreated","FileModified","FileRenamed")
+    | where FolderPath has ".github/workflows"
+        or FolderPath has @"\.github\workflows"
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "WorkflowWrite",
+              FileName,
+              ProcessCommandLine = strcat(FolderPath, "/", FileName),
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. CLOUDAPPEVENTS — ATTACKER-CONTROLLED "CHECKMARX
+//     CONFIGURATION STORAGE" GITHUB REPOS
+//     TeamPCP stages payloads / exfil buckets in GitHub repos
+//     named `<word>-<word>-<3 digits>` with the description
+//     "Checkmarx Configuration Storage". Hunt GitHub audit
+//     activity ingested into CloudAppEvents.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(90d)
+| where Application has "GitHub"
+| extend Raw = tostring(RawEventData)
+| where Raw has "Checkmarx Configuration Storage"
+    or Raw matches regex @"[a-z]+-[a-z]+-\d{3}"
+       and Raw has "Checkmarx"
+| project Timestamp, Application, ActionType,
+          AccountDisplayName, AccountObjectId,
+          IPAddress, UserAgent,
+          ActivityObjects, RawEventData
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KICS EXECUTION → OUTBOUND EGRESS WITHIN 5 MIN
+//     Behavioural catch-all: a KICS process runs and within
+//     five minutes the same device makes an unusual outbound
+//     connection NOT to a known-benign Checkmarx / registry
+//     host. Captures re-hashed variants of the trojan.
+// ------------------------------------------------------------
+let KicsRuns =
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName in~ ("kics", "kics.exe")
+         or ProcessCommandLine has "checkmarx/kics"
+    | project KicsTime = Timestamp, DeviceName,
+              KicsCmd = ProcessCommandLine,
+              KicsProc = FileName;
+let OutboundEgress =
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where RemoteUrl !has "checkmarx.com"
+    | where RemoteUrl !has "github.com"
+    | where RemoteUrl !has "githubusercontent.com"
+    | where RemoteUrl !has "docker.io"
+    | where RemoteUrl !has "ghcr.io"
+    | where RemoteUrl !has "microsoft.com"
+    | where RemoteUrl !has "npmjs.org"
+    | where RemoteUrl !has "registry.npmjs"
+    | project NetTime = Timestamp, DeviceName,
+              RemoteUrl, RemoteIP,
+              NetProc = InitiatingProcessFileName,
+              NetCmd  = InitiatingProcessCommandLine;
+KicsRuns
+| join kind=inner OutboundEgress on DeviceName
+| where NetTime between (KicsTime .. (KicsTime + 5m))
+| project DeviceName, KicsTime, KicsProc, KicsCmd,
+          NetTime, NetProc, RemoteUrl, RemoteIP, NetCmd,
+          Delta = NetTime - KicsTime
+| sort by KicsTime desc
+
+
+// ------------------------------------------------------------
+// 13. FULL KILL-CHAIN CORRELATION
+//     Priority-ranked list of hosts with multiple TeamPCP
+//     indicators present inside a 7-day window:
+//       (a) compromised KICS image / binary / VS Code ext
+//       (b) Bun runtime execution (stage-2 loader)
+//       (c) credential file read by kics/bun/node
+//       (d) outbound to C2 (audit.checkmarx[.]cx / 94.154.172.43)
+//     Devices matching 2+ signals are highest priority for
+//     credential rotation and IR.
+// ------------------------------------------------------------
+let CompromisedKics =
+    union
+    (
+        DeviceProcessEvents
+        | where Timestamp > ago(7d)
+        | where ProcessCommandLine has "checkmarx/kics"
+           and ProcessCommandLine has_any ("v2.1.20","v2.1.21",
+                                            ":debian",":alpine",":latest")
+        | project Timestamp, DeviceName
+    ),
+    (
+        DeviceProcessEvents
+        | where Timestamp > ago(7d)
+        | where SHA256 in~ (
+            "2a6a35f06118ff7d61bfd36a5788557b695095e7c9a609b4a01956883f146f50",
+            "24680027afadea90c7c713821e214b15cb6c922e67ac01109fb1edb3ee4741d9")
+        | project Timestamp, DeviceName
+    ),
+    (
+        DeviceFileEvents
+        | where Timestamp > ago(7d)
+        | where FolderPath has_any (
+            "cx-dev-assist-1.17.0", "cx-dev-assist-1.19.0",
+            "ast-results-2.63.0",   "ast-results-2.66.0")
+        | project Timestamp, DeviceName
+    )
+    | summarize KicsFirst=min(Timestamp), KicsLast=max(Timestamp),
+                KicsHits=count() by DeviceName;
+let BunRuntime =
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where FileName in~ ("bun","bun.exe","bunx","bunx.exe")
+         or ProcessCommandLine has_any ("bun run","bunx ","mcpAddon")
+    | summarize BunFirst=min(Timestamp), BunLast=max(Timestamp),
+                BunHits=count() by DeviceName;
+let CredHarvest =
+    DeviceFileEvents
+    | where Timestamp > ago(7d)
+    | where FileName in~ (".npmrc",".env","credentials",
+                          "id_rsa","id_ed25519")
+         or FolderPath has_any (@"\.aws\","/.aws/",
+                                @"\.azure\","/.azure/",
+                                @"\.ssh\","/.ssh/")
+    | where InitiatingProcessFileName in~ (
+        "kics","kics.exe","bun","bun.exe","bunx","bunx.exe",
+        "node","node.exe")
+    | summarize CredFirst=min(Timestamp), CredLast=max(Timestamp),
+                CredHits=count() by DeviceName;
+let C2Egress =
+    DeviceNetworkEvents
+    | where Timestamp > ago(7d)
+    | where RemoteUrl has "audit.checkmarx.cx"
+         or RemoteIP == "94.154.172.43"
+    | summarize C2First=min(Timestamp), C2Last=max(Timestamp),
+                C2Hits=count() by DeviceName;
+CompromisedKics
+| join kind=leftouter BunRuntime  on DeviceName
+| join kind=leftouter CredHarvest on DeviceName
+| join kind=leftouter C2Egress    on DeviceName
+| extend RiskSignals =
+      iff(isnotempty(KicsHits), 1, 0)
+    + iff(isnotempty(BunHits),  1, 0)
+    + iff(isnotempty(CredHits), 1, 0)
+    + iff(isnotempty(C2Hits),   1, 0)
+| where RiskSignals >= 2
+| project DeviceName, RiskSignals,
+          KicsFirst, KicsLast, KicsHits,
+          BunFirst,  BunLast,  BunHits,
+          CredFirst, CredLast, CredHits,
+          C2First,   C2Last,   C2Hits
+| sort by RiskSignals desc, C2Last desc
