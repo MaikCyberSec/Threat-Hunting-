@@ -1,0 +1,532 @@
+// ============================================================
+// UNC6692 — Microsoft Teams External Chat Abuse →
+// SNOWBELT / SNOWGLAZE / SNOWBASIN Ecosystem
+// Disclosed:  April 22, 2026 (GTIG / Mandiant)
+// Email-bomb pre-stage active from late December 2025
+// Source:     CybersecurityNews / Google Threat Intelligence
+//             Group / Mandiant / Microsoft advisory
+// Platform:   Microsoft Defender XDR (Advanced Hunting) +
+//             Microsoft Sentinel
+// MITRE ATT&CK: T1566.003 (Spearphishing via Service),
+//               T1204.002, T1078.004, T1176 (Browser Ext),
+//               T1059.005 (AHK), T1059.001, T1053.005,
+//               T1547.001 (Startup folder), T1071.001,
+//               T1090.002 (SOCKS), T1102 (Web Service),
+//               T1003.001 (LSASS dump), T1003.003 (NTDS),
+//               T1550.002 (Pass-the-Hash), T1021.001 (RDP),
+//               T1046, T1113, T1567.002
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Mandiant / GTIG disclosed on April 22, 2026 that threat group
+// **UNC6692** is abusing *legitimate* Microsoft Teams external
+// collaboration to phish credentials and deploy a modular
+// post-exploit framework dubbed the **SNOW ecosystem** —
+// without exploiting any software vulnerability.
+//
+// ACTOR PLAYBOOK
+// ---------------------------------------------------------------
+//   1. Mass email-bombing (December 2025) creates urgency and
+//      plausibility for the follow-up.
+//   2. Attacker tenant initiates a Microsoft Teams chat with the
+//      victim, posing as internal IT helpdesk.
+//   3. Chat delivers a link using the `microsoft-edge:` URI
+//      scheme, forcing Edge to render the phishing page.
+//   4. Page ("Mailbox Repair and Sync Utility v2.1.5") is gated
+//      on an `?email=` URL parameter, rejects the first two
+//      password attempts on purpose (psychological anchoring),
+//      exfils creds to an S3 bucket on the 3rd attempt.
+//   5. Fake "Parsing configuration data" progress bar covers a
+//      background payload download from AWS S3:
+//        - `RegSrvc.exe`  (AutoHotKey binary, renamed)
+//        - `Protected.ahk` (obfuscated AHK script)
+//   6. SNOW ecosystem lands:
+//        - **SNOWBELT**   — Chromium browser extension
+//                           (directory name `SysEvents`), uses a
+//                           DGA-generated S3 URL and the VAPID
+//                           key listed below for C2 relay.
+//        - **SNOWGLAZE**  — Python WebSocket-SOCKS tunneler to
+//                           Heroku C2.
+//        - **SNOWBASIN**  — Python local HTTP server on port
+//                           8000 for shell exec + screenshot +
+//                           file exfil.
+//   7. Persistence: Startup folder shortcut + TWO scheduled
+//      tasks + headless Microsoft Edge silently loading the
+//      SNOWBELT extension.
+//   8. Post-compromise: local port scan (135/445/3389), PsExec,
+//      RDP to backup server, Task-Manager-based LSASS dump,
+//      NTDS.dit / SAM / SYSTEM / SECURITY hive extraction via
+//      FTK Imager, Pass-the-Hash to DCs, exfil via LimeWire.
+//
+// PRIMARY IOCs
+// ---------------------------------------------------------------
+//   Phishing URL pattern
+//     https://service-page-[ID]-outlook.s3.us-west-2.amazonaws.com/update.html?email=
+//
+//   Heroku WebSocket C2
+//     wss://sad4w7h913-b4a57f9c36eb[.]herokuapp[.]com:443/ws
+//
+//   SNOWBELT DGA S3 URL pattern
+//     https://[a-f0-9]{24}-[0-9]{6,7}-[0-9]{1}.s3.us-east-2.amazonaws[.]com
+//
+//   SNOWBELT VAPID key (unique per campaign — highest-fidelity)
+//     BJkWCT45mL0uvV3AssRaq9Gn7iE2N7Lx38ZmWDFCjwhz0zv0QSVhKuZBLTTgAijB12cgzMzqyiJZr5tokRzSJu0
+//
+//   Masquerading artefacts
+//     RegSrvc.exe                 (AutoHotKey binary)
+//     Protected.ahk               (stage-2 AHK script)
+//     SysEvents                   (SNOWBELT extension directory)
+//     "Mailbox Repair and Sync Utility v2.1.5"  (phish page title)
+//
+// SCHEMA NOTES (validated against Defender XDR)
+// ---------------------------------------------------------------
+//  - CloudAppEvents: Microsoft Teams federated chat surfaces
+//    with `Application` containing "Microsoft Teams" and
+//    identity details in `AccountDisplayName` / `RawEventData`.
+//    External tenant activity often shows up as `ActionType`
+//    containing "ChatCreated" / "MessageSent" / "MemberAdded".
+//  - DeviceNetworkEvents has NO `AccountName` — use
+//    `InitiatingProcessAccountName`.
+//  - DeviceFileEvents has NO `AccountName` — use
+//    `InitiatingProcessAccountName` or `RequestAccountName`.
+//  - DeviceProcessEvents has BOTH `AccountName` (subject) and
+//    `InitiatingProcessAccountName` (parent).
+//  - Scheduled task create events surface via
+//    `DeviceEvents | where ActionType == "ScheduledTaskCreated"`.
+//  - Registry-based Chromium extension install surfaces via
+//    DeviceRegistryEvents against the ExtensionInstallForcelist
+//    / ExtensionSettings paths.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//  - External Teams chat is legitimate for many orgs. The hunt
+//    in query #1 is a BASELINE — tune to your federated allow-
+//    list, then alert on chats from tenants outside it.
+//  - `microsoft-edge:` URI scheme has some legitimate use (help
+//    links from native apps). We filter on non-browser parents.
+//  - AutoHotKey is legitimate for some power users — the hunt
+//    keys on the specific renamed `RegSrvc.exe` masquerade and
+//    AHK scripts dropped in user-writable paths.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//  - https://cybersecuritynews.com/microsoft-teams-breach-organizations/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. MICROSOFT TEAMS CHAT FROM EXTERNAL / NON-FEDERATED TENANT
+//    Baseline + hunt. Any Teams chat / message where the remote
+//    party is outside your tenant and NOT on your federated
+//    allow-list is the attack entry point for UNC6692.
+//    Tune the `AllowedExternalDomains` list to your environment.
+// ------------------------------------------------------------
+let AllowedExternalDomains = dynamic([
+    "wortell.nl",          // <-- replace with YOUR allow-list
+    "microsoft.com"
+]);
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where Application has "Teams" or Application has "Microsoft Teams"
+| where ActionType has_any ("ChatCreated", "MessageSent",
+                             "MemberAdded", "MemberRoleChanged",
+                             "FederatedChat", "External")
+| extend Raw = tostring(RawEventData)
+| where Raw has_any ("@", "external", "federated", "outsidetenant")
+| extend ExternalHit = iff(
+    Raw matches regex @"(?i)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+    extract(@"(?i)@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})", 1, Raw),
+    "")
+| where ExternalHit != ""
+    and not(ExternalHit has_any (AllowedExternalDomains))
+| project Timestamp, Application, ActionType,
+          AccountDisplayName, AccountObjectId,
+          ExternalDomain = ExternalHit,
+          IPAddress, UserAgent,
+          ActivityObjects, RawEventData
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. `microsoft-edge:` URI SCHEME INVOKED BY NON-BROWSER PARENT
+//    The UNC6692 chat link forces Edge to open the phish page
+//    via the `microsoft-edge:` protocol handler. Teams.exe /
+//    Outlook.exe / ms-teams.exe spawning msedge.exe with that
+//    scheme is the attack entry on-endpoint.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("msedge.exe", "cmd.exe", "rundll32.exe")
+    or ProcessCommandLine has "microsoft-edge:"
+| where ProcessCommandLine has "microsoft-edge:"
+    or InitiatingProcessCommandLine has "microsoft-edge:"
+| where InitiatingProcessFileName in~ (
+    "Teams.exe", "ms-teams.exe", "msteams.exe",
+    "Outlook.exe", "OUTLOOK.EXE",
+    "explorer.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. PHISHING URL PATTERN —
+//    service-page-[ID]-outlook.s3.us-west-2.amazonaws.com
+//    High-fidelity. Any device reaching this hostname family
+//    during the campaign window is a confirmed hit.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteUrl matches regex
+    @"(?i)service-page-[A-Za-z0-9\-]+-outlook\.s3\.us-west-2\.amazonaws\.com"
+    or RemoteUrl has "service-page-"
+       and RemoteUrl has "-outlook.s3.us-west-2.amazonaws.com"
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. SNOWBELT DGA S3 URL PATTERN
+//    24-hex + 6/7-digit + single-digit prefix on a
+//    us-east-2 S3 bucket. Highly regular — low FP rate.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteUrl matches regex
+    @"(?i)[a-f0-9]{24}-[0-9]{6,7}-[0-9]{1}\.s3\.us-east-2\.amazonaws\.com"
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteUrl, RemoteIP
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. SNOWBELT VAPID KEY PRESENCE
+//    The Web-Push VAPID key embedded in the extension is unique
+//    per campaign — anywhere it touches disk, command line,
+//    registry, or process telemetry is a confirmed infection.
+// ------------------------------------------------------------
+let Vapid = "BJkWCT45mL0uvV3AssRaq9Gn7iE2N7Lx38ZmWDFCjwhz0zv0QSVhKuZBLTTgAijB12cgzMzqyiJZr5tokRzSJu0";
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where ProcessCommandLine has Vapid
+         or InitiatingProcessCommandLine has Vapid
+    | project Timestamp, DeviceName, AccountName, Source="Process",
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceRegistryEvents
+    | where Timestamp > ago(90d)
+    | where RegistryValueData has Vapid
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "Registry",
+              FileName = RegistryValueName,
+              ProcessCommandLine = RegistryValueData,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. SNOWBELT EXTENSION DIRECTORY — `SysEvents`
+//    The SNOWBELT browser extension lives in a folder literally
+//    named `SysEvents` dropped under the Chromium user data
+//    directory. Hunt file writes in Edge / Chrome / Brave
+//    extension paths.
+//    NOTE: DeviceFileEvents has no `AccountName` — use
+//    `InitiatingProcessAccountName`.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(90d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has_any (
+    @"\Microsoft\Edge\User Data\",
+    @"\Google\Chrome\User Data\",
+    @"\BraveSoftware\Brave-Browser\User Data\",
+    @"\Mozilla\Firefox\Profiles\"
+)
+| where FolderPath has "SysEvents"
+    or FileName =~ "SysEvents"
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. MASQUERADED AUTOHOTKEY — `RegSrvc.exe` + `.ahk` STAGING
+//    UNC6692 renames the AutoHotKey binary to `RegSrvc.exe`
+//    (looks like a Windows service) and ships an accompanying
+//    `.ahk` script (`Protected.ahk`).
+// ------------------------------------------------------------
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where FileName =~ "RegSrvc.exe"
+        or ProcessCommandLine has_any ("Protected.ahk", ".ahk")
+    | project Timestamp, DeviceName, AccountName,
+              Source = "Process",
+              FileName, FolderPath, ProcessCommandLine, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(90d)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FileName in~ ("RegSrvc.exe", "Protected.ahk")
+        or FileName endswith ".ahk"
+    | where FolderPath has_any (
+        @"\Downloads\", @"\AppData\Roaming\",
+        @"\AppData\Local\", @"\AppData\Local\Temp\",
+        @"\Users\Public\", @"\Desktop\", @"\ProgramData\")
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "FileWrite",
+              FileName, FolderPath,
+              ProcessCommandLine = InitiatingProcessCommandLine,
+              SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. HEROKU WEBSOCKET C2 — SNOWGLAZE TUNNELER
+//    Known C2 plus structural pattern. `*.herokuapp.com`
+//    reached over WSS from a non-browser process is the signal.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(90d)
+| where RemoteUrl has "sad4w7h913-b4a57f9c36eb.herokuapp.com"
+    or (RemoteUrl has ".herokuapp.com"
+        and RemoteUrl has "/ws")
+| where InitiatingProcessFileName !in~ (
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "MsSense.exe", "MsMpEng.exe")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteUrl, RemoteIP, RemotePort
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. HEADLESS EDGE / `--load-extension` / `--headless`
+//    SNOWBELT is silently loaded into a headless Microsoft Edge
+//    instance. Legitimate headless Edge is rare on user
+//    endpoints — when combined with `--load-extension`
+//    pointing at a user-writable path it is near-certain malice.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(90d)
+| where FileName in~ ("msedge.exe", "chrome.exe", "brave.exe")
+| where ProcessCommandLine has_any (
+    "--headless", "--disable-gpu --headless",
+    "--load-extension=", "--disable-extensions-except="
+)
+| where ProcessCommandLine has_any (
+    "AppData\\Local", "AppData\\Roaming", "Users\\Public",
+    "ProgramData", "Downloads", "Temp\\"
+)
+    or ProcessCommandLine has "SysEvents"
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. SNOWBASIN LOCAL HTTP SERVER — PYTHON LISTENING ON :8000
+//     Python bound locally on 8000 for command execution and
+//     screen / file collection. Detect via a Python child
+//     process command line invoking `http.server` / `SimpleHTTPServer`
+//     or sockets listening on 8000.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(90d)
+| where FileName in~ ("python.exe", "pythonw.exe", "python3.exe")
+| where ProcessCommandLine has_any (
+    "http.server", "SimpleHTTPServer",
+    "-m http.server", "BaseHTTPServer",
+    "bind=('127.0.0.1', 8000)", "('0.0.0.0', 8000)",
+    ":8000"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. POST-COMPROMISE — CREDENTIAL-ACCESS + LATERAL-MOVEMENT
+//     Task Manager LSASS dump, FTK Imager, LimeWire exfil,
+//     PsExec, and in-tree port scan to 135/445/3389.
+// ------------------------------------------------------------
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where FileName in~ ("taskmgr.exe", "procdump.exe",
+                           "procdump64.exe", "rundll32.exe")
+    | where ProcessCommandLine has_any ("lsass", "comsvcs.dll,MiniDump")
+    | project Timestamp, DeviceName, AccountName,
+              Source = "LSASSDump",
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where FileName in~ ("FTK Imager.exe", "FTKImager.exe",
+                           "ADExplorer.exe", "LimeWire.exe")
+        or ProcessCommandLine has_any ("FTK Imager", "AccessData",
+                                        "LimeWire")
+    | project Timestamp, DeviceName, AccountName,
+              Source = "DFIRToolAbuse",
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where FileName in~ ("psexec.exe", "psexec64.exe",
+                           "paexec.exe", "csexec.exe")
+        or ProcessCommandLine has "\\\\" and ProcessCommandLine has "-s"
+    | project Timestamp, DeviceName, AccountName,
+              Source = "PsExec",
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceNetworkEvents
+    | where Timestamp > ago(90d)
+    | where RemotePort in (135, 445, 3389)
+    | where ActionType == "ConnectionAttempt"
+    | summarize Ports = make_set(RemotePort),
+                Targets = dcount(RemoteIP),
+                Hits = count()
+            by DeviceName, InitiatingProcessFileName,
+               bin(Timestamp, 15m)
+    | where Targets > 10
+    | extend AccountName = "", Source = "PortScan",
+             ProcessCommandLine = strcat("Ports=",tostring(Ports),
+                                          " Targets=",tostring(Targets),
+                                          " Hits=",tostring(Hits)),
+             FileName = InitiatingProcessFileName,
+             InitiatingProcessCommandLine = ""
+    | project Timestamp, DeviceName, AccountName, Source,
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. NTDS.dit / SAM / SYSTEM / SECURITY HIVE ACCESS
+//     FTK Imager + Volume Shadow Copy paths on DCs. Surfaces
+//     the NTDS exfiltration step that follows Pass-the-Hash.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(90d)
+| where ActionType in ("FileCreated", "FileAccessed",
+                        "FileModified", "FileCopied", "FileRenamed")
+| where FileName in~ ("ntds.dit", "SAM", "SYSTEM", "SECURITY")
+    or FolderPath has_any (@"\NTDS\",
+                            @"\HarddiskVolumeShadowCopy",
+                            @"\GLOBALROOT\Device\HarddiskVolume")
+| where InitiatingProcessFileName !in~ (
+    "lsass.exe", "services.exe", "wininit.exe",
+    "MsMpEng.exe", "MsSense.exe", "SenseIR.exe",
+    "svchost.exe")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 13. FULL KILL-CHAIN CORRELATION
+//     Priority-rank devices showing 2+ UNC6692 indicators in a
+//     14-day window:
+//       (a) `microsoft-edge:` URI spawned by Teams / Outlook
+//       (b) phishing S3 or SNOWBELT DGA S3 URL reached
+//       (c) RegSrvc.exe / .ahk file landing in user paths
+//       (d) Heroku WSS C2 egress
+//       (e) SysEvents extension folder written
+//     2+ signals = near-certain active SNOW ecosystem infection.
+// ------------------------------------------------------------
+let EdgeUri =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where ProcessCommandLine has "microsoft-edge:"
+       and InitiatingProcessFileName in~ ("Teams.exe","ms-teams.exe",
+                                           "msteams.exe","Outlook.exe")
+    | summarize EdgeHits=count(), EdgeLast=max(Timestamp) by DeviceName;
+let PhishS3 =
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where RemoteUrl matches regex
+        @"(?i)service-page-[A-Za-z0-9\-]+-outlook\.s3\.us-west-2\.amazonaws\.com"
+       or RemoteUrl matches regex
+        @"(?i)[a-f0-9]{24}-[0-9]{6,7}-[0-9]{1}\.s3\.us-east-2\.amazonaws\.com"
+    | summarize S3Hits=count(), S3Last=max(Timestamp) by DeviceName;
+let AhkDrop =
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where (FileName =~ "RegSrvc.exe"
+         or FileName endswith ".ahk"
+         or FileName =~ "Protected.ahk")
+       and FolderPath has_any (@"\Downloads\", @"\AppData\",
+                                @"\Users\Public\", @"\ProgramData\")
+    | summarize AhkHits=count(), AhkLast=max(Timestamp) by DeviceName;
+let HerokuWss =
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where RemoteUrl has "sad4w7h913-b4a57f9c36eb.herokuapp.com"
+       or (RemoteUrl has ".herokuapp.com" and RemoteUrl has "/ws")
+    | where InitiatingProcessFileName !in~ (
+        "chrome.exe","msedge.exe","firefox.exe","brave.exe")
+    | summarize WssHits=count(), WssLast=max(Timestamp) by DeviceName;
+let ExtDir =
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FolderPath has "SysEvents"
+       and FolderPath has_any (@"\Microsoft\Edge\User Data\",
+                                @"\Google\Chrome\User Data\")
+    | summarize ExtHits=count(), ExtLast=max(Timestamp) by DeviceName;
+EdgeUri
+| join kind=fullouter PhishS3  on DeviceName
+| join kind=fullouter AhkDrop  on DeviceName
+| join kind=fullouter HerokuWss on DeviceName
+| join kind=fullouter ExtDir   on DeviceName
+| extend Device = coalesce(DeviceName, DeviceName1, DeviceName2,
+                            DeviceName3, DeviceName4)
+| extend RiskSignals =
+      iff(isnotempty(EdgeHits),1,0)
+    + iff(isnotempty(S3Hits),  1,0)
+    + iff(isnotempty(AhkHits), 1,0)
+    + iff(isnotempty(WssHits), 1,0)
+    + iff(isnotempty(ExtHits), 1,0)
+| where RiskSignals >= 2
+| project Device, RiskSignals,
+          EdgeHits, EdgeLast,
+          S3Hits,   S3Last,
+          AhkHits,  AhkLast,
+          WssHits,  WssLast,
+          ExtHits,  ExtLast
+| sort by RiskSignals desc, WssLast desc
