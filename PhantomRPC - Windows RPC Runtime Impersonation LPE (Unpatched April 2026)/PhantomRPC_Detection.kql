@@ -1,0 +1,496 @@
+// ============================================================
+// PhantomRPC — Windows RPC Runtime Impersonation Local
+// Privilege Escalation (Architectural — UNPATCHED)
+// Disclosed:  Black Hat Asia 2026, April 24, 2026
+// Researcher: Haidar Kabibo (Kaspersky Application Security)
+// Source:     CybersecurityNews / Black Hat Asia 2026 talk +
+//             public PhantomRPC audit framework on GitHub
+// Platform:   Microsoft Defender XDR (Advanced Hunting)
+// MITRE ATT&CK: T1134 (Access Token Manipulation),
+//               T1134.001 (Token Impersonation/Theft),
+//               T1574 (Hijack Execution Flow),
+//               T1559 (Inter-Process Communication),
+//               T1559.003 (XPC Services / Named Pipes),
+//               T1068 (Exploitation for Privilege Escalation),
+//               T1543.003 (Windows Service)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// PhantomRPC is an architectural weakness in the Windows RPC
+// runtime (`rpcrt4.dll`). When a privileged client process makes
+// an RPC call to a server endpoint whose backing service is
+// **offline / disabled**, the runtime does NOT validate that the
+// answering server is the legitimate one. A low-privileged
+// attacker holding `SeImpersonatePrivilege` (held by default by
+// `Network Service` and `Local Service`) can stand up a rogue
+// RPC server that mimics the disabled endpoint, accept the
+// privileged client's connection, then call `RpcImpersonateClient`
+// to assume the caller's token — escalating from a service
+// account to SYSTEM or Administrator.
+//
+// MICROSOFT POSITION
+// ---------------------------------------------------------------
+// MSRC closed the case (reported Sep 19, 2025; response Oct 9)
+// without scheduling a fix. Rationale: `SeImpersonatePrivilege`
+// is the documented gate. **There is no patch.** Detection is
+// the primary mitigation; the recommended baseline is
+// ETW-based RPC monitoring for `RPC_S_SERVER_UNAVAILABLE`
+// (Event ID 1) combined with high impersonation levels.
+//
+// FIVE DOCUMENTED ATTACK PATHS
+// ---------------------------------------------------------------
+//   1. `gpupdate.exe`  (Group Policy Client, SYSTEM) → coerced
+//      into an RPC call to a TermService endpoint.
+//   2. `msedge.exe`    (browser launch) → TermService with high
+//      impersonation level.
+//   3. `WdiServiceHost.exe` / Diagnostic Policy Service polls
+//      TermService **every 5–15 minutes** — a recurring tick
+//      perfect for racing a rogue server up.
+//   4. `ipconfig.exe`  → DHCP Client (when the service is
+//      disabled) — Local Service-level escalation path.
+//   5. `w32tm.exe`     → connects to the named pipe
+//      `\PIPE\W32TIME`. If W32Time is disabled, the pipe
+//      doesn't exist — the attacker creates it first and
+//      catches the client.
+//
+// HUNT POSTURE
+// ---------------------------------------------------------------
+// MDE Advanced Hunting does NOT expose all RPC ETW events
+// directly. The detections below combine what IS reliably
+// available — named-pipe creation events, service-state queries,
+// process lineage on the five abused binaries, the public
+// PhantomRPC audit-framework artefact, and `rpcrt4.dll` loads
+// from suspicious user-writable callers. For the deepest
+// coverage, augment with Sysmon Event ID 17/18 (PipeCreated /
+// PipeConnected) and the RPC ETW provider
+// (`Microsoft-Windows-RPC` / `{6AD52B32-D609-4BE9-AE07-CE8DAE937E39}`).
+//
+// SCHEMA NOTES (validated against Defender XDR)
+// ---------------------------------------------------------------
+//  - Named-pipe creation is captured via DeviceEvents with
+//    `ActionType == "NamedPipeEvent"`. The pipe name is in
+//    `FileName` and attributes in `AdditionalFields`.
+//  - DeviceProcessEvents has BOTH `AccountName` and
+//    `InitiatingProcessAccountName`.
+//  - DeviceImageLoadEvents has `InitiatingProcessAccountName`
+//    only (no `AccountName`).
+//  - DeviceRegistryEvents has `InitiatingProcessAccountName`
+//    only.
+//  - Service state changes that go via `sc.exe` / PowerShell
+//    surface in DeviceProcessEvents; programmatic changes
+//    surface in DeviceEvents (`ServiceInstalled`).
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//  - `gpupdate.exe`, `ipconfig.exe`, `w32tm.exe`, `msedge.exe`
+//    are all common — the hunts qualify on parent + integrity
+//    + named-pipe context, not the binary alone.
+//  - Legitimate Network/Local Service processes hosting named
+//    pipes is normal; the hunts target service-mimicking pipe
+//    names from non-vendor binaries.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//  - https://cybersecuritynews.com/new-windows-rpc-vulnerability/
+//  - Black Hat Asia 2026 — "PhantomRPC", H. Kabibo, Kaspersky
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. ROGUE NAMED-PIPE CREATION — `\PIPE\W32TIME` (path #5)
+//    The W32Time named pipe is normally hosted by `svchost.exe`
+//    running the W32Time service. If W32Time is disabled, the
+//    pipe shouldn't exist at all. Any other process creating
+//    it = PhantomRPC race in progress.
+//    NOTE: NamedPipeEvent is captured under DeviceEvents.
+// ------------------------------------------------------------
+DeviceEvents
+| where Timestamp > ago(60d)
+| where ActionType == "NamedPipeEvent"
+| extend AF = parse_json(AdditionalFields)
+| extend PipeName = tostring(coalesce(AF.PipeName, FileName))
+| where PipeName has_any (
+    @"\PIPE\W32TIME", @"\\.\pipe\W32TIME",
+    @"\PIPE\w32time", "W32TIME"
+)
+| where InitiatingProcessFileName !in~ ("svchost.exe", "w32tm.exe",
+                                         "MsMpEng.exe", "MsSense.exe")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, PipeName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. ROGUE NAMED-PIPE CREATION — TERMSERVICE / DHCP MIMICRY
+//    Paths #1, #2, #3, #4 race a fake server against TermService
+//    or the DHCP client RPC endpoint. Hunt for processes
+//    other than the legitimate hosts creating these named pipes.
+// ------------------------------------------------------------
+DeviceEvents
+| where Timestamp > ago(60d)
+| where ActionType == "NamedPipeEvent"
+| extend AF = parse_json(AdditionalFields)
+| extend PipeName = tostring(coalesce(AF.PipeName, FileName))
+| where PipeName has_any (
+    "TermSrv", "TermService",
+    "DHCP", "Dhcpcsvc", "Dnscache",
+    "wdi", "diagnostic"
+)
+| where InitiatingProcessFileName !in~ (
+    "svchost.exe", "lsass.exe", "services.exe",
+    "WdiServiceHost.exe", "WdiSystemHost.exe",
+    "MsMpEng.exe", "MsSense.exe", "SenseIR.exe"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, PipeName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. PHANTOMRPC AUDIT-FRAMEWORK ARTEFACTS ON DISK
+//    The public PhantomRPC audit framework will quickly become
+//    a red-team / attacker tool. Hunt the obvious file-name
+//    and command-line strings.
+// ------------------------------------------------------------
+union
+(
+    DeviceFileEvents
+    | where Timestamp > ago(90d)
+    | where ActionType in ("FileCreated","FileModified","FileRenamed")
+    | where FileName has_any ("PhantomRPC", "phantomrpc")
+       or FolderPath has_any ("PhantomRPC", "phantomrpc")
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "FileWrite",
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where FileName has_any ("PhantomRPC", "phantomrpc")
+       or ProcessCommandLine has_any ("PhantomRPC", "phantomrpc")
+    | project Timestamp, DeviceName, AccountName, Source = "Process",
+              FileName, FolderPath, SHA256,
+              ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceNetworkEvents
+    | where Timestamp > ago(90d)
+    | where RemoteUrl has "PhantomRPC"
+       or RemoteUrl has "phantomrpc"
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "Network",
+              FileName = InitiatingProcessFileName,
+              FolderPath = InitiatingProcessFolderPath,
+              SHA256 = "",
+              ProcessCommandLine = RemoteUrl,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. SERVICE-STATE RECON — DISABLING / QUERYING TERMSERVICE,
+//    DHCP, W32TIME, RDPRPC, OR DPS
+//    Attack prerequisite: the targeted service must be DISABLED
+//    so the attacker's named pipe can win the race. Hunt for
+//    `sc config ... start= disabled`, `Stop-Service`,
+//    `Set-Service -StartupType Disabled`, or rapid-fire `sc query`
+//    against the abused services.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("sc.exe", "powershell.exe", "pwsh.exe",
+                       "net.exe", "wmic.exe")
+| where ProcessCommandLine has_any (
+    "TermService", "TermSrv",
+    "Dhcp", "DhcpClient", "Dhcpcsvc",
+    "W32Time", "w32time",
+    "DPS", "DiagTrack",
+    "WdiServiceHost", "WdiSystemHost"
+)
+| where ProcessCommandLine has_any (
+    "config", "start=", "Stop-Service",
+    "Set-Service", "StartupType",
+    "stop ", "disable",
+    "query"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. SERVICE-STATE TAMPERING VIA REGISTRY
+//    `Start` value flipped to `4` (disabled) or `2` (auto)
+//    under `HKLM\SYSTEM\CurrentControlSet\Services\<svc>` for
+//    any of the abused services. Programmatic equivalent of
+//    `sc config`, often used post-exploitation.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("RegistryValueSet", "RegistryValueDeleted")
+| where RegistryKey has_all (@"\SYSTEM\CurrentControlSet\Services\")
+| where RegistryKey has_any (
+    "TermService", "Dhcp", "W32Time", "DPS",
+    "WdiServiceHost", "WdiSystemHost",
+    "Dnscache"
+)
+| where RegistryValueName =~ "Start"
+| where InitiatingProcessFileName !in~ (
+    "TrustedInstaller.exe", "MsiExec.exe",
+    "MsMpEng.exe", "MsSense.exe")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, RegistryKey, RegistryValueName,
+          RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. ABUSED CLIENT BINARIES — UNEXPECTED PARENTS / INTEGRITY
+//    Path #1 / #5: `gpupdate.exe` and `w32tm.exe` are usually
+//    invoked by the Group Policy Client (`svchost`), Task
+//    Scheduler, or interactive admins. Invocation by a
+//    non-privileged or unusual parent suggests coercion into
+//    triggering an RPC call.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("gpupdate.exe", "w32tm.exe", "ipconfig.exe")
+| where InitiatingProcessFileName !in~ (
+    "svchost.exe", "services.exe", "taskhostw.exe",
+    "explorer.exe", "cmd.exe", "powershell.exe",
+    "pwsh.exe", "mmc.exe", "wininit.exe",
+    "MsSense.exe", "MsMpEng.exe", "SenseIR.exe"
+)
+    or InitiatingProcessFolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp\",
+        @"\AppData\Roaming\", @"\Users\Public\")
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. WDI POLL TICK — 5–15 MIN RECURRING TERMSERVICE TOUCH
+//    Path #3: the Diagnostic System Host polls TermService on
+//    a 5-15 minute cadence. Used as a deterministic trigger.
+//    Surface the WDI host invocations and any nearby anomalous
+//    child processes.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ (
+    "WdiServiceHost.exe", "WdiSystemHost.exe", "svchost.exe")
+    and InitiatingProcessCommandLine has_any (
+        "WdiServiceHost", "WdiSystemHost", "DiagSvc")
+| where FileName !in~ (
+    "WdiServiceHost.exe", "WdiSystemHost.exe", "svchost.exe",
+    "conhost.exe", "MsSense.exe", "MsMpEng.exe")
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp asc
+
+
+// ------------------------------------------------------------
+// 8. NETWORK SERVICE / LOCAL SERVICE HOSTING NAMED PIPES
+//    Pre-condition for PhantomRPC: an attacker process holding
+//    `SeImpersonatePrivilege` (so a Network/Local Service ID)
+//    creates a named pipe that mimics a system service. Surface
+//    pipe creations by these accounts that aren't from svchost.
+// ------------------------------------------------------------
+DeviceEvents
+| where Timestamp > ago(60d)
+| where ActionType == "NamedPipeEvent"
+| extend AF = parse_json(AdditionalFields)
+| extend PipeName = tostring(coalesce(AF.PipeName, FileName))
+| where InitiatingProcessAccountName in~ (
+    "NETWORK SERVICE", "LOCAL SERVICE",
+    "NT AUTHORITY\\NETWORK SERVICE",
+    "NT AUTHORITY\\LOCAL SERVICE")
+| where InitiatingProcessFileName !in~ (
+    "svchost.exe", "lsass.exe", "services.exe",
+    "WdiServiceHost.exe", "spoolsv.exe",
+    "MsMpEng.exe", "MsSense.exe", "SenseIR.exe")
+| where PipeName has_any (
+    "TermSrv", "TermService", "Dhcp", "W32TIME",
+    "wdi", "spoolss", "lsass", "ntsvcs", "scerpc")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          PipeName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. `rpcrt4.dll` LOADED BY USER-WRITABLE / UNTRUSTED PROCESSES
+//    RPC client + impersonation occurs through `rpcrt4.dll`.
+//    Most legitimate loaders are signed Microsoft binaries.
+//    Hunt for `rpcrt4.dll` loads by processes living in
+//    Downloads / Temp / AppData / Public.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(60d)
+| where FileName =~ "rpcrt4.dll"
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp\",
+    @"\AppData\Roaming\", @"\AppData\Local\",
+    @"\Users\Public\", @"\ProgramData\Temp\")
+| where InitiatingProcessFileName !in~ (
+    "MsSense.exe", "MsMpEng.exe", "SenseIR.exe")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. NEW WINDOWS SERVICE INSTALLED BY LOW-PRIV ACCOUNT
+//     Post-exploitation persistence: PhantomRPC's payoff is a
+//     SYSTEM context — frequently used to install a service.
+//     Detect ServiceInstalled events spawned by a Network /
+//     Local Service or non-administrative source.
+// ------------------------------------------------------------
+DeviceEvents
+| where Timestamp > ago(60d)
+| where ActionType == "ServiceInstalled"
+| extend AF = parse_json(AdditionalFields)
+| extend ServiceName = tostring(AF.ServiceName),
+         ImagePath   = tostring(AF.ImagePath)
+| where InitiatingProcessAccountName in~ (
+    "NETWORK SERVICE", "LOCAL SERVICE",
+    "NT AUTHORITY\\NETWORK SERVICE",
+    "NT AUTHORITY\\LOCAL SERVICE")
+    or InitiatingProcessFolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ServiceName, ImagePath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. TOKEN-ELEVATION ANOMALY — LOW-PRIV PARENT, HIGH-PRIV CHILD
+//     The end-state of PhantomRPC is a SYSTEM/Administrator
+//     child spawned from a Network/Local Service parent. Hunt
+//     for that integrity-level inversion within the same
+//     process tree, excluding canonical service-launch paths.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where AccountName has_any ("SYSTEM", "Administrator")
+    or AccountSid =~ "S-1-5-18"
+    or AccountSid startswith "S-1-5-21-" and AccountSid endswith "-500"
+| where InitiatingProcessAccountName in~ (
+    "NETWORK SERVICE", "LOCAL SERVICE",
+    "NT AUTHORITY\\NETWORK SERVICE",
+    "NT AUTHORITY\\LOCAL SERVICE")
+| where InitiatingProcessFileName !in~ (
+    "services.exe", "lsass.exe", "wininit.exe",
+    "svchost.exe", "TrustedInstaller.exe",
+    "WdiServiceHost.exe",
+    "MsSense.exe", "MsMpEng.exe", "SenseIR.exe")
+| project Timestamp, DeviceName,
+          ParentAccount = InitiatingProcessAccountName,
+          ChildAccount  = AccountName,
+          ChildFile = FileName,
+          ChildCmd  = ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. FULL CORRELATION
+//     Priority-rank devices showing 2+ PhantomRPC indicators in
+//     a 14-day window:
+//       (a) Rogue named-pipe creation against W32TIME / TermSrv / DHCP
+//       (b) Service state tampering on the abused services
+//       (c) `rpcrt4.dll` loaded by an untrusted-path process
+//       (d) Token-elevation anomaly (Local/Network Service parent
+//           → SYSTEM child)
+//     2+ signals = strong PhantomRPC signal — investigate the host.
+// ------------------------------------------------------------
+let RoguePipe =
+    DeviceEvents
+    | where Timestamp > ago(14d)
+    | where ActionType == "NamedPipeEvent"
+    | extend AF = parse_json(AdditionalFields)
+    | extend PipeName = tostring(coalesce(AF.PipeName, FileName))
+    | where PipeName has_any ("W32TIME","TermSrv","TermService",
+                               "Dhcp","DHCP","wdi")
+    | where InitiatingProcessFileName !in~ (
+        "svchost.exe","lsass.exe","services.exe",
+        "WdiServiceHost.exe","w32tm.exe",
+        "MsSense.exe","MsMpEng.exe","SenseIR.exe")
+    | summarize PipeHits = count(),
+                PipeLast = max(Timestamp) by DeviceName;
+let SvcTamper =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ ("sc.exe","powershell.exe","pwsh.exe","net.exe")
+    | where ProcessCommandLine has_any (
+        "TermService","Dhcp","W32Time","WdiServiceHost")
+    | where ProcessCommandLine has_any (
+        "config","start=","Stop-Service","Set-Service",
+        "StartupType","disable","stop ")
+    | summarize SvcHits = count(),
+                SvcLast = max(Timestamp) by DeviceName;
+let RpcUntrusted =
+    DeviceImageLoadEvents
+    | where Timestamp > ago(14d)
+    | where FileName =~ "rpcrt4.dll"
+    | where InitiatingProcessFolderPath has_any (
+        @"\Downloads\",@"\Temp\",@"\AppData\",
+        @"\Users\Public\",@"\ProgramData\Temp\")
+    | summarize RpcHits = count(),
+                RpcLast = max(Timestamp) by DeviceName;
+let TokenElev =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where (AccountName has_any ("SYSTEM","Administrator")
+             or AccountSid == "S-1-5-18")
+    | where InitiatingProcessAccountName in~ (
+        "NETWORK SERVICE","LOCAL SERVICE",
+        "NT AUTHORITY\\NETWORK SERVICE",
+        "NT AUTHORITY\\LOCAL SERVICE")
+    | where InitiatingProcessFileName !in~ (
+        "services.exe","lsass.exe","wininit.exe","svchost.exe",
+        "TrustedInstaller.exe","WdiServiceHost.exe")
+    | summarize TokenHits = count(),
+                TokenLast = max(Timestamp) by DeviceName;
+RoguePipe
+| join kind=fullouter SvcTamper    on DeviceName
+| join kind=fullouter RpcUntrusted on DeviceName
+| join kind=fullouter TokenElev    on DeviceName
+| extend Device = coalesce(DeviceName, DeviceName1,
+                            DeviceName2, DeviceName3)
+| extend RiskSignals =
+      iff(isnotempty(PipeHits),  1, 0)
+    + iff(isnotempty(SvcHits),   1, 0)
+    + iff(isnotempty(RpcHits),   1, 0)
+    + iff(isnotempty(TokenHits), 1, 0)
+| where RiskSignals >= 2
+| project Device, RiskSignals,
+          PipeHits,  PipeLast,
+          SvcHits,   SvcLast,
+          RpcHits,   RpcLast,
+          TokenHits, TokenLast
+| sort by RiskSignals desc, TokenLast desc
