@@ -1,0 +1,374 @@
+// ============================================================
+// BlueNoroff — Fileless PowerShell ClickFix Campaign (Web3 / Crypto)
+// Source:   CyberSecurity News / Arctic Wolf (April 2026)
+//           "New BlueNoroff Campaign Uses Fileless PowerShell"
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1566.002, T1204.004, T1059.001, T1027,
+//               T1140, T1547.001, T1071.001, T1005,
+//               T1555.003, T1539, T1113, T1123, T1020
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// BlueNoroff (a.k.a. APT38 / Sapphire Sleet / Stardust Chollima)
+// — DPRK-aligned, Lazarus subgroup — is running a fresh Web3 /
+// crypto-focused campaign. Targets are CEOs, founders and fintech
+// executives across 20+ countries (41% in the US, 45% C-suite).
+//
+// KILL CHAIN
+// ---------------------------------------------------------------
+//   1) Spear-phish: attacker poses as a legal/fintech contact and
+//      sends a Calendly invite. Once accepted, the legitimate
+//      Google Meet link is swapped for a typo-squatted Zoom URL.
+//   2) Fake Zoom page (self-contained HTML, looping participant
+//      tiles) shows an "SDK deprecated" overlay instructing the
+//      victim to copy/paste a "diagnostic" command.
+//   3) ClickFix clipboard hijack: the page silently replaces the
+//      clipboard with a hidden PowerShell one-liner. Victim
+//      pastes it into the Run dialog or terminal.
+//   4) PowerShell drops "chromechip.log" in %TEMP% and pulls an
+//      obfuscated second stage; an in-memory C2 beacon checks in
+//      every ~5 seconds with JSON (hostname, OS, processes,
+//      admin status, timezone).
+//   5) Persistence: shortcut "Chrome Update Certificated.lnk" in
+//      the user's Startup folder re-launches the fileless beacon.
+//   6) Post-compromise: theft of browser credentials, Telegram
+//      session data ('tdata'), and live webcam frames (later
+//      reused for AI-generated deepfake lures against the next
+//      victim — 950+ artefacts found on attacker infra).
+//
+// KEY ARTEFACTS
+// ---------------------------------------------------------------
+//   - %TEMP%\chromechip.log               (stage-2 dropper)
+//   - %TEMP%\chrome-debug-data001.log     (cleanup artefact)
+//   - %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\
+//       Chrome Update Certificated.lnk   (persistence)
+//   - powershell.exe -WindowStyle Hidden / -w h
+//   - JSON beacon fields: hostname, os, processes, admin, tz
+//   - 5-second beacon cadence to attacker C2
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate IT scripts using -WindowStyle Hidden
+//   - Vendor updaters writing to %TEMP% — tune by signer / path
+//   - Browser extensions writing to user profile (rare)
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/new-bluenoroff-campaign-uses-fileless-powershell/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. CLICKFIX PASTE CHAIN — Run dialog / browser → PowerShell
+//    The victim pastes the hijacked clipboard command into the
+//    Run dialog (parent: explorer.exe) or directly from a
+//    browser context. This is the single highest-fidelity tell.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+| where InitiatingProcessFileName in~ (
+    "explorer.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe",
+    "brave.exe", "opera.exe", "arc.exe",
+    "Zoom.exe", "ZoomLauncher.exe"
+)
+| where ProcessCommandLine has_any (
+    "-WindowStyle", "-w h", "-WindowSty",
+    "-EncodedCommand", "-enc ", "-e ",
+    "FromBase64String", "IEX", "Invoke-Expression",
+    "DownloadString", "DownloadFile", "Net.WebClient",
+    "Invoke-WebRequest", "iwr ", "curl ", "wget "
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, FileName,
+          ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. POWERSHELL HIDDEN-WINDOW + DOWNLOAD ONE-LINER
+//    Hallmark of BlueNoroff's ClickFix payload — hidden window
+//    plus an in-memory IEX/DownloadString fetch.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("-WindowStyle Hidden", "-w h", "-WindowSty hidden", "-WindowSty H")
+| where ProcessCommandLine has_any (
+    "IEX", "Invoke-Expression",
+    "DownloadString", "DownloadFile",
+    "Net.WebClient", "Invoke-WebRequest",
+    "FromBase64String", "[Convert]::FromBase64",
+    "-EncodedCommand", "-enc "
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. STAGE-2 DROPPER ARTEFACTS IN USER TEMP
+//    chromechip.log / chrome-debug-data001.log are unique
+//    BlueNoroff filenames staged in %TEMP%.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("chromechip.log", "chrome-debug-data001.log")
+   or FolderPath has_any (@"\Temp\chromechip", @"\Temp\chrome-debug-data")
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. STARTUP-FOLDER PERSISTENCE — "Chrome Update Certificated.lnk"
+//    Exact filename used by BlueNoroff to re-execute the
+//    fileless PowerShell beacon at logon.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has @"\Start Menu\Programs\Startup"
+| where FileName has_any (
+    "Chrome Update Certificated.lnk",
+    "Chrome Update Certificate.lnk",
+    "ChromeUpdateCertificated.lnk"
+)
+   or (FileName endswith ".lnk" and FileName has_all ("Chrome", "Update", "Certificat"))
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. ANY .LNK DROPPED IN STARTUP THAT CHAINS TO POWERSHELL
+//    Broader hunt — catches the BlueNoroff persistence even
+//    if the actor renames the shortcut.
+// ------------------------------------------------------------
+let StartupLnk = DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType == "FileCreated"
+| where FolderPath has @"\Start Menu\Programs\Startup"
+| where FileName endswith ".lnk"
+| where InitiatingProcessFileName !in~ (
+    "msiexec.exe", "explorer.exe", "OneDrive.exe",
+    "setup.exe", "TrustedInstaller.exe"
+)
+| project Timestamp, DeviceName, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine;
+StartupLnk
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "mshta.exe")
+   or InitiatingProcessCommandLine has_any ("powershell", "IEX", "Invoke-Expression", "FromBase64", "DownloadString")
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. POWERSHELL OUTBOUND BEACON — non-Microsoft destinations
+//    The fileless C2 lives entirely inside powershell.exe and
+//    talks JSON outbound. Suppress legitimate MS endpoints.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+| where not (RemoteUrl has_any (
+    "microsoft.com", "windowsupdate.com", "msftconnecttest",
+    "office.com", "office365.com", "azure.com",
+    "live.com", "msftncsi.com", "powershellgallery.com",
+    "nuget.org", "github.com", "githubusercontent.com"
+))
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. 5-SECOND BEACON CADENCE FROM POWERSHELL
+//    BlueNoroff's in-memory implant checks in every ~5 s.
+//    Bin connections per device/destination and surface
+//    sources with a tight, periodic interval.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(24h)
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+| summarize
+    Connections   = count(),
+    UniqueMinutes = dcount(bin(Timestamp, 1m)),
+    FirstSeen     = min(Timestamp),
+    LastSeen      = max(Timestamp)
+    by DeviceName, RemoteIP, RemotePort, InitiatingProcessFileName
+| where Connections >= 50 and UniqueMinutes >= 10
+| extend WindowSec = datetime_diff('second', LastSeen, FirstSeen)
+| extend AvgIntervalSec = todouble(WindowSec) / todouble(Connections)
+| where AvgIntervalSec between (1.0 .. 15.0)
+| order by Connections desc
+
+
+// ------------------------------------------------------------
+// 8. JSON HOST-FINGERPRINT BEACON STRINGS
+//    Catches obfuscated / unobfuscated PowerShell that
+//    constructs the BlueNoroff beacon body — hostname, os,
+//    processes, admin, timezone in one script.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where FileName in~ ("powershell.exe", "pwsh.exe")
+    | extend Body = ProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(7d)
+    | where ActionType in ("PowerShellCommand", "ScriptContent")
+    | extend Body = tostring(parse_json(AdditionalFields).Command)
+)
+| where isnotempty(Body)
+| where Body has "hostname" and Body has_any ("os", "OSVersion") and Body has_any ("admin", "IsAdmin", "elevated") and Body has_any ("timezone", "tz", "TimeZone")
+| where Body has_any ("ConvertTo-Json", "@{", "Get-Process", "Get-WmiObject", "Get-CimInstance")
+| project Timestamp, DeviceName, FileName, InitiatingProcessFileName, Body
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. BROWSER CREDENTIAL STORE ACCESS BY POWERSHELL
+//    Stage-3 theft: PowerShell touching Chrome / Edge / Brave
+//    "Login Data", "Cookies", "Local State" — hallmark of the
+//    Lazarus credential-harvest tail.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "mshta.exe", "rundll32.exe")
+| where FileName in~ ("Login Data", "Cookies", "Local State", "Web Data", "History", "logins.json", "key4.db", "cookies.sqlite")
+   or FolderPath has_any (
+        @"\Google\Chrome\User Data",
+        @"\Microsoft\Edge\User Data",
+        @"\BraveSoftware\Brave-Browser\User Data",
+        @"\Mozilla\Firefox\Profiles"
+    )
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. TELEGRAM SESSION THEFT ('tdata')
+//     BlueNoroff exfiltrates the Telegram desktop session for
+//     account takeover — look for non-Telegram processes
+//     accessing the tdata folder.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has @"\Telegram Desktop\tdata"
+   or FileName in~ ("key_datas", "map0", "map1")
+| where InitiatingProcessFileName !in~ ("Telegram.exe", "Updater.exe")
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. WEBCAM / SCREEN CAPTURE TRIGGERED BY POWERSHELL
+//     Lazarus reuses captured webcam footage to build deepfakes
+//     for the next victim. PowerShell-driven capture is unusual.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+       or FileName in~ ("powershell.exe", "pwsh.exe")
+    | where ProcessCommandLine has_any (
+        "MFCaptureEngine", "MediaCapture", "DirectShow",
+        "AForge.Video", "Win32_PnPEntity",
+        "Get-PnpDevice", "OpenCv", "VideoCapture",
+        "BitmapEncoder", "CopyFromScreen",
+        "FromHbitmap", "Drawing.Bitmap"
+    )
+    | extend Body = ProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(7d)
+    | where ActionType in ("PowerShellCommand", "ScriptContent")
+    | extend Body = tostring(parse_json(AdditionalFields).Command)
+    | where Body has_any (
+        "MFCaptureEngine", "MediaCapture",
+        "Graphics.CopyFromScreen", "BitmapEncoder",
+        "VideoCapture", "AForge.Video"
+    )
+)
+| project Timestamp, DeviceName, FileName, InitiatingProcessFileName, Body
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Browser/Run → PowerShell → chromechip.log dropped in
+//     %TEMP% → Startup .lnk persistence → outbound beacon.
+//     Use for high-confidence triage of suspected BlueNoroff.
+// ------------------------------------------------------------
+let Stage1_ClickFix = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+| where InitiatingProcessFileName in~ (
+    "explorer.exe", "chrome.exe", "msedge.exe",
+    "firefox.exe", "brave.exe", "Zoom.exe"
+)
+| where ProcessCommandLine has_any (
+    "IEX", "Invoke-Expression", "DownloadString",
+    "FromBase64String", "-EncodedCommand", "-enc ",
+    "-WindowStyle Hidden", "-w h"
+)
+| project DeviceName, ClickFixTime = Timestamp,
+          Browser = InitiatingProcessFileName,
+          Payload = ProcessCommandLine;
+let Stage2_TempDrop = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("chromechip.log", "chrome-debug-data001.log")
+| project DeviceName, DropTime = Timestamp,
+          DroppedFile = FileName, DropPath = FolderPath;
+let Stage3_Persist = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath has @"\Start Menu\Programs\Startup"
+| where FileName endswith ".lnk"
+| project DeviceName, PersistTime = Timestamp,
+          LnkName = FileName, LnkPath = FolderPath;
+let Stage4_Beacon = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+| where not (RemoteUrl has_any (
+    "microsoft.com", "windowsupdate.com", "office.com",
+    "github.com", "powershellgallery.com"
+))
+| project DeviceName, BeaconTime = Timestamp,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl, C2_Port = RemotePort;
+Stage1_ClickFix
+| join kind=inner Stage2_TempDrop on DeviceName
+| where DropTime between (ClickFixTime .. (ClickFixTime + 10m))
+| join kind=leftouter Stage3_Persist on DeviceName
+| where PersistTime between (ClickFixTime .. (ClickFixTime + 60m))
+| join kind=leftouter Stage4_Beacon on DeviceName
+| where BeaconTime between (ClickFixTime .. (ClickFixTime + 60m))
+| project ClickFixTime, DropTime, PersistTime, BeaconTime,
+          DeviceName, Browser, Payload,
+          DroppedFile, DropPath,
+          LnkName, LnkPath,
+          C2_IP, C2_Url, C2_Port
+| order by ClickFixTime desc
