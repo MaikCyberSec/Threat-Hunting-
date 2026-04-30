@@ -1,0 +1,524 @@
+// ============================================================
+// SAP npm Supply Chain Compromise — "mini Shai Hulud"
+// Threat actor: TeamPCP   |   Disclosed: April 29, 2026
+// Source:  CybersecurityNews + StepSecurity / Aikido Security /
+//          SafeDep / Socket / Wiz coordinated reporting
+// Platform: Microsoft Defender XDR (Advanced Hunting) —
+//           Windows + Linux (MDE for Linux) + Sentinel
+// MITRE ATT&CK: T1195.002, T1199, T1587.001, T1583.001,
+//               T1552.001, T1552.005, T1552.007, T1078.004,
+//               T1567.002, T1005, T1059.007 (JS), T1105
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// On April 29, 2026 multiple research teams disclosed a
+// coordinated TeamPCP supply-chain attack against four widely-
+// used SAP npm packages. The campaign — "mini Shai Hulud" —
+// extends TeamPCP's recurring playbook seen previously against
+// **Trivy, LiteLLM, and Checkmarx KICS** in March / April 2026:
+//   - malicious `preinstall` hook in `package.json`
+//   - downloads the Bun JavaScript runtime during install
+//   - Bun executes an obfuscated stage-2 loader
+//   - harvests credentials, exfils to attacker-controlled
+//     GitHub repositories
+//   - uses stolen npm tokens to republish OTHER packages owned
+//     by the compromised maintainers (worm-style spread —
+//     hence "Shai Hulud")
+//
+// COMPROMISED PACKAGES
+// ---------------------------------------------------------------
+//   @cap-js/postgres      2.2.2     SHA256 1d9e4ece8e13c8eaf94cb858470d1bd8f81bb58f62583552303774fa1579edee
+//   @cap-js/db-service    2.10.1    SHA256 258257560fe2f1c2cc3924eae40718c829085b52ae3436b4e46d2565f6996271
+//   @cap-js/sqlite        2.2.2     SHA256 a1da198bb4e883d077a0e13351bf2c3acdea10497152292e873d79d4f7420211
+//   mbt                   1.2.48    SHA256 86282ebcd3bebf50f087f2c6b00c62caa667cdcb53558033d85acd39e3d88b41
+//
+// SHARED IOCs
+// ---------------------------------------------------------------
+//   Stage-1 dropper       setup.mjs   (downloads Bun)
+//                         SHA1   307d0fa7407d40e67d14e9d5a4c61ac5b4f20431
+//   Stage-2 payload       execution.js (~11 MB obfuscated)
+//                         SHA256 eb6eb4154b03ec73218727dc643d26f4e14dfda2438112926bb5daf37ae8bcdb
+//                         (postgres / db-service variant)
+//   Cipher                __decodeScrambled (consistent across
+//                         all four package variants — same as
+//                         prior TeamPCP campaigns)
+//   Locale check          early-exit if system locale = ru_*  /
+//                         Russian — strong attribution signal
+//   Credential targets    GitHub tokens, .npmrc, AWS/Azure/GCP
+//                         env vars, Kubernetes service-account
+//                         tokens, GitHub Actions runtime secrets
+//   Self-propagation      stolen npm tokens used to republish
+//                         maintainers' OTHER packages
+//
+// HUNT POSTURE
+// ---------------------------------------------------------------
+// This pack chains directly with the existing
+//   "Checkmarx KICS Supply Chain Compromise (April 2026)"
+// detection — same actor, same Bun-based loader pattern. Run
+// both together for full TeamPCP coverage. Where this pack
+// adds value:
+//   - the four SHA256 tarball hashes
+//   - the SHA1 stage-1 dropper hash
+//   - the exact package@version strings in npm/yarn/pnpm
+//     command lines and lockfiles
+//   - the `setup.mjs` / `execution.js` filename pair
+//   - the `__decodeScrambled` cipher string anywhere on disk
+//
+// SCHEMA NOTES (validated against Defender XDR)
+// ---------------------------------------------------------------
+//  - DeviceNetworkEvents has NO `AccountName` — use
+//    `InitiatingProcessAccountName`.
+//  - DeviceFileEvents has NO `AccountName` — use
+//    `InitiatingProcessAccountName`.
+//  - DeviceProcessEvents has BOTH `AccountName` and
+//    `InitiatingProcessAccountName`.
+//  - DeviceImageLoadEvents has `InitiatingProcessAccountName`
+//    only.
+//  - SHA1 + SHA256 are populated on file/process/image-load
+//    events when MDE has hashed the artefact.
+//  - npm typically runs as `node.exe` (Windows) or `node`
+//    (Linux/macOS) — both are covered.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//  - Legitimate `@cap-js/*` and `mbt` users on safe versions —
+//    the hunt pins to the SPECIFIC compromised versions and
+//    SHA256 tarball hashes.
+//  - Bun is a legitimate runtime — we flag Bun *downloaded by
+//    npm/node during a package install*, not Bun in general.
+//  - `setup.mjs` is an uncommon but legitimate filename in
+//    some projects — we qualify on context (npm install
+//    parent + Bun fetch + payload SHA256).
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//  - https://cybersecuritynews.com/sap-npm-packages-compromised/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN-BAD TARBALL SHA256 + STAGE-2 PAYLOAD SHA256
+//    Highest fidelity. Any hit on these hashes — in process
+//    execution, file write, or image load — is a confirmed
+//    landing of this campaign on the host.
+// ------------------------------------------------------------
+let BadHashes = dynamic([
+    // Compromised npm tarballs
+    "1d9e4ece8e13c8eaf94cb858470d1bd8f81bb58f62583552303774fa1579edee", // @cap-js/postgres   2.2.2
+    "258257560fe2f1c2cc3924eae40718c829085b52ae3436b4e46d2565f6996271", // @cap-js/db-service 2.10.1
+    "a1da198bb4e883d077a0e13351bf2c3acdea10497152292e873d79d4f7420211", // @cap-js/sqlite     2.2.2
+    "86282ebcd3bebf50f087f2c6b00c62caa667cdcb53558033d85acd39e3d88b41", // mbt                1.2.48
+    // Stage-2 obfuscated loader
+    "eb6eb4154b03ec73218727dc643d26f4e14dfda2438112926bb5daf37ae8bcdb"  // execution.js (postgres/db-service)
+]);
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in~ (BadHashes)
+    | project Timestamp, DeviceName, AccountName, Source = "ProcessExec",
+              FileName, FolderPath, SHA256,
+              ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in~ (BadHashes)
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "FileWrite",
+              FileName, FolderPath, SHA256,
+              ProcessCommandLine = InitiatingProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in~ (BadHashes)
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "ImageLoad",
+              FileName, FolderPath, SHA256,
+              ProcessCommandLine = InitiatingProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. STAGE-1 DROPPER SHA1 — `setup.mjs`
+//    Shared dropper hash across all four compromised packages.
+//    Surfaces even when re-tarred with different outer SHA256.
+// ------------------------------------------------------------
+let DropperSHA1 = "307d0fa7407d40e67d14e9d5a4c61ac5b4f20431";
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where SHA1 == DropperSHA1
+    | project Timestamp, DeviceName, AccountName, Source = "ProcessExec",
+              FileName, FolderPath, SHA1, SHA256,
+              ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where SHA1 == DropperSHA1
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "FileWrite",
+              FileName, FolderPath, SHA1, SHA256,
+              ProcessCommandLine = InitiatingProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. COMPROMISED PACKAGE@VERSION ON COMMAND LINE
+//    npm / yarn / pnpm install, lockfile updates, or any other
+//    tooling referencing the EXACT vulnerable version strings.
+//    Quoted to ensure version match.
+// ------------------------------------------------------------
+let BadPkgs = dynamic([
+    "@cap-js/postgres@2.2.2",
+    "@cap-js/db-service@2.10.1",
+    "@cap-js/sqlite@2.2.2",
+    "mbt@1.2.48"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("npm.exe", "npm", "yarn.exe", "yarn",
+                       "pnpm.exe", "pnpm", "npx.exe", "npx",
+                       "node.exe", "node")
+    or InitiatingProcessFileName in~ ("npm.exe", "npm",
+                                       "yarn.exe", "yarn",
+                                       "pnpm.exe", "pnpm")
+| where ProcessCommandLine has_any (BadPkgs)
+    or InitiatingProcessCommandLine has_any (BadPkgs)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. COMPROMISED PACKAGE@VERSION IN LOCKFILES / package.json
+//    Even if a CI run did not log the exact install command,
+//    the resolved version lands on disk. Hunt for write events
+//    against `package-lock.json` / `yarn.lock` / `pnpm-lock.yaml`
+//    that contain the vulnerable identifiers.
+//    NOTE: DeviceFileEvents has no `AccountName` — use
+//    `InitiatingProcessAccountName`.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("package-lock.json", "yarn.lock",
+                       "pnpm-lock.yaml", "package.json")
+| where InitiatingProcessCommandLine has_any (
+    "@cap-js/postgres", "@cap-js/db-service",
+    "@cap-js/sqlite", "mbt@1.2.48"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. `setup.mjs` AND `execution.js` IN node_modules
+//    The exact filename pair the campaign drops. Hunt the file
+//    write inside any `node_modules` subtree.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("setup.mjs", "execution.js")
+| where FolderPath has "node_modules"
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath, SHA256, SHA1,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. BUN RUNTIME DOWNLOADED BY npm / node DURING INSTALL
+//    The malicious preinstall hook fetches Bun. Legitimate
+//    packages rarely reach for Bun mid-install. Filter on
+//    Bun's official install endpoints fetched by npm/node/yarn.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where RemoteUrl has_any (
+    "bun.sh", "bun.com",
+    "github.com/oven-sh/bun",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com"
+)
+| where InitiatingProcessFileName in~ (
+    "node.exe", "node",
+    "npm.exe", "npm", "npm-cli.js",
+    "yarn.exe", "yarn",
+    "pnpm.exe", "pnpm",
+    "npx.exe", "npx"
+)
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteUrl, RemoteIP
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. `__decodeScrambled` CIPHER STRING ANYWHERE
+//    Consistent attribution string across TeamPCP payloads.
+//    Surfacing it in any file write or process command line is
+//    high-fidelity for both this campaign and TeamPCP variants
+//    re-using the same loader.
+// ------------------------------------------------------------
+union
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where ProcessCommandLine has "__decodeScrambled"
+    | project Timestamp, DeviceName, AccountName, Source = "Process",
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(90d)
+    | where ActionType in ("FileCreated", "FileModified")
+    | where InitiatingProcessCommandLine has "__decodeScrambled"
+    | project Timestamp, DeviceName,
+              AccountName = InitiatingProcessAccountName,
+              Source = "FileWrite",
+              FileName, FolderPath = FolderPath,
+              ProcessCommandLine = InitiatingProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. CREDENTIAL HARVEST POST-INSTALL
+//    The stage-2 payload reads .npmrc, AWS / Azure / GCP env
+//    var stores, Kubernetes service-account tokens, and GitHub
+//    runtime secrets. Hunt those reads by node / bun / npm
+//    from inside a node_modules execution context.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileAccessed", "FileModified",
+                        "FileCreated", "FileRenamed")
+| where FileName in~ (
+    ".npmrc", "credentials", "credentials.json",
+    "config", "config.json",
+    "id_rsa", "id_ed25519",
+    "azure.json", "service-account.json",
+    "kubeconfig", "config"
+)
+    or FolderPath has_any (
+        @"\.aws\", "/.aws/",
+        @"\.azure\", "/.azure/",
+        @"\.config\gcloud", "/.config/gcloud",
+        @"\.kube\", "/.kube/",
+        @"\.ssh\", "/.ssh/",
+        @"\.docker\", "/.docker/",
+        "/var/run/secrets/kubernetes.io"
+    )
+| where InitiatingProcessFileName in~ (
+    "node.exe", "node",
+    "bun.exe", "bun", "bunx.exe", "bunx",
+    "npm.exe", "npm", "npm-cli.js"
+)
+    or InitiatingProcessCommandLine has_any (
+        "setup.mjs", "execution.js", "node_modules")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. PRE-INSTALL HOOK — node / bun SPAWNED BY npm AT INSTALL
+//    The infection vector is a `preinstall` script in
+//    `package.json`. Surface npm spawning node/bun against
+//    `setup.mjs` or anything launching from node_modules during
+//    a fresh install.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where InitiatingProcessFileName in~ ("npm.exe", "npm",
+                                        "npm-cli.js",
+                                        "yarn.exe", "yarn",
+                                        "pnpm.exe", "pnpm")
+| where FileName in~ ("node.exe", "node",
+                       "bun.exe", "bun", "bunx.exe", "bunx")
+| where ProcessCommandLine has_any (
+    "setup.mjs", "execution.js",
+    "preinstall", "postinstall",
+    "node_modules"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FolderPath
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. NPM PUBLISH BURSTS — TOKEN-ABUSE WORM SPREAD
+//     Self-propagation: stolen npm tokens are used to republish
+//     OTHER packages owned by the same maintainer. Hunt for
+//     `npm publish` from a host that just executed
+//     `setup.mjs` / `execution.js`, especially in CI runners.
+// ------------------------------------------------------------
+let RecentPayload =
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where ProcessCommandLine has_any ("setup.mjs", "execution.js")
+       or SHA256 in~ (
+            "eb6eb4154b03ec73218727dc643d26f4e14dfda2438112926bb5daf37ae8bcdb")
+    | project PayloadTime = Timestamp, DeviceName,
+              PayloadCmd  = ProcessCommandLine;
+let PublishEvents =
+    DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where FileName in~ ("npm.exe", "npm", "pnpm.exe", "pnpm",
+                           "yarn.exe", "yarn")
+    | where ProcessCommandLine has_any ("publish", "npm publish",
+                                         "pnpm publish",
+                                         "yarn publish")
+    | project PubTime = Timestamp, DeviceName, AccountName,
+              PubFile = FileName, PubCmd = ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine;
+RecentPayload
+| join kind=inner PublishEvents on DeviceName
+| where PubTime between (PayloadTime .. (PayloadTime + 1h))
+| project DeviceName, AccountName,
+          PayloadTime, PayloadCmd,
+          PubTime, PubFile, PubCmd,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          Delta = PubTime - PayloadTime
+| sort by PayloadTime desc
+
+
+// ------------------------------------------------------------
+// 11. ATTACKER-CONTROLLED GITHUB EXFIL — DGA-ish REPO PATTERN
+//     TeamPCP exfiltrates encrypted credentials to
+//     attacker-owned GitHub repositories. Surface uploads or
+//     git-pushes from build agents to GitHub repos with
+//     the previously observed
+//        `<word>-<word>-<3 digits>` (Checkmarx Configuration
+//                                     Storage) pattern, plus
+//     any unfamiliar GitHub orgs reached during a build.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where RemoteUrl has_any (
+    "api.github.com", "github.com", "uploads.github.com")
+| where InitiatingProcessFileName in~ (
+    "node.exe", "node",
+    "bun.exe", "bun", "bunx.exe", "bunx",
+    "npm.exe", "npm")
+| where InitiatingProcessCommandLine has_any (
+    "setup.mjs", "execution.js", "node_modules")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteUrl, RemoteIP
+| sort by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. FULL CORRELATION — TeamPCP SUPPLY-CHAIN INFECTION
+//     Priority-rank devices showing 2+ indicators in 14 days:
+//       (a) Known-bad SHA256 (tarball or stage-2)
+//       (b) Compromised package@version on cmdline / lockfile
+//       (c) `setup.mjs` / `execution.js` drop in node_modules
+//       (d) Bun fetched by npm/node during install
+//       (e) Credential file harvest by node/bun
+//     2+ signals = active infection — rotate npm/GitHub/cloud
+//     credentials and quarantine the host's CI artefacts.
+// ------------------------------------------------------------
+let HashHits =
+    union
+    (DeviceProcessEvents | where Timestamp > ago(14d)
+     | where SHA256 in~ (
+        "1d9e4ece8e13c8eaf94cb858470d1bd8f81bb58f62583552303774fa1579edee",
+        "258257560fe2f1c2cc3924eae40718c829085b52ae3436b4e46d2565f6996271",
+        "a1da198bb4e883d077a0e13351bf2c3acdea10497152292e873d79d4f7420211",
+        "86282ebcd3bebf50f087f2c6b00c62caa667cdcb53558033d85acd39e3d88b41",
+        "eb6eb4154b03ec73218727dc643d26f4e14dfda2438112926bb5daf37ae8bcdb")),
+    (DeviceFileEvents | where Timestamp > ago(14d)
+     | where SHA256 in~ (
+        "1d9e4ece8e13c8eaf94cb858470d1bd8f81bb58f62583552303774fa1579edee",
+        "258257560fe2f1c2cc3924eae40718c829085b52ae3436b4e46d2565f6996271",
+        "a1da198bb4e883d077a0e13351bf2c3acdea10497152292e873d79d4f7420211",
+        "86282ebcd3bebf50f087f2c6b00c62caa667cdcb53558033d85acd39e3d88b41",
+        "eb6eb4154b03ec73218727dc643d26f4e14dfda2438112926bb5daf37ae8bcdb"))
+    | summarize HashHits = count(), HashLast = max(Timestamp) by DeviceName;
+let PkgVer =
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where ProcessCommandLine has_any (
+        "@cap-js/postgres@2.2.2",
+        "@cap-js/db-service@2.10.1",
+        "@cap-js/sqlite@2.2.2",
+        "mbt@1.2.48")
+    | summarize PkgHits = count(), PkgLast = max(Timestamp) by DeviceName;
+let DropFile =
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ ("setup.mjs", "execution.js")
+       and FolderPath has "node_modules"
+    | summarize DropHits = count(), DropLast = max(Timestamp) by DeviceName;
+let BunFetch =
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where RemoteUrl has_any ("bun.sh", "bun.com",
+                                "github.com/oven-sh/bun")
+    | where InitiatingProcessFileName in~ (
+        "node.exe","node","npm.exe","npm","yarn.exe","yarn",
+        "pnpm.exe","pnpm","npx.exe","npx")
+    | summarize BunHits = count(), BunLast = max(Timestamp) by DeviceName;
+let CredAccess =
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ (".npmrc","credentials","kubeconfig",
+                          "id_rsa","id_ed25519")
+       or FolderPath has_any (@"\.aws\","/.aws/",
+                              @"\.azure\","/.azure/",
+                              @"\.kube\","/.kube/",
+                              @"\.config\gcloud","/.config/gcloud",
+                              "/var/run/secrets/kubernetes.io")
+    | where InitiatingProcessFileName in~ (
+        "node.exe","node","bun.exe","bun","bunx.exe","bunx")
+    | summarize CredHits = count(), CredLast = max(Timestamp) by DeviceName;
+HashHits
+| join kind=fullouter PkgVer     on DeviceName
+| join kind=fullouter DropFile   on DeviceName
+| join kind=fullouter BunFetch   on DeviceName
+| join kind=fullouter CredAccess on DeviceName
+| extend Device = coalesce(DeviceName, DeviceName1, DeviceName2,
+                            DeviceName3, DeviceName4)
+| extend RiskSignals =
+      iff(isnotempty(HashHits), 1, 0)
+    + iff(isnotempty(PkgHits),  1, 0)
+    + iff(isnotempty(DropHits), 1, 0)
+    + iff(isnotempty(BunHits),  1, 0)
+    + iff(isnotempty(CredHits), 1, 0)
+| where RiskSignals >= 2
+| project Device, RiskSignals,
+          HashHits, HashLast,
+          PkgHits,  PkgLast,
+          DropHits, DropLast,
+          BunHits,  BunLast,
+          CredHits, CredLast
+| sort by RiskSignals desc, HashLast desc
