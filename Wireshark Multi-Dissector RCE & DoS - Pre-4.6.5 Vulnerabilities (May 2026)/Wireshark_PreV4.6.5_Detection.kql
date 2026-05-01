@@ -1,0 +1,376 @@
+// ============================================================
+// Wireshark Multi-Dissector RCE & DoS — Pre-4.6.5 Vulnerabilities
+// Source:   CyberSecurity News (May 1 2026) — "Wireshark Vulnerabilities
+//           Allow Code Execution"; upstream Wireshark 4.6.5 advisories
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1203, T1204.002, T1059.001, T1574.002,
+//               T1027, T1499.004, T1106
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Wireshark < 4.6.5 ships with 40+ disclosed vulnerabilities across
+// dissectors, decompression engines and the profile-import workflow.
+// Several are crash-to-code-execution class — exploitable by feeding
+// the analyst a malicious capture file (.pcap / .pcapng / compressed)
+// or by injecting a malformed packet onto a network segment that
+// Wireshark / tshark / dumpcap is listening on.
+//
+// Wireshark is routinely run on SOC, IR, NOC and engineering hosts —
+// frequently with elevated privileges to capture from raw sockets.
+// A successful exploit therefore lands code on the very tool the
+// defender is using to investigate, often as Administrator.
+//
+// CRITICAL CVEs (RCE-CLASS)
+// ---------------------------------------------------------------
+//   CVE-2026-5402   TLS dissector            — crash + code execution
+//   CVE-2026-5403   SBC codec dissector      — crash + code execution
+//   CVE-2026-5405   RDP dissector            — crash + code execution
+//   CVE-2026-5656   Profile-import workflow  — crash + code execution
+//   CVE-2026-5407   SMB2 dissector           — infinite loop / DoS
+//   CVE-2026-6535   zlib decompression       — engine crash
+//   CVE-2026-6533   LZ77 decompression       — engine crash
+//
+// 20+ additional DoS-class dissector CVEs (Monero, BT-DHT, FC-SWILS,
+// ICMPv6, AFP, K12 RF5, AMR-NB, SDP, iLBC, DCP-ETSI, BEEP, ZigBee,
+// Kismet, ASN.1 PER, RTSP, IEEE 802.11, MySQL, GSM RP, WebSocket,
+// HTTP) plus infinite-loop CVEs in DLMS/COSEM, USB HID, SANE, GNW,
+// OpenFlow v5/v6, MBIM, RPKI-Router.
+//
+// AFFECTED / FIXED
+// ---------------------------------------------------------------
+//   Affected: Wireshark < 4.6.5  (Wireshark.exe / tshark.exe / dumpcap.exe)
+//   Fixed:    Wireshark 4.6.5 (May 1 2026)
+//
+// ATTACK VECTORS
+// ---------------------------------------------------------------
+//   1) Malicious .pcap / .pcapng capture file delivered via email,
+//      ticket attachment, chat or shared drive — opened by analyst.
+//   2) Malformed packets injected onto a segment that the host is
+//      capturing live (raw socket / WinPcap / Npcap).
+//   3) Compressed capture files (.pcap.gz, .pcapng.gz, .zst) trigger
+//      the zlib / LZ77 decompression bugs (CVE-2026-6535/6533).
+//   4) Profile-import (Edit → Configuration Profiles → Import) of a
+//      crafted profile zip triggers CVE-2026-5656.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate analyst workflow: Wireshark opens .pcap from
+//     %USERPROFILE%\Downloads — tune by trusted users / source paths.
+//   - Network engineering tooling that wraps tshark / dumpcap.
+//   - Capture exports from MDE, Sysmon, Zeek, Sentinel hunters.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/wireshark-vulnerabilities-code-execution/
+//   https://www.wireshark.org/docs/relnotes/wireshark-4.6.5.html
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. VULNERABLE WIRESHARK INVENTORY (TVM)
+//    Surfaces every device running Wireshark < 4.6.5. Uses
+//    parse_version for accurate dotted-version comparison.
+// ------------------------------------------------------------
+DeviceTvmSoftwareInventory
+| where SoftwareVendor =~ "wireshark" or SoftwareName has "wireshark"
+| extend FixedVersion = "4.6.5"
+| where parse_version(SoftwareVersion) < parse_version(FixedVersion)
+| project DeviceId, DeviceName, OSPlatform, OSVersion,
+          SoftwareVendor, SoftwareName, SoftwareVersion, FixedVersion,
+          EndOfSupportStatus
+| order by DeviceName asc
+
+
+// ------------------------------------------------------------
+// 2. KNOWN WIRESHARK CVEs PRESENT (TVM VULNERABILITIES)
+//    Direct lookup against the TVM CVE feed. Will populate as
+//    Microsoft ingests the May 2026 advisory cluster.
+// ------------------------------------------------------------
+let WiresharkCVEs = dynamic([
+    "CVE-2026-5402","CVE-2026-5403","CVE-2026-5405","CVE-2026-5407",
+    "CVE-2026-5656","CVE-2026-6533","CVE-2026-6535"
+]);
+DeviceTvmSoftwareVulnerabilities
+| where (SoftwareVendor =~ "wireshark" or SoftwareName has "wireshark")
+   or CveId in (WiresharkCVEs)
+| project DeviceId, DeviceName, OSPlatform,
+          SoftwareVendor, SoftwareName, SoftwareVersion,
+          CveId, VulnerabilitySeverityLevel, CvssScore,
+          IsExploitAvailable, RecommendedSecurityUpdate
+| order by CvssScore desc, DeviceName asc
+
+
+// ------------------------------------------------------------
+// 3. WIRESHARK / TSHARK / DUMPCAP LAUNCHED FROM SUSPICIOUS PARENT
+//    Browser, mail client or archiver spawning Wireshark is a
+//    strong indicator that an analyst is being baited into
+//    opening a hostile capture file.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("Wireshark.exe", "tshark.exe", "dumpcap.exe")
+| where InitiatingProcessFileName in~ (
+    "outlook.exe", "OUTLOOK.EXE", "olk.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "Teams.exe", "ms-teams.exe", "slack.exe", "discord.exe",
+    "WinRAR.exe", "7zG.exe", "7zFM.exe", "Bandizip.exe",
+    "explorer.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. WIRESHARK OPENING A CAPTURE FILE FROM A USER-WRITABLE PATH
+//    Captures supplied as command-line arguments are the
+//    primary RCE vector. Watch for .pcap / .pcapng / .cap /
+//    compressed variants from Downloads, Temp, Outlook attach.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("Wireshark.exe", "tshark.exe")
+| where ProcessCommandLine has_any (
+    ".pcap", ".pcapng", ".cap",
+    ".pcap.gz", ".pcapng.gz", ".pcap.zst", ".pcapng.zst",
+    ".cap.gz"
+)
+| where ProcessCommandLine has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\INetCache\", @"\Outlook\", @"\Content.Outlook\",
+    @"\OneDrive\Attachments", @"\Desktop\",
+    @":\Users\Public\", @"\Quarantine\"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, FileName,
+          ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. COMPRESSED CAPTURE FILES DROPPED IN USER PATHS
+//    Feeds the zlib (CVE-2026-6535) and LZ77 (CVE-2026-6533)
+//    decompression bugs. Surface .gz / .zst variants written by
+//    browsers, mail or archivers — review before opening.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".pcap.gz"
+   or FileName endswith ".pcapng.gz"
+   or FileName endswith ".pcap.zst"
+   or FileName endswith ".pcapng.zst"
+   or FileName endswith ".cap.gz"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Content.Outlook\", @"\INetCache\",
+    @"\OneDrive\Attachments", @"\Desktop\"
+)
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. WIRESHARK PROFILE IMPORT FROM A SUSPICIOUS PATH
+//    CVE-2026-5656 — crafted profile zip triggers code exec
+//    on import. Wireshark profile dirs:
+//        %APPDATA%\Wireshark\profiles\
+//        %APPDATA%\Wireshark\Personal Configuration\profiles\
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has_any (
+    @"\Wireshark\profiles\",
+    @"\Wireshark\Personal Configuration\profiles"
+)
+| where InitiatingProcessFileName in~ ("Wireshark.exe", "explorer.exe", "7zG.exe", "7zFM.exe", "WinRAR.exe", "Bandizip.exe")
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. WIRESHARK / TSHARK / DUMPCAP SPAWNING A CHILD PROCESS
+//    Should never happen in normal use. Any cmd / powershell /
+//    rundll32 / regsvr32 / mshta child is post-exploit code
+//    execution from a dissector RCE.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("Wireshark.exe", "tshark.exe", "dumpcap.exe")
+| where FileName !in~ (
+    "Wireshark.exe", "tshark.exe", "dumpcap.exe",
+    "WerFault.exe", "WerFaultSecure.exe",
+    "conhost.exe", "vcredist_x64.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessIntegrityLevel, ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. DUMPCAP RUNNING FROM AN UNUSUAL PARENT / PATH
+//    dumpcap.exe normally lives under "C:\Program Files\Wireshark\".
+//    Watch for it spawned from user-writable paths, or by parents
+//    other than Wireshark / tshark / a known IT tool.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "dumpcap.exe"
+| where (FolderPath !startswith @"C:\Program Files\Wireshark"
+         and FolderPath !startswith @"C:\Program Files (x86)\Wireshark")
+   or  (InitiatingProcessFileName !in~ (
+            "Wireshark.exe", "tshark.exe",
+            "explorer.exe", "cmd.exe", "powershell.exe", "pwsh.exe"
+        ))
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. WIRESHARK LOADING A DLL FROM A USER-WRITABLE PATH
+//    DLL sideload / hijack — useful both as exploitation
+//    follow-on and as a hardening check on the Wireshark install.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("Wireshark.exe", "tshark.exe", "dumpcap.exe")
+| where FolderPath !startswith @"C:\Program Files\Wireshark"
+   and FolderPath !startswith @"C:\Program Files (x86)\Wireshark"
+   and FolderPath !startswith @"C:\Windows\"
+| where FolderPath has_any (
+    @"\AppData\Local\Temp",
+    @"\AppData\Roaming\",
+    @"\Downloads\",
+    @"\Users\Public\",
+    @"\ProgramData\"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. OUTBOUND NETWORK FROM WIRESHARK / TSHARK / DUMPCAP
+//     Wireshark itself does not phone home for analysis.
+//     Outbound traffic from these binaries — especially to
+//     non-Wireshark / non-Microsoft destinations — is a strong
+//     post-exploitation tell.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("Wireshark.exe", "tshark.exe", "dumpcap.exe")
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+| where not (RemoteUrl has_any (
+    "wireshark.org", "microsoft.com", "windowsupdate.com",
+    "msftconnecttest", "digicert.com", "sectigo.com"
+))
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. SUSPICIOUS .PCAP DELIVERY VIA EMAIL / BROWSER
+//     Capture files dropped to Outlook attachment cache, browser
+//     download dirs or Teams files folders — the most common
+//     exploitation entry point against an analyst.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".pcap"
+   or FileName endswith ".pcapng"
+   or FileName endswith ".cap"
+   or FileName endswith ".pcap.gz"
+   or FileName endswith ".pcapng.gz"
+   or FileName endswith ".pcap.zst"
+   or FileName endswith ".pcapng.zst"
+| where FolderPath has_any (
+    @"\Content.Outlook\",
+    @"\INetCache\",
+    @"\Microsoft\Olk\Attachments",
+    @"\Microsoft\Teams\",
+    @"\Microsoft Teams\",
+    @"\Downloads\",
+    @"\OneDrive\Attachments"
+)
+| where InitiatingProcessFileName in~ (
+    "outlook.exe", "OUTLOOK.EXE", "olk.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "Teams.exe", "ms-teams.exe", "slack.exe", "discord.exe"
+)
+| project Timestamp, DeviceName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Vulnerable Wireshark device → suspicious .pcap delivery
+//     → Wireshark opens it → unexpected child process spawned.
+//     Use for high-confidence exploitation triage.
+// ------------------------------------------------------------
+let VulnerableHosts = DeviceTvmSoftwareInventory
+| where SoftwareVendor =~ "wireshark" or SoftwareName has "wireshark"
+| where parse_version(SoftwareVersion) < parse_version("4.6.5")
+| project DeviceName, VulnVersion = SoftwareVersion;
+let Stage1_Delivery = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileRenamed")
+| where FileName endswith ".pcap"
+   or FileName endswith ".pcapng"
+   or FileName endswith ".cap"
+   or FileName endswith ".pcap.gz"
+   or FileName endswith ".pcapng.gz"
+| where FolderPath has_any (
+    @"\Content.Outlook\", @"\INetCache\",
+    @"\Microsoft\Olk\Attachments", @"\Microsoft\Teams\",
+    @"\Downloads\", @"\OneDrive\Attachments"
+)
+| project DeviceName, DeliveryTime = Timestamp,
+          DeliveredFile = FileName, DeliveryPath = FolderPath,
+          DeliveredBy = InitiatingProcessFileName;
+let Stage2_Open = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("Wireshark.exe", "tshark.exe")
+| where ProcessCommandLine has_any (".pcap", ".pcapng", ".cap")
+| project DeviceName, OpenTime = Timestamp,
+          OpenCmd = ProcessCommandLine,
+          WSPid = ProcessId;
+let Stage3_BadChild = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("Wireshark.exe", "tshark.exe", "dumpcap.exe")
+| where FileName !in~ (
+    "Wireshark.exe", "tshark.exe", "dumpcap.exe",
+    "WerFault.exe", "WerFaultSecure.exe", "conhost.exe"
+)
+| project DeviceName, ChildTime = Timestamp,
+          ChildName = FileName, ChildCmd = ProcessCommandLine,
+          ParentPid = InitiatingProcessId;
+VulnerableHosts
+| join kind=inner Stage1_Delivery on DeviceName
+| join kind=inner Stage2_Open on DeviceName
+| where OpenTime between (DeliveryTime .. (DeliveryTime + 24h))
+| join kind=leftouter Stage3_BadChild on DeviceName
+| where ChildTime between (OpenTime .. (OpenTime + 10m))
+| project DeliveryTime, OpenTime, ChildTime,
+          DeviceName, VulnVersion,
+          DeliveredFile, DeliveryPath, DeliveredBy,
+          OpenCmd, ChildName, ChildCmd
+| order by DeliveryTime desc
