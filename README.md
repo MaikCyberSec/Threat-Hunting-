@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **May 2026**
+- [Email Bombing & Fake IT Support Teams Vishing - Quick Assist Abuse](<Email Bombing & Fake IT Support Teams Vishing - Quick Assist Abuse (May 2026)>)
 - [Wireshark Multi-Dissector RCE & DoS - Pre-4.6.5 Vulnerabilities](<Wireshark Multi-Dissector RCE & DoS - Pre-4.6.5 Vulnerabilities (May 2026)>)
 
 **April 2026**
