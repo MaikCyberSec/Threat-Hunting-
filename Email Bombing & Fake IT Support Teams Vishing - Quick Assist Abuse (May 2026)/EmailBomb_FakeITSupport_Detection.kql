@@ -1,0 +1,382 @@
+// ============================================================
+// Email Bombing & Fake IT Support — Microsoft Teams Vishing
+// Source:   CyberSecurity News / eSentire (May 4 2026)
+//           "Email Bombing and Fake IT Support Calls" — 72%
+//           reported success rate; growing since early 2026.
+// Platform: Microsoft Defender for Endpoint + Defender for
+//           Office 365 + Defender for Cloud Apps (Advanced Hunting)
+// MITRE ATT&CK: T1566.004, T1566.003, T1219, T1098.005,
+//               T1059.001, T1204.002, T1567.002, T1486
+// Threat Actors: Scattered Spider, UNC6692, Payouts King
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// A Teams-based vishing playbook used by Scattered Spider,
+// UNC6692 and the Payouts King cluster. The chain is purpose-
+// built to bypass email security stacks by moving the social-
+// engineering step out of email entirely:
+//
+//   1) Email bomb — the target's mailbox is flooded with
+//      hundreds-to-thousands of newsletter / opt-in confirmation
+//      emails inside a short window (often <30 min) to manufacture
+//      panic and bury legitimate traffic.
+//   2) "IT support" appears via Microsoft Teams external chat —
+//      external-tenant accounts with display names like
+//      "IT Protection Department", "Windows Security Help Desk",
+//      or realistic full-name personas (michaelturner@, etc.).
+//   3) The "support tech" walks the victim through launching
+//      Quick Assist (built-in Windows tool) and shares the
+//      6-digit code, granting full remote control to the actor.
+//   4) During the session, the actor drops
+//      "Email-Deployment-Process-System.zip" containing a
+//      malicious Java binary, downloads AnyDesk for persistent
+//      access, and stages WinSCP from the official site for
+//      covert SFTP exfil.
+//   5) Outcomes range from credential / mailbox theft to ransomware
+//      handoff (Black Basta / BlackSuit / DragonForce lineage).
+//
+// IMPERSONATION DISPLAY NAMES (observed)
+// ---------------------------------------------------------------
+//   "IT Protection Department"
+//   "Windows Security Help Desk"
+//   "Help Desk", "IT Support", "Microsoft Help Desk"
+//   Personal-name personas (michaelturner@, danielfoster@, ...)
+//
+// BULLETPROOF HOSTERS BEHIND TEAMS SENDER ACCOUNTS
+// ---------------------------------------------------------------
+//   NKtelecom INC
+//   WorkTitans B.V.
+//   Global Connectivity Solutions LLP
+//   GWY IT PTY LTD
+//
+// KEY ARTEFACTS
+// ---------------------------------------------------------------
+//   - quickassist.exe launched shortly after a Teams external chat
+//   - Email-Deployment-Process-System.zip dropped via Quick Assist
+//   - AnyDesk.exe in user-writable paths (often Downloads / Temp)
+//   - WinSCP.exe with /command, /script or sftp:// arguments
+//   - java.exe / javaw.exe spawned from user-writable path
+//   - 100+ inbound mails to a single recipient inside 15 minutes
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Genuine Quick Assist support sessions from your own helpdesk.
+//     Maintain an allow-list of known internal helper accounts.
+//   - AnyDesk used by IT for legitimate remote support — pin the
+//     install to your standard package path / signer.
+//   - WinSCP for legitimate SFTP transfers — tune by user / dest.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/email-bombing-and-fake-it-support-calls/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. EMAIL BOMB BURST DETECTION
+//    Surfaces recipients hit with 100+ inbound messages from
+//    50+ distinct senders inside a 15-minute window — the
+//    signature opener of the Scattered Spider / UNC6692 play.
+// ------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| summarize
+    InboundCount    = count(),
+    DistinctSenders = dcount(SenderFromAddress),
+    DistinctDomains = dcount(SenderFromDomain),
+    SampleSubjects  = make_set(Subject, 5)
+    by RecipientEmailAddress, BombWindow = bin(Timestamp, 15m)
+| where InboundCount >= 100 and DistinctSenders >= 50
+| order by InboundCount desc
+
+
+// ------------------------------------------------------------
+// 2. BOMB-BURST WINDOW × EXTERNAL TEAMS CHAT (CO-OCCURRENCE)
+//    Tenant-wide co-occurrence trigger — any 15-min window that
+//    contains BOTH an email-bomb burst AND inbound external-
+//    tenant Teams chats. Pairs each bomb window with every
+//    external chat in the same hour for SOC pivot.
+//    NOTE: User-level mapping requires IdentityInfo → AccountSid
+//          → UPN; this co-occurrence query intentionally skips
+//          that join and is meant for triage, not alerting.
+// ------------------------------------------------------------
+let BombWindows = EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| summarize InboundCount = count(), DistinctSenders = dcount(SenderFromAddress)
+    by RecipientEmailAddress, BombStart = bin(Timestamp, 15m)
+| where InboundCount >= 100 and DistinctSenders >= 50
+| project BombStart, RecipientEmailAddress, InboundCount, DistinctSenders;
+let TeamsExternal = CloudAppEvents
+| where Timestamp > ago(7d)
+| where Application == "Microsoft Teams"
+| where ActionType in ("ChatCreated", "MessageSent", "MemberAdded", "MemberRoleChanged")
+| extend Raw = tostring(RawEventData)
+| where Raw has "External" or Raw has_any ("federatedUser", "anonymousGuest")
+| project TeamsTime = Timestamp, TeamsActor = AccountDisplayName,
+          IPAddress, CountryCode, ISP, ActionType;
+BombWindows
+| extend WindowKey = bin(BombStart, 1h)
+| join kind=inner (
+    TeamsExternal
+    | extend WindowKey = bin(TeamsTime, 1h)
+) on WindowKey
+| where TeamsTime between (BombStart .. (BombStart + 60m))
+| project BombStart, TeamsTime, RecipientEmailAddress,
+          InboundCount, DistinctSenders,
+          TeamsActor, ActionType, IPAddress, CountryCode, ISP
+| order by BombStart desc
+
+
+// ------------------------------------------------------------
+// 3. TEAMS EXTERNAL CHAT WITH "IT / HELP DESK / SECURITY"
+//    DISPLAY NAME
+//    The impersonation tell. Surfaces external chats from
+//    accounts using IT-support-styled display names.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(14d)
+| where Application == "Microsoft Teams"
+| where ActionType in ("ChatCreated", "MessageSent", "MemberAdded")
+| extend Raw = tostring(RawEventData)
+| where Raw has "External" or Raw has_any ("federatedUser", "anonymousGuest")
+| where Raw has_any (
+    "IT Protection", "Windows Security", "Help Desk", "HelpDesk",
+    "IT Support", "Microsoft Help", "Security Desk",
+    "Service Desk", "Windows Support", "Microsoft Security"
+)
+| project Timestamp, ActionType, AccountDisplayName,
+          IPAddress, CountryCode, ISP, Raw
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. QUICK ASSIST LAUNCHED ON A USER ENDPOINT
+//    quickassist.exe is the actor's preferred remote-control
+//    pivot. Surface every launch — review against expected
+//    helpdesk activity. Watch parent for browser/Teams.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "quickassist.exe"
+   or ProcessVersionInfoOriginalFileName =~ "QuickAssist.exe"
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. QUICK ASSIST SPAWNED FROM TEAMS / BROWSER / OUTLOOK
+//    Tightest social-engineering signal: a user clicks "Run"
+//    or pastes the command from the Teams chat → Quick Assist
+//    starts under msedge / chrome / Teams / Outlook.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "quickassist.exe"
+| where InitiatingProcessFileName in~ (
+    "Teams.exe", "ms-teams.exe",
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "OUTLOOK.EXE", "outlook.exe", "olk.exe",
+    "explorer.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. MALICIOUS PAYLOAD ARCHIVE — "Email-Deployment-Process-System"
+//    Exact filename + close variants observed during Quick
+//    Assist sessions. Surface drops in any user-writable path.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName has_any (
+    "Email-Deployment-Process-System",
+    "Email_Deployment_Process_System",
+    "EmailDeploymentProcessSystem"
+)
+   or (FileName endswith ".zip"
+       and FileName has_all ("Email", "Deployment"))
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. ANYDESK IN USER-WRITABLE PATH
+//    Actor pulls AnyDesk.exe (often portable build) into
+//    Downloads / Temp / Public for persistent remote access
+//    after the Quick Assist session ends.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FileName has_any ("AnyDesk.exe", "AnyDesk.msi")
+    | where FolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+        @":\Users\Public\", @"\Desktop\", @"\OneDrive\"
+    )
+    | extend EventKind = "FileDrop"
+    | project Timestamp, DeviceName, EventKind, FileName, FolderPath,
+              SHA256, InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName =~ "AnyDesk.exe"
+       or ProcessVersionInfoOriginalFileName =~ "AnyDesk.exe"
+    | where FolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+        @":\Users\Public\", @"\Desktop\", @"\OneDrive\"
+    )
+    | extend EventKind = "Execution"
+    | project Timestamp, DeviceName, EventKind, FileName, FolderPath,
+              SHA256 = "", InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. WINSCP USED FOR SFTP / SCP EXFILTRATION
+//    Legitimate WinSCP abused as the exfil tool. Look for
+//    command-line transfer arguments — sftp://, /command,
+//    /script — especially from non-IT user accounts.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "WinSCP.exe"
+   or FileName =~ "WinSCP.com"
+   or ProcessVersionInfoOriginalFileName has "WinSCP"
+| where ProcessCommandLine has_any (
+    "sftp://", "scp://", "ftps://", "ftp://",
+    "/command", "/script", "/upload",
+    "synchronize", "put ", "putto"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. JAVA BINARY EXECUTED FROM A USER-WRITABLE PATH
+//    The "Email-Deployment-Process-System.zip" payload is a
+//    Java binary. Catch java.exe / javaw.exe / jar invocations
+//    where the JAR sits in a user-writable directory.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("java.exe", "javaw.exe", "jp2launcher.exe")
+   or ProcessCommandLine has " -jar "
+| where ProcessCommandLine has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. ARCHIVE EXTRACTION INSIDE A QUICK ASSIST SESSION WINDOW
+//     Looks for any archive (.zip / .rar / .7z / .iso) extracted
+//     within 30 min of a Quick Assist launch — captures the
+//     "open this file please" moment of the support session.
+// ------------------------------------------------------------
+let QuickAssistRuns = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "quickassist.exe"
+| project DeviceName, QATime = Timestamp;
+let ArchiveDrops = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType == "FileCreated"
+| where FileName endswith ".zip"
+   or FileName endswith ".rar"
+   or FileName endswith ".7z"
+   or FileName endswith ".iso"
+   or FileName endswith ".img"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @":\Users\Public\"
+)
+| project DeviceName, DropTime = Timestamp, ArchiveName = FileName,
+          ArchivePath = FolderPath, DropParent = InitiatingProcessFileName;
+QuickAssistRuns
+| join kind=inner ArchiveDrops on DeviceName
+| where DropTime between (QATime .. (QATime + 30m))
+| project QATime, DropTime, DeviceName,
+          ArchiveName, ArchivePath, DropParent
+| order by QATime desc
+
+
+// ------------------------------------------------------------
+// 11. SFTP / SCP / FTPS EGRESS FROM WINSCP TO PUBLIC IPs
+//     Pairs with #8 — the actual outbound transfer events.
+//     Filter to public destinations to suppress LAN noise.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("WinSCP.exe", "WinSCP.com")
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+| where RemotePort in (22, 990, 989, 21, 2222, 443)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. ENDPOINT KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Quick Assist launch → suspicious file drop or RMM install
+//     within 1 h → WinSCP exfil within 24 h. Joined on
+//     DeviceName so it is reliable regardless of UPN-to-SID
+//     mappings. Pair with query #1 (bomb-burst date) for the
+//     full Scattered Spider / UNC6692 picture.
+// ------------------------------------------------------------
+let Stage1_QA = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "quickassist.exe"
+| project DeviceName, AccountName, QATime = Timestamp,
+          QAParent = InitiatingProcessFileName;
+let Stage2_BadDrop = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName has_any (
+    "Email-Deployment-Process-System",
+    "AnyDesk.exe", "AnyDesk.msi"
+)
+   or (FileName endswith ".jar"
+       and FolderPath has_any (@"\Downloads\", @"\Temp\", @"\Public\"))
+| project DeviceName, DropTime = Timestamp,
+          DropFile = FileName, DropPath = FolderPath,
+          DropParent = InitiatingProcessFileName;
+let Stage3_Exfil = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "WinSCP.exe" or FileName =~ "WinSCP.com"
+| where ProcessCommandLine has_any ("sftp://", "scp://", "/command", "/script")
+| project DeviceName, ExfilTime = Timestamp,
+          ExfilCmd = ProcessCommandLine;
+Stage1_QA
+| join kind=inner Stage2_BadDrop on DeviceName
+| where DropTime between (QATime .. (QATime + 1h))
+| join kind=leftouter Stage3_Exfil on DeviceName
+| where ExfilTime between (QATime .. (QATime + 24h))
+| project QATime, DropTime, ExfilTime,
+          DeviceName, AccountName,
+          QAParent, DropFile, DropPath, DropParent, ExfilCmd
+| order by QATime desc
