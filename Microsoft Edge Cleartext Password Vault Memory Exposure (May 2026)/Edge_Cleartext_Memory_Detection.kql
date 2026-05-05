@@ -1,0 +1,394 @@
+// ============================================================
+// Microsoft Edge — Cleartext Password Vault in Process Memory
+// Source:   CyberSecurity News / BigBiteOfTech (Apr 29 2026)
+//           PoC: github.com/L1v1ng0ffTh3L4N/Proof-of-Concepts/
+//                tree/main/EdgeSavedPasswordsDumper
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1555.003, T1003.001, T1059.001, T1106,
+//               T1218.011, T1057, T1041
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Microsoft Edge decrypts the entire saved-password vault into
+// the browser process memory the moment msedge.exe launches and
+// keeps the credentials there in cleartext for the lifetime of
+// the process. Any process able to read msedge.exe memory
+// (procdump, comsvcs MiniDump, .NET ReadProcessMemory, Task
+// Manager "Create Dump File", or a custom tool such as the
+// public PoC "EdgeSavedPasswordsDumper") can recover every
+// stored username and password without DPAPI or App-Bound-
+// Encryption keys.
+//
+// Microsoft has classified the behaviour as "by design", so no
+// patch is expected. Defenders must therefore treat this as a
+// permanent posture issue, especially in multi-user environments
+// (RDS / Citrix / WVD / AVD / terminal servers) where one
+// administrator can dump every user session at once.
+//
+// CHROME COMPARISON
+// ---------------------------------------------------------------
+// Chrome decrypts only the requested entry, on demand, and
+// pairs it with App-Bound Encryption — significantly reducing
+// the cleartext window. Edge does NOT.
+//
+// KEY DETECTION ANGLES
+// ---------------------------------------------------------------
+//   1) Process-memory dumping tools targeting msedge.exe
+//      (procdump, ProcDump64, comsvcs.dll MiniDump LOLBin,
+//      .NET MiniDumpWriteDump, Task Manager dump, WerFault).
+//   2) Direct memory reads via PowerShell P/Invoke into
+//      OpenProcess + ReadProcessMemory against msedge.exe.
+//   3) The published PoC binary "EdgeSavedPasswordsDumper".
+//   4) Companion file-based theft: non-Edge processes touching
+//      "Login Data", "Local State", "Web Data", "Cookies"
+//      under the Edge user-profile directory.
+//   5) Inventory of high-risk hosts: Edge installed on Remote
+//      Desktop Session Hosts / Citrix / WVD / AVD.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate IT diagnostics using procdump or Task Manager
+//     to dump a hung browser. Tune by user / signer / context.
+//   - WerFault.exe creating crash dumps after a real crash —
+//     review timing relative to Edge stability events.
+//   - Endpoint backup / forensic tools that touch the Edge
+//     user-profile directory.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/microsoft-edge-passwords-cleartext/
+//   https://github.com/L1v1ng0ffTh3L4N/Proof-of-Concepts/tree/main/EdgeSavedPasswordsDumper
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. PUBLIC POC — "EdgeSavedPasswordsDumper" BY NAME
+//    Surface any execution or file drop named after the
+//    public proof-of-concept. Highest-fidelity hit.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName has "EdgeSavedPasswordsDumper"
+       or ProcessCommandLine has "EdgeSavedPasswordsDumper"
+       or InitiatingProcessCommandLine has "EdgeSavedPasswordsDumper"
+       or ProcessVersionInfoOriginalFileName has "EdgeSavedPasswordsDumper"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FileName has "EdgeSavedPasswordsDumper"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. PROCDUMP / SYSINTERNALS TARGETING MSEDGE.EXE
+//    procdump.exe / procdump64.exe with "msedge" in the
+//    command line is one of the cleanest single-event tells.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("procdump.exe", "procdump64.exe")
+   or ProcessVersionInfoOriginalFileName in~ ("procdump.exe", "procdump64.exe")
+| where ProcessCommandLine has_any ("msedge", "msedge.exe")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. RUNDLL32 + COMSVCS.DLL MINIDUMP LOLBIN
+//    Classic LOLBin technique to dump any process by PID via
+//    comsvcs.dll!MiniDump — works equally well on msedge.exe.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "rundll32.exe"
+| where ProcessCommandLine has "comsvcs.dll"
+   and ProcessCommandLine has_any ("MiniDump", "#24", " 24 ")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. POWERSHELL READPROCESSMEMORY / OPENPROCESS AGAINST MSEDGE
+//    P/Invoke patterns calling kernel32!OpenProcess +
+//    ReadProcessMemory or psapi!EnumProcessModules with
+//    "msedge" referenced in the same script block.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where FileName in~ ("powershell.exe", "pwsh.exe")
+    | where ProcessCommandLine has "msedge"
+    | where ProcessCommandLine has_any (
+        "OpenProcess", "ReadProcessMemory",
+        "MiniDumpWriteDump", "NtReadVirtualMemory",
+        "EnumProcessModules", "Get-Process msedge",
+        "Marshal.Copy", "Marshal.PtrToStructure",
+        "kernel32", "psapi", "dbghelp"
+    )
+    | extend Body = ProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(14d)
+    | where ActionType in ("PowerShellCommand", "ScriptContent")
+    | extend Body = tostring(parse_json(AdditionalFields).Command)
+    | where isnotempty(Body)
+    | where Body has "msedge"
+    | where Body has_any (
+        "OpenProcess", "ReadProcessMemory",
+        "MiniDumpWriteDump", "NtReadVirtualMemory",
+        "EnumProcessModules"
+    )
+)
+| project Timestamp, DeviceName, FileName,
+          InitiatingProcessFileName, Body
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. MEMORY DUMP FILE OF MSEDGE WRITTEN TO DISK
+//    *.dmp / *.mdmp / *.hdmp file events whose name references
+//    msedge — captures procdump, comsvcs MiniDump, taskmgr
+//    "Create Dump File", and bespoke tools alike.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where (FileName endswith ".dmp" or FileName endswith ".mdmp" or FileName endswith ".hdmp")
+   and (FileName has "msedge" or FolderPath has "msedge")
+| where InitiatingProcessFileName !in~ ("WerFault.exe", "WerFaultSecure.exe")
+   or FolderPath !startswith @"C:\ProgramData\Microsoft\Windows\WER"
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. EDGE CREDENTIAL FILES READ BY A NON-EDGE PROCESS
+//    Companion attack path — same vault, file-based. "Login
+//    Data", "Local State", "Web Data", "Cookies" touched by
+//    anything other than msedge.exe / IT-management tooling.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has @"\Microsoft\Edge\User Data"
+| where FileName in~ ("Login Data", "Local State", "Web Data", "Cookies")
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "msedgewebview2.exe", "MicrosoftEdgeUpdate.exe",
+    "OneDrive.exe", "explorer.exe", "SearchIndexer.exe",
+    "MsMpEng.exe", "MpDefenderCoreService.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. MANUAL DUMP VIA TASK MANAGER ("Create Dump File")
+//    taskmgr.exe spawning WerFault with a -pss / -pid pointing
+//    at msedge — fingerprint of an interactive admin dumping
+//    the browser through the Task Manager UI.
+// ------------------------------------------------------------
+let MSEdgePids = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "msedge.exe"
+| project DeviceName, MSEdgePid = ProcessId, EdgeStart = Timestamp;
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("WerFault.exe", "WerFaultSecure.exe")
+| where InitiatingProcessFileName =~ "taskmgr.exe"
+| where ProcessCommandLine has_any ("-pss", "-p ", "-pid", "msedge")
+| join kind=leftouter MSEdgePids on DeviceName
+| where ProcessCommandLine has tostring(MSEdgePid) or ProcessCommandLine has "msedge"
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, FileName,
+          ProcessCommandLine, MSEdgePid
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. SUSPICIOUS CHILD OF MSEDGE.EXE (POST-EXPLOIT PIVOT)
+//    msedge.exe should not spawn cmd / powershell / mshta /
+//    rundll32 / regsvr32 / wscript / cscript. Catches both
+//    browser-exploit follow-ons and tools dropped during a
+//    credential-theft session.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "msedge.exe"
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "mshta.exe", "rundll32.exe", "regsvr32.exe",
+    "wscript.exe", "cscript.exe", "bitsadmin.exe",
+    "certutil.exe", "wmic.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. HIGH-RISK INVENTORY — EDGE ON RDS / MULTI-USER HOSTS
+//    The vulnerability is most damaging on Remote Desktop
+//    Session Host / Citrix / WVD / AVD because one admin can
+//    dump every user's vault. Surface the exposure surface.
+// ------------------------------------------------------------
+let MultiUserHosts = DeviceLogonEvents
+| where Timestamp > ago(7d)
+| where LogonType in ("RemoteInteractive", "Interactive")
+| summarize DistinctUsers = dcount(AccountName) by DeviceName
+| where DistinctUsers >= 3
+| project DeviceName, DistinctUsers;
+let EdgeHosts = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "msedge.exe"
+| summarize EdgeLaunches = count(),
+            DistinctEdgeUsers = dcount(AccountName)
+    by DeviceName;
+MultiUserHosts
+| join kind=inner EdgeHosts on DeviceName
+| project DeviceName, DistinctUsers, EdgeLaunches, DistinctEdgeUsers
+| order by DistinctEdgeUsers desc, DistinctUsers desc
+
+
+// ------------------------------------------------------------
+// 10. CREDENTIAL-DUMPER PARENT PROCESS LADDER
+//     Catches a low-privilege launcher (Outlook, browser,
+//     archiver, Office) spawning a dumper tool that then
+//     touches msedge — the social-engineering-to-credential-
+//     theft pivot.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (
+    "procdump.exe", "procdump64.exe",
+    "rundll32.exe", "powershell.exe", "pwsh.exe"
+)
+| where ProcessCommandLine has_any (
+    "msedge", "comsvcs.dll", "MiniDump",
+    "ReadProcessMemory", "OpenProcess"
+)
+| where InitiatingProcessFileName in~ (
+    "OUTLOOK.EXE", "outlook.exe", "olk.exe",
+    "WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE",
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "Teams.exe", "ms-teams.exe",
+    "WinRAR.exe", "7zG.exe", "7zFM.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. OUTBOUND EGRESS SOON AFTER A MSEDGE DUMP / READ EVENT
+//     If a dumper writes a memory dump and the same process
+//     family talks outbound to a non-Microsoft destination
+//     within 1 hour, it is almost certainly exfiltration.
+// ------------------------------------------------------------
+let DumpEvents = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where (FileName endswith ".dmp" or FileName endswith ".mdmp")
+   and (FileName has "msedge" or FolderPath has "msedge")
+| project DeviceName, DumpTime = Timestamp,
+          DumpFile = FileName, DumpPath = FolderPath,
+          DumpProc = InitiatingProcessFileName;
+let Egress = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+| where not (RemoteUrl has_any (
+    "microsoft.com", "windowsupdate.com", "msftconnecttest",
+    "office.com", "office365.com", "azure.com",
+    "live.com", "msftncsi.com"
+))
+| project DeviceName, EgressTime = Timestamp,
+          EgressProc = InitiatingProcessFileName,
+          RemoteIP, RemotePort, RemoteUrl;
+DumpEvents
+| join kind=inner Egress on DeviceName
+| where EgressTime between (DumpTime .. (DumpTime + 1h))
+| where EgressProc =~ DumpProc
+   or EgressProc in~ ("powershell.exe", "pwsh.exe", "rundll32.exe", "curl.exe", "certutil.exe")
+| project DumpTime, EgressTime, DeviceName,
+          DumpFile, DumpPath, DumpProc,
+          EgressProc, RemoteIP, RemotePort, RemoteUrl
+| order by DumpTime desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Ties msedge.exe live on host → memory-dump tool execution
+//     → dump file written → suspicious egress, all on the
+//     same DeviceName inside a 4-hour window.
+// ------------------------------------------------------------
+let Stage1_Edge = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "msedge.exe"
+| summarize EdgeLast = max(Timestamp) by DeviceName;
+let Stage2_DumpTool = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where (
+    (FileName in~ ("procdump.exe", "procdump64.exe"))
+    or (FileName =~ "rundll32.exe" and ProcessCommandLine has "comsvcs.dll" and ProcessCommandLine has_any ("MiniDump", "#24"))
+    or (FileName in~ ("powershell.exe", "pwsh.exe")
+        and ProcessCommandLine has "msedge"
+        and ProcessCommandLine has_any ("OpenProcess", "ReadProcessMemory", "MiniDumpWriteDump"))
+    or FileName has "EdgeSavedPasswordsDumper"
+)
+| project DeviceName, ToolTime = Timestamp,
+          ToolName = FileName, ToolCmd = ProcessCommandLine;
+let Stage3_DumpFile = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where (FileName endswith ".dmp" or FileName endswith ".mdmp")
+   and (FileName has "msedge" or FolderPath has "msedge")
+| project DeviceName, DumpTime = Timestamp,
+          DumpFile = FileName, DumpPath = FolderPath;
+let Stage4_Egress = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+| where not (RemoteUrl has_any ("microsoft.com", "windowsupdate.com", "office.com"))
+| project DeviceName, EgressTime = Timestamp,
+          EgressProc = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_Edge
+| join kind=inner Stage2_DumpTool on DeviceName
+| where ToolTime between (EdgeLast - 1h .. EdgeLast + 4h)
+| join kind=leftouter Stage3_DumpFile on DeviceName
+| where DumpTime between (ToolTime .. (ToolTime + 30m))
+| join kind=leftouter Stage4_Egress on DeviceName
+| where EgressTime between (ToolTime .. (ToolTime + 4h))
+| project EdgeLast, ToolTime, DumpTime, EgressTime,
+          DeviceName, ToolName, ToolCmd,
+          DumpFile, DumpPath,
+          EgressProc, C2_IP, C2_Url
+| order by ToolTime desc
