@@ -1,0 +1,416 @@
+// ============================================================
+// Entra ID Conditional Access Bypass — Device Code Flow,
+// Phantom Device Registration & PRT Abuse
+// Source:   CyberSecurity News / Howler Cell (Cyderes) — May 6 2026
+// Platform: Microsoft Defender XDR Advanced Hunting
+//           (AADSignInEventsBeta + CloudAppEvents + IdentityInfo)
+// MITRE ATT&CK: T1078.004, T1098.005, T1556.007, T1550.001,
+//               T1212, T1606.002
+// Threat Actor: Storm-2372 (suspected Russian state-aligned),
+//               TTPs mirrored by Howler Cell red-team engagement
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Howler Cell (Cyderes) demonstrated a multi-stage Conditional
+// Access bypass that closely mirrors Storm-2372 tradecraft. The
+// chain abuses *trust* in the Entra ID identity plane rather
+// than any single CVE:
+//
+//   1) Stolen credentials are blocked by an existing CA policy
+//      (failure code AADSTS53003 — "Access has been blocked by
+//      Conditional Access policies"). The actor pivots immediately
+//      to a different protocol — Device Code Flow — for which the
+//      tenant's CA policy was authored but never enforced.
+//   2) The Device Registration Service (DRS) is called from a
+//      non-Windows host. DRS does not validate that the caller
+//      is a physical Windows machine, so a Linux laptop signs
+//      and registers itself as a "Windows" device using a valid
+//      Azure AD certificate + private key.
+//   3) The phantom device claims hybrid-domain-join status to
+//      bypass Intune's pre-registration enforcement. Intune
+//      treats missing Health Attestation responses as
+//      "not applicable" rather than non-compliant.
+//   4) A Primary Refresh Token (PRT) is minted with the false
+//      device claims. From this point forward every Conditional
+//      Access policy gated on "compliant device" or "hybrid Azure
+//      AD joined device" is silently satisfied.
+//   5) The attacker steps through to high-value resources, often
+//      activating privileged roles synced from on-prem AD
+//      (Howler Cell counted 255 such roles in the engagement).
+//
+// KEY DETECTION ANGLES
+// ---------------------------------------------------------------
+//   - AADSTS53003 failure → Device Code success for the same user
+//     within a short window.
+//   - Device code success where DeviceDetail is empty / unmanaged.
+//   - First-time DeviceId immediately used for sensitive resources.
+//   - ConditionalAccessStatus == "notApplied" for sensitive apps.
+//   - DRS / device-registration audit events from non-corporate
+//     IPs or from accounts with no prior registration history.
+//   - Privileged role activation within 1 h of a device code login.
+//
+// TABLE LICENSING NOTES
+// ---------------------------------------------------------------
+//   AADSignInEventsBeta — requires Microsoft 365 Defender + Entra
+//                         ID (Premium P1/P2 sign-in log ingestion).
+//   CloudAppEvents       — requires Defender for Cloud Apps.
+//   IdentityInfo         — requires Defender for Identity / MDI.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate Device Code flow on shared / kiosk / Azure CLI
+//     workflows. Tune by app / user / location.
+//   - First-time device registrations during onboarding waves.
+//   - Single AADSTS53003 followed by a legitimate success
+//     after the user moves to a compliant device.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/azure-ad-conditional-access-bypassed/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. SUCCESSFUL SIGN-IN VIA DEVICE CODE FLOW
+//    Baseline detection — every successful auth that used the
+//    Device Code grant. Surface for triage even before tuning.
+// ------------------------------------------------------------
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or AuthenticationDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| project Timestamp, AccountUpn, AccountDisplayName,
+          Application, ApplicationId,
+          ResourceDisplayName,
+          IPAddress, Country, City,
+          UserAgent, ClientAppUsed,
+          ConditionalAccessStatus,
+          DeviceTrustType, IsManaged, IsCompliant,
+          RiskLevelDuringSignIn, RiskState
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. AADSTS53003 BLOCK → DEVICE-CODE SUCCESS (SAME USER)
+//    The exact Howler Cell / Storm-2372 pivot — Conditional
+//    Access blocks the credential, the actor reuses it via
+//    Device Code flow within an hour and gets in.
+// ------------------------------------------------------------
+let CA_Blocked = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 53003
+| project BlockTime = Timestamp, AccountObjectId, AccountUpn,
+          BlockIP = IPAddress, BlockUA = UserAgent;
+let DeviceCode_Success = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or AuthenticationDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| project SuccessTime = Timestamp, AccountObjectId, AccountUpn,
+          SuccessIP = IPAddress, SuccessApp = Application,
+          SuccessResource = ResourceDisplayName,
+          SuccessUA = UserAgent;
+CA_Blocked
+| join kind=inner DeviceCode_Success on AccountObjectId
+| where SuccessTime between (BlockTime .. (BlockTime + 1h))
+| project BlockTime, SuccessTime, AccountUpn,
+          BlockIP, SuccessIP, SuccessApp, SuccessResource,
+          BlockUA, SuccessUA
+| order by BlockTime desc
+
+
+// ------------------------------------------------------------
+// 3. DEVICE CODE SUCCESS FROM AN UNMANAGED / NON-COMPLIANT DEVICE
+//    The phantom-device tell — Device Code authenticated
+//    successfully but the device is not Intune-compliant and
+//    has no recognised trust type.
+// ------------------------------------------------------------
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| where (isempty(DeviceTrustType) or DeviceTrustType in~ ("Unknown", ""))
+   and (IsCompliant != true)
+   and (IsManaged != true)
+| project Timestamp, AccountUpn, IPAddress, Country, ISP = NetworkLocationDetails,
+          UserAgent, Application, ResourceDisplayName,
+          DeviceTrustType, IsManaged, IsCompliant,
+          ConditionalAccessStatus
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. CONDITIONAL ACCESS "NOT APPLIED" FOR SENSITIVE APPS
+//    Gap analysis — successful sign-ins to high-value resources
+//    where no CA policy actually applied. Pin your sensitive
+//    app list (Graph, Azure Mgmt, Exchange, SharePoint, Intune,
+//    Key Vault, Defender portal).
+// ------------------------------------------------------------
+let SensitiveApps = dynamic([
+    "Microsoft Graph",
+    "Windows Azure Service Management API",
+    "Office 365 Exchange Online",
+    "Office 365 SharePoint Online",
+    "Microsoft Intune",
+    "Azure Key Vault",
+    "Microsoft Defender XDR",
+    "Microsoft Information Protection Sync Service",
+    "Azure Active Directory PowerShell",
+    "Microsoft Azure CLI"
+]);
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where ResourceDisplayName in (SensitiveApps)
+   or Application in (SensitiveApps)
+| where ConditionalAccessStatus =~ "notApplied"
+   or isempty(ConditionalAccessStatus)
+| project Timestamp, AccountUpn, ResourceDisplayName, Application,
+          IPAddress, Country, UserAgent,
+          DeviceTrustType, IsCompliant, IsManaged,
+          ConditionalAccessStatus, RiskLevelDuringSignIn
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. NEW / FIRST-TIME DEVICE → IMMEDIATE SENSITIVE-RESOURCE USE
+//    Phantom device pattern — a DeviceName / DeviceId not seen
+//    in the last 30 days authenticates and within 30 minutes
+//    accesses Graph, Exchange, SharePoint or Azure Management.
+// ------------------------------------------------------------
+let SeenDevices = AADSignInEventsBeta
+| where Timestamp between (ago(30d) .. ago(1d))
+| where isnotempty(DeviceName)
+| summarize by DeviceName, AccountObjectId;
+let NewDevices = AADSignInEventsBeta
+| where Timestamp > ago(1d)
+| where isnotempty(DeviceName)
+| join kind=leftanti SeenDevices on DeviceName, AccountObjectId
+| project NewDeviceTime = Timestamp, AccountObjectId, AccountUpn,
+          DeviceName, DeviceTrustType, IsManaged, IsCompliant,
+          NewIP = IPAddress, NewUA = UserAgent;
+let SensitiveAccess = AADSignInEventsBeta
+| where Timestamp > ago(1d)
+| where ErrorCode == 0
+| where ResourceDisplayName has_any (
+    "Microsoft Graph", "Azure Service Management",
+    "Exchange", "SharePoint", "Intune",
+    "Key Vault", "Defender", "Active Directory"
+)
+| project AccessTime = Timestamp, AccountObjectId,
+          DeviceName, AccessResource = ResourceDisplayName;
+NewDevices
+| join kind=inner SensitiveAccess on AccountObjectId, DeviceName
+| where AccessTime between (NewDeviceTime .. (NewDeviceTime + 30m))
+| project NewDeviceTime, AccessTime, AccountUpn,
+          DeviceName, DeviceTrustType, IsManaged, IsCompliant,
+          NewIP, NewUA, AccessResource
+| order by NewDeviceTime desc
+
+
+// ------------------------------------------------------------
+// 6. DEVICE CODE SPRAY — ONE IP, MANY USERS
+//    A single source IP requesting Device Code flow against
+//    multiple accounts within a short window — strong actor
+//    signature.
+// ------------------------------------------------------------
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| summarize
+    DistinctUsers = dcount(AccountObjectId),
+    Successes     = countif(ErrorCode == 0),
+    Failures      = countif(ErrorCode != 0),
+    FirstSeen     = min(Timestamp),
+    LastSeen      = max(Timestamp),
+    SampleUsers   = make_set(AccountUpn, 10)
+    by IPAddress, bin(Timestamp, 1h)
+| where DistinctUsers >= 5
+| order by DistinctUsers desc
+
+
+// ------------------------------------------------------------
+// 7. ENTRA DEVICE-REGISTRATION AUDIT EVENTS — UNUSUAL CONTEXT
+//    DRS / Add device / Update device admin events from non-
+//    typical IPs or out-of-hours. Requires CloudAppEvents
+//    (Defender for Cloud Apps).
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(14d)
+| where Application in~ ("Office 365", "Microsoft 365", "Microsoft Entra ID", "Azure Active Directory")
+| where ActionType has_any (
+    "Add device", "Update device",
+    "Add registered owner", "Add registered users",
+    "Register device", "Device registration"
+)
+| extend Raw = tostring(RawEventData)
+| project Timestamp, ActionType, AccountDisplayName, AccountObjectId,
+          IPAddress, CountryCode, City, ISP,
+          UserAgent, Application, Raw
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. SINGLE-FACTOR AUTH SUCCESS ON SENSITIVE RESOURCES
+//    Strong follow-on tell — a phantom-device PRT silently
+//    satisfies CA's "compliant device" requirement, so the
+//    sign-in shows AuthenticationRequirement =
+//    singleFactorAuthentication for resources that should
+//    have triggered MFA.
+// ------------------------------------------------------------
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationRequirement =~ "singleFactorAuthentication"
+| where ResourceDisplayName has_any (
+    "Microsoft Graph", "Azure Service Management",
+    "Exchange", "SharePoint", "Intune",
+    "Key Vault", "Defender", "Active Directory PowerShell"
+)
+| where DeviceTrustType in~ ("Unknown", "")
+   or IsCompliant != true
+| project Timestamp, AccountUpn, ResourceDisplayName, Application,
+          IPAddress, Country, UserAgent,
+          DeviceTrustType, IsManaged, IsCompliant,
+          AuthenticationRequirement, ConditionalAccessStatus
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. PRIVILEGED ROLE ACTIVATION SHORTLY AFTER DEVICE-CODE LOGIN
+//    PIM / role-activation events within 1 h of a Device Code
+//    success on the same user. Requires CloudAppEvents.
+// ------------------------------------------------------------
+let DC_Logins = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| project DCTime = Timestamp, AccountObjectId, AccountUpn,
+          DCIP = IPAddress;
+let RoleActivations = CloudAppEvents
+| where Timestamp > ago(7d)
+| where ActionType has_any (
+    "Add member to role",
+    "Activate role",
+    "Activate eligible role",
+    "Add eligible role assignment",
+    "Add active role assignment"
+)
+| project RoleTime = Timestamp,
+          AccountObjectId,
+          ActionType, ActorDisplay = AccountDisplayName,
+          RoleIP = IPAddress, RoleApp = Application,
+          RoleRaw = tostring(RawEventData);
+DC_Logins
+| join kind=inner RoleActivations on AccountObjectId
+| where RoleTime between (DCTime .. (DCTime + 1h))
+| project DCTime, RoleTime, AccountUpn,
+          DCIP, RoleIP, ActionType, RoleRaw
+| order by DCTime desc
+
+
+// ------------------------------------------------------------
+// 10. RISKY DEVICE CODE SIGN-IN
+//     Entra-flagged risky sign-in (medium / high) using the
+//     Device Code grant. Combine Identity Protection with
+//     this hunt for a high-priority alert.
+// ------------------------------------------------------------
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| where RiskLevelDuringSignIn in~ ("medium", "high")
+   or RiskState in~ ("atRisk", "confirmedCompromised")
+| project Timestamp, AccountUpn, ErrorCode,
+          IPAddress, Country, UserAgent,
+          Application, ResourceDisplayName,
+          RiskLevelDuringSignIn, RiskState, RiskDetail,
+          ConditionalAccessStatus
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. SAME ACCOUNT — IMPOSSIBLE TRAVEL ACROSS DEVICE CODE +
+//     INTERACTIVE FLOW
+//     Device Code success from one country and an interactive
+//     success from another country, same account, < 4 h apart.
+//     Heavy hint of a phantom-device hand-off to the actor.
+// ------------------------------------------------------------
+let DC_Successes = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| project DCTime = Timestamp, AccountObjectId, AccountUpn,
+          DCCountry = Country, DCIP = IPAddress;
+let Interactive_Successes = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where IsInteractive == true
+| project IntTime = Timestamp, AccountObjectId,
+          IntCountry = Country, IntIP = IPAddress,
+          IntApp = Application, IntResource = ResourceDisplayName;
+DC_Successes
+| join kind=inner Interactive_Successes on AccountObjectId
+| where IntTime between (DCTime - 4h .. DCTime + 4h)
+| where DCCountry != IntCountry
+| where isnotempty(DCCountry) and isnotempty(IntCountry)
+| project DCTime, IntTime, AccountUpn,
+          DCCountry, IntCountry, DCIP, IntIP,
+          IntApp, IntResource
+| order by DCTime desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     AADSTS53003 block → Device Code success → device-
+//     registration audit event → privileged-role activation
+//     for the same user, within a 4-hour window.
+// ------------------------------------------------------------
+let Stage1_Blocked = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 53003
+| project Stage1_Time = Timestamp, AccountObjectId, AccountUpn,
+          BlockIP = IPAddress;
+let Stage2_DC = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| project Stage2_Time = Timestamp, AccountObjectId,
+          DCApp = Application, DCResource = ResourceDisplayName,
+          DCIP = IPAddress, DCUA = UserAgent;
+let Stage3_Reg = CloudAppEvents
+| where Timestamp > ago(7d)
+| where ActionType has_any ("Add device", "Update device", "Register device")
+| project Stage3_Time = Timestamp, AccountObjectId,
+          RegAction = ActionType, RegIP = IPAddress;
+let Stage4_Role = CloudAppEvents
+| where Timestamp > ago(7d)
+| where ActionType has_any (
+    "Add member to role", "Activate role",
+    "Activate eligible role", "Add eligible role assignment",
+    "Add active role assignment"
+)
+| project Stage4_Time = Timestamp, AccountObjectId,
+          RoleAction = ActionType, RoleIP = IPAddress;
+Stage1_Blocked
+| join kind=inner Stage2_DC on AccountObjectId
+| where Stage2_Time between (Stage1_Time .. (Stage1_Time + 1h))
+| join kind=leftouter Stage3_Reg on AccountObjectId
+| where Stage3_Time between (Stage2_Time .. (Stage2_Time + 2h))
+| join kind=leftouter Stage4_Role on AccountObjectId
+| where Stage4_Time between (Stage2_Time .. (Stage2_Time + 4h))
+| project Stage1_Time, Stage2_Time, Stage3_Time, Stage4_Time,
+          AccountUpn,
+          BlockIP, DCIP, RegIP, RoleIP,
+          DCApp, DCResource, DCUA,
+          RegAction, RoleAction
+| order by Stage1_Time desc
