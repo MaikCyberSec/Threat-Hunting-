@@ -1,0 +1,372 @@
+// ============================================================
+// Microsoft 365 Copilot — Hunting Pack for Prompt Injection,
+// Posture, Plugin Abuse and Anomalous Usage
+// Source:   CyberSecurity News (May 7 2026) — three Critical
+//           CVEs in M365 Copilot Business Chat / M365 Copilot /
+//           Copilot Chat (Edge): CVE-2026-26129, CVE-2026-26164,
+//           CVE-2026-33111. All cloud-side, server-side fixed
+//           by Microsoft. The defender's job now is *posture*
+//           and *abuse detection*, not patching.
+// Platform: Microsoft Defender XDR + Defender for Cloud Apps
+//           + Entra ID (Advanced Hunting)
+// MITRE ATLAS / OWASP LLM Top 10:
+//   ATLAS:  AML.T0051 Prompt Injection,
+//           AML.T0048 Exfil via Inference,
+//           AML.T0040 Plugin Compromise
+//   OWASP:  LLM01 Prompt Injection,
+//           LLM02 Insecure Output Handling,
+//           LLM06 Sensitive Info Disclosure,
+//           LLM07 Insecure Plugin Design
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// On May 7 2026 Microsoft disclosed three Critical CVEs in the
+// M365 Copilot product family:
+//
+//   CVE-2026-26129  M365 Copilot Business Chat   (CWE-74 Injection)
+//   CVE-2026-26164  M365 Copilot                 (CWE-74 Injection)
+//   CVE-2026-33111  Copilot Chat (Edge)          (CWE-77 Cmd Inj)
+//
+// All three are network-accessible, require no privileges and
+// no user interaction. Microsoft fixed them server-side; no
+// tenant action is required to apply the patch.
+//
+// What enterprises DO need to act on:
+//   - Copilot has read access to mailboxes, SharePoint sites,
+//     OneDrive, Teams chats and meeting transcripts.
+//   - An indirect-prompt-injection chain — hostile content in
+//     an inbound email or shared document — can manipulate
+//     Copilot into surfacing, summarising or exfiltrating data
+//     across the entire tenant graph that the calling user can
+//     reach.
+//   - Copilot Studio agents and Power Platform connectors can
+//     widen the blast radius further if granted broad scopes.
+//
+// This pack therefore focuses on POSTURE and ANOMALY rather
+// than IOC matching:
+//
+//   1) Inventory / baseline of who is using Copilot.
+//   2) Volume anomalies — unusually heavy prompt or document
+//      access by a single principal.
+//   3) Indirect-prompt-injection content patterns in emails
+//      and files Copilot is likely to ingest.
+//   4) Plugin / connector / agent provisioning events.
+//   5) Cross-license posture (Copilot users missing MFA / CA).
+//
+// LICENSING NOTES
+// ---------------------------------------------------------------
+//   CloudAppEvents (Copilot interactions) — requires Defender
+//   for Cloud Apps with the Microsoft 365 Copilot connector
+//   enabled. If your tenant does not have it, queries 1–4 and
+//   8 will return empty.
+//   AADSignInEventsBeta / AADSpnSignInEventsBeta — require
+//   Entra ID P1/P2 sign-in log ingestion into Defender XDR.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/microsoft-365-copilot-vulnerabilities-data/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. COPILOT USAGE BASELINE — WHO, WHERE, HOW OFTEN
+//    Establish a 7-day baseline. Useful as a posture report
+//    and as the input to anomaly queries below.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(7d)
+| where Application has_any (
+    "Microsoft 365 Copilot",
+    "Microsoft Copilot for Microsoft 365",
+    "Copilot"
+)
+| summarize
+    Interactions = count(),
+    DistinctDays = dcount(bin(Timestamp, 1d)),
+    DistinctApps = dcount(ActionType),
+    FirstSeen    = min(Timestamp),
+    LastSeen     = max(Timestamp)
+    by AccountDisplayName, AccountObjectId, Application
+| order by Interactions desc
+
+
+// ------------------------------------------------------------
+// 2. HIGH-VOLUME COPILOT INTERACTIONS BY A SINGLE USER
+//    Sudden bursts (100+ interactions per hour, or > 5x the
+//    user's 7-day median) often indicate scripted abuse,
+//    plugin runaway, or post-compromise reconnaissance via
+//    Copilot prompts.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(7d)
+| where Application has "Microsoft 365 Copilot"
+   or Application has "Copilot for Microsoft 365"
+| summarize HourlyCount = count()
+    by AccountObjectId, AccountDisplayName,
+       Hour = bin(Timestamp, 1h)
+| where HourlyCount >= 100
+| order by HourlyCount desc
+
+
+// ------------------------------------------------------------
+// 3. PROMPT-INJECTION PHRASES IN COPILOT INTERACTION DATA
+//    When Copilot prompt content is captured in
+//    AdditionalFields / RawEventData, surface known indirect-
+//    prompt-injection trigger phrases and exfil markers.
+// ------------------------------------------------------------
+let InjectionMarkers = dynamic([
+    "ignore previous instructions",
+    "ignore prior instructions",
+    "ignore the above",
+    "disregard your instructions",
+    "you are now",
+    "system:",
+    "<|im_start|>", "<|im_end|>",
+    "</system>", "[INST]",
+    "execute the following",
+    "summarize and send",
+    "post this to",
+    "leak the",
+    "reveal the system prompt",
+    "developer mode"
+]);
+CloudAppEvents
+| where Timestamp > ago(14d)
+| where Application has "Copilot"
+| extend Raw = tostring(RawEventData)
+| where Raw has_any (InjectionMarkers)
+| project Timestamp, AccountDisplayName, AccountObjectId,
+          Application, ActionType,
+          IPAddress, CountryCode, ISP, Raw
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. MARKDOWN-IMAGE / HYPERLINK EXFIL PATTERN IN COPILOT IO
+//    Indirect prompt injections frequently exfil data by
+//    asking Copilot to render a markdown image whose URL
+//    encodes the stolen text. Surfaces "![..](https://..?..)"
+//    and "<a href=https://..?..>" patterns inside Copilot IO.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(14d)
+| where Application has "Copilot"
+| extend Raw = tostring(RawEventData)
+| where Raw matches regex @"!\[[^\]]*\]\(https?://[^)]+\?[^)]+\)"
+   or  Raw matches regex @"<a\s+href=[""']?https?://[^\s""'>]+\?[^\s""'>]+"
+| project Timestamp, AccountDisplayName, AccountObjectId,
+          Application, ActionType, IPAddress, Raw
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. INBOUND EMAIL CONTAINING PROMPT-INJECTION TRIGGERS
+//    Catches the *delivery* side of indirect prompt injection
+//    — hostile prompt phrases in a subject or attachment name
+//    that Copilot may later summarise. Body content is not
+//    directly hunt-able; tune attachment-name signal carefully.
+// ------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| where Subject has_any (
+    "ignore previous instructions",
+    "ignore prior instructions",
+    "system prompt",
+    "<|im_start|>",
+    "you are now",
+    "summarize and forward"
+)
+| project Timestamp, RecipientEmailAddress,
+          SenderFromAddress, SenderFromDomain,
+          Subject, AttachmentCount, UrlCount,
+          DeliveryAction, ConfidenceLevel,
+          NetworkMessageId
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. NEW OAUTH CONSENT FOR COPILOT-RELATED APPS / PLUGINS
+//    Tracks Application or service principal consents granted
+//    in the last 30 days where the app touches Copilot, Graph
+//    or M365 read scopes. Tunes the supply-chain blast radius.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where ActionType has_any (
+    "Consent to application", "Add app role assignment",
+    "Add OAuth2PermissionGrant", "Add delegated permission grant"
+)
+| extend Raw = tostring(RawEventData)
+| where Raw has_any (
+    "Copilot", "Graph", "Mail.Read", "Files.Read",
+    "Sites.Read", "Chat.Read", "ChannelMessage.Read",
+    "Calendars.Read", "User.Read.All"
+)
+| project Timestamp, ActionType, AccountDisplayName,
+          AccountObjectId, IPAddress, CountryCode, Raw
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. SERVICE PRINCIPAL SIGN-INS TO COPILOT / GRAPH FROM
+//    UNUSUAL LOCATIONS
+//    A non-Microsoft IP authenticating an SPN with broad
+//    Copilot / Graph scopes is the abuse path for a
+//    compromised plugin or stolen client secret.
+// ------------------------------------------------------------
+AADSpnSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where ResourceDisplayName has_any (
+    "Microsoft Graph",
+    "Microsoft 365 Copilot",
+    "Microsoft Copilot for Microsoft 365",
+    "Office 365 Exchange Online",
+    "Office 365 SharePoint Online"
+)
+| where IPAddress != ""
+   and Country !in ("Netherlands","Belgium","Germany","United States")  // tune to your geos
+| project Timestamp, ServicePrincipalName, ServicePrincipalId,
+          ResourceDisplayName, IPAddress, Country, City,
+          ConditionalAccessStatus
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. EXTERNAL / GUEST USER INTERACTING WITH COPILOT
+//    Guest users should rarely have Copilot. Surface any
+//    guest-account Copilot interaction immediately.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where Application has "Copilot"
+| extend Raw = tostring(RawEventData)
+| where Raw has_any ("Guest", "#EXT#", "external")
+   or AccountDisplayName has "#EXT#"
+| project Timestamp, AccountDisplayName, AccountObjectId,
+          Application, ActionType,
+          IPAddress, CountryCode, ISP, Raw
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. COPILOT INTERACTION IMMEDIATELY FOLLOWED BY A BULK
+//    DOWNLOAD / EXPORT EVENT
+//    A user prompting Copilot for "summarise everything about
+//    Project X" and then bulk-downloading from SharePoint or
+//    OneDrive within an hour is a classic exfil pattern.
+// ------------------------------------------------------------
+let CopilotUse = CloudAppEvents
+| where Timestamp > ago(7d)
+| where Application has "Copilot"
+| project CopilotTime = Timestamp,
+          AccountObjectId, AccountUpn = AccountDisplayName;
+let BulkExports = CloudAppEvents
+| where Timestamp > ago(7d)
+| where Application has_any ("SharePoint", "OneDrive")
+| where ActionType has_any (
+    "FileDownloaded", "FileSyncDownloadedFull",
+    "FileExported", "FileAccessed"
+)
+| summarize ExportCount = count(),
+            ExportFirst = min(Timestamp),
+            ExportLast  = max(Timestamp)
+    by AccountObjectId, bin_at(Timestamp, 1h, ago(7d))
+| where ExportCount >= 50;
+CopilotUse
+| join kind=inner BulkExports on AccountObjectId
+| where ExportFirst between (CopilotTime .. (CopilotTime + 1h))
+| project CopilotTime, ExportFirst, ExportLast,
+          AccountUpn, ExportCount
+| order by CopilotTime desc
+
+
+// ------------------------------------------------------------
+// 10. COPILOT-LICENSED USERS WITH WEAK AUTH POSTURE
+//     Cross-license posture: any user who has interacted with
+//     Copilot in the past 30 days but whose recent sign-ins
+//     show no MFA enforcement on a sensitive resource.
+// ------------------------------------------------------------
+let CopilotUsers = CloudAppEvents
+| where Timestamp > ago(30d)
+| where Application has "Copilot"
+| summarize CopilotUse = count() by AccountObjectId, AccountDisplayName
+| project AccountObjectId, AccountDisplayName, CopilotUse;
+let WeakSignIns = AADSignInEventsBeta
+| where Timestamp > ago(30d)
+| where ErrorCode == 0
+| where AuthenticationRequirement =~ "singleFactorAuthentication"
+| where ResourceDisplayName has_any (
+    "Microsoft Graph", "Exchange", "SharePoint", "Copilot"
+)
+| summarize SingleFactorSignIns = count() by AccountObjectId
+| where SingleFactorSignIns >= 1;
+CopilotUsers
+| join kind=inner WeakSignIns on AccountObjectId
+| project AccountDisplayName, CopilotUse, SingleFactorSignIns
+| order by SingleFactorSignIns desc, CopilotUse desc
+
+
+// ------------------------------------------------------------
+// 11. COPILOT STUDIO / POWER PLATFORM AGENT PROVISIONING
+//     Surfaces newly-published Copilot Studio agents, Power
+//     Platform connectors and custom plugins. Each is a
+//     potential prompt-injection / data-exfil vector.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where Application has_any ("Power Platform", "Power Apps", "Copilot Studio", "Microsoft Power Automate")
+| where ActionType has_any (
+    "CreateBot", "PublishBot", "UpdateBot",
+    "CreateConnector", "CreateConnection",
+    "CreateApp", "PublishApp",
+    "CreateFlow", "TurnOnFlow"
+)
+| project Timestamp, ActionType, Application,
+          AccountDisplayName, AccountObjectId,
+          IPAddress, CountryCode, RawEventData
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. POSTURE CORRELATION (RISK-RANKED)
+//     Combines: Copilot use, single-factor sign-ins to
+//     sensitive resources, recent OAuth consents and bulk
+//     exports — to produce a per-user risk score useful for
+//     CISO reporting.
+// ------------------------------------------------------------
+let CU = CloudAppEvents
+| where Timestamp > ago(30d)
+| where Application has "Copilot"
+| summarize CopilotUse = count() by AccountObjectId, AccountDisplayName;
+let WK = AADSignInEventsBeta
+| where Timestamp > ago(30d)
+| where ErrorCode == 0 and AuthenticationRequirement =~ "singleFactorAuthentication"
+| summarize WeakSignIns = count() by AccountObjectId;
+let CONS = CloudAppEvents
+| where Timestamp > ago(30d)
+| where ActionType has_any ("Consent to application", "Add OAuth2PermissionGrant")
+| summarize NewConsents = count() by AccountObjectId;
+let EXP = CloudAppEvents
+| where Timestamp > ago(30d)
+| where Application has_any ("SharePoint", "OneDrive")
+| where ActionType has_any ("FileDownloaded", "FileSyncDownloadedFull", "FileExported")
+| summarize Exports = count() by AccountObjectId;
+CU
+| join kind=leftouter WK on AccountObjectId
+| join kind=leftouter CONS on AccountObjectId
+| join kind=leftouter EXP on AccountObjectId
+| extend WeakSignIns = coalesce(WeakSignIns, 0),
+         NewConsents = coalesce(NewConsents, 0),
+         Exports     = coalesce(Exports, 0)
+| extend RiskScore =
+       iff(CopilotUse  >= 50,  1, 0)
+     + iff(WeakSignIns >= 1,   3, 0)
+     + iff(NewConsents >= 1,   2, 0)
+     + iff(Exports     >= 100, 3, 0)
+| where RiskScore >= 3
+| project AccountDisplayName, CopilotUse, WeakSignIns,
+          NewConsents, Exports, RiskScore
+| order by RiskScore desc, Exports desc

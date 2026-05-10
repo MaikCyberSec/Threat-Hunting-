@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **May 2026**
+- [Microsoft 365 Copilot Hunting - Prompt Injection Posture & Anomalous Usage](<Microsoft 365 Copilot Hunting - Prompt Injection Posture & Anomalous Usage (May 2026)>)
 - [MuddyWater Microsoft Teams Vishing - Stagecomp & Darkcomp Chaos False-Flag](<MuddyWater Microsoft Teams Vishing - Stagecomp & Darkcomp Chaos False-Flag (May 2026)>)
 - [Entra ID Conditional Access Bypass - Device Code & Phantom Device Registration](<Entra ID Conditional Access Bypass - Device Code & Phantom Device Registration (May 2026)>)
 - [Microsoft Edge Cleartext Password Vault Memory Exposure](<Microsoft Edge Cleartext Password Vault Memory Exposure (May 2026)>)
