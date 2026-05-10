@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **May 2026**
+- [TCLBanker - Brazilian Banker with WhatsApp & Outlook Worm Modules](<TCLBanker - Brazilian Banker with WhatsApp & Outlook Worm Modules (May 2026)>)
 - [Microsoft 365 Copilot Hunting - Prompt Injection Posture & Anomalous Usage](<Microsoft 365 Copilot Hunting - Prompt Injection Posture & Anomalous Usage (May 2026)>)
 - [MuddyWater Microsoft Teams Vishing - Stagecomp & Darkcomp Chaos False-Flag](<MuddyWater Microsoft Teams Vishing - Stagecomp & Darkcomp Chaos False-Flag (May 2026)>)
 - [Entra ID Conditional Access Bypass - Device Code & Phantom Device Registration](<Entra ID Conditional Access Bypass - Device Code & Phantom Device Registration (May 2026)>)

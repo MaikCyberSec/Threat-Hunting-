@@ -1,0 +1,435 @@
+// ============================================================
+// TCLBANKER (REF3076) — Brazilian Banking Trojan with
+// WhatsApp Web & Outlook COM Worm Modules
+// Source:   CyberSecurity News / Elastic Security Labs (May 9 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1574.002, T1140, T1497, T1113, T1056.004,
+//               T1566.002, T1566.003, T1559.001, T1021.003,
+//               T1005, T1547
+// Related:  Maverick, SORVEPOTEL (predecessor banking trojans)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Elastic Security Labs disclosed TCLBANKER (campaign tag REF3076),
+// a Brazilian banking trojan that combines a classic WPF-overlay
+// credential-theft tail with two purpose-built worm modules that
+// re-use trusted communication channels for self-propagation:
+//
+//   - A WhatsApp Web worm that does NOT request a fresh QR scan.
+//     It clones the existing browser session data (Chrome / Edge),
+//     spins up a hidden browser instance, bypasses bot detection
+//     and messages every contact a malicious file from a known-
+//     good identity.
+//   - An Outlook worm that uses Windows COM automation to drive
+//     OUTLOOK.EXE in the background, harvesting the address book
+//     and sending phishing mail from the victim's real mailbox.
+//
+// Initial access is a malspam ZIP that ships a fake — but
+// genuinely-signed — Logitech "Logi AI Prompt Builder" installer.
+// DLL side-loading drops the malicious "screen_retriever_plugin.dll"
+// next to the legitimate exe, which then performs the usual
+// sandbox / VM / locale / time-zone checks before activating
+// against 59 Brazilian banks, fintechs and crypto platforms.
+//
+// Although the campaign currently enforces a Brazilian locale,
+// every TTP is geography-agnostic and several primitives — DLL
+// side-loading via signed Logitech binary, WhatsApp Web session
+// theft, Outlook COM worm — are likely to be re-used elsewhere.
+//
+// KILL CHAIN
+// ---------------------------------------------------------------
+//   1) Malspam ZIP (e.g. XXL_21042026-181516.zip) →
+//      Logi AI Prompt Builder + screen_retriever_plugin.dll
+//   2) Sideload of malicious DLL into the signed Logitech binary
+//   3) Sandbox / VM / locale / TZ checks
+//   4) WPF full-screen overlay against 59 Brazilian banks +
+//      keyboard / screenshot suppression
+//   5) WhatsApp Web session-theft worm + Outlook COM worm
+//   6) C2 over Cloudflare Workers + custom domains
+//
+// IOC HASHES (SHA256)
+// ---------------------------------------------------------------
+//   screen_retriever_plugin.dll:
+//     701d51b7be8b034c860bf97847bd59a87dca8481c4625328813746964995b626
+//     8a174aa70a4396547045aef6c69eb0259bae1706880f4375af71085eeb537059
+//     668f932433a24bbae89d60b24eee4a24808fc741f62c5a3043bb7c9152342f40
+//   Initial ZIP:
+//     63beb7372098c03baab77e0dfc8e5dca5e0a7420f382708a4df79bed2d900394
+//
+// IOC NETWORK
+// ---------------------------------------------------------------
+//   campanha1-api.ef971a42[.]workers[.]dev
+//   documents.ef971a42[.]workers[.]dev
+//   mxtestacionamentos[.]com
+//   arquivos-omie[.]com
+//   documentos-online[.]com
+//   afonsoferragista[.]com
+//   doccompartilhe[.]com
+//   recebamais[.]com
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Genuine Logi AI Prompt Builder installs from official
+//     Logitech support paths.
+//   - Legitimate Outlook automation by line-of-business apps
+//     (CRM, ticketing). Tune by signer / install path.
+//   - Cloudflare Workers domains are heavily used legitimately
+//     — the IOC list is the safe filter, NOT *.workers.dev as a
+//     whole.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/tclbanker-malware-targets-users-whatsapp-outlook-worm-modules/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN SHA256 HASHES (FILE + PROCESS)
+//    Direct, highest-fidelity match on the 4 IOC hashes from
+//    Elastic Security Labs.
+// ------------------------------------------------------------
+let TCLBanker_SHA256 = dynamic([
+    "701d51b7be8b034c860bf97847bd59a87dca8481c4625328813746964995b626",
+    "8a174aa70a4396547045aef6c69eb0259bae1706880f4375af71085eeb537059",
+    "668f932433a24bbae89d60b24eee4a24808fc741f62c5a3043bb7c9152342f40",
+    "63beb7372098c03baab77e0dfc8e5dca5e0a7420f382708a4df79bed2d900394"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (TCLBanker_SHA256)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine = ""
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (TCLBanker_SHA256)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (TCLBanker_SHA256)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. KNOWN C2 / PHISHING DOMAINS & CLOUDFLARE WORKERS
+//    Direct domain / URL hit. Note: filter is on EXACT IOC
+//    domains — do NOT broaden to *.workers.dev (very noisy).
+// ------------------------------------------------------------
+let TCLBanker_Domains = dynamic([
+    "campanha1-api.ef971a42.workers.dev",
+    "documents.ef971a42.workers.dev",
+    "mxtestacionamentos.com",
+    "arquivos-omie.com",
+    "documentos-online.com",
+    "afonsoferragista.com",
+    "doccompartilhe.com",
+    "recebamais.com"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType == "ConnectionSuccess"
+   or ActionType == "DnsConnectionInspected"
+| where RemoteUrl has_any (TCLBanker_Domains)
+   or tostring(parse_url(RemoteUrl).Host) in (TCLBanker_Domains)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. SCREEN_RETRIEVER_PLUGIN.DLL — FILE / IMAGE-LOAD EVENTS
+//    Catches the malicious DLL by name even if the actor
+//    re-builds and the SHA256s rotate.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "screen_retriever_plugin.dll"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "screen_retriever_plugin.dll"
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. LOGI AI PROMPT BUILDER SIDELOAD FROM USER-WRITABLE PATH
+//    The legitimate Logitech binary loading screen_retriever
+//    or any DLL from a Downloads / Temp / AppData / Public
+//    location — a structural sideload tell.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any ("LogiAIPromptBuilder.exe", "Logi AI Prompt Builder.exe")
+   or InitiatingProcessFileName has "LogiAI"
+| where FolderPath !startswith @"C:\Program Files"
+   and FolderPath !startswith @"C:\Program Files (x86)"
+   and FolderPath !startswith @"C:\Windows"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. INITIAL-DROPPER ZIP NAMING PATTERN — XXL_*.zip
+//    Pattern: XXL_DDMMYYYY-HHMMSS.zip in user-writable path.
+//    Catches the documented archive plus close variants.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".zip"
+| where FileName matches regex @"^XXL_\d{6,8}[-_]\d{4,6}\.zip$"
+   or FileName has "XXL_21042026"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @"\Content.Outlook\"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. WHATSAPP WEB SESSION-CLONE TELL — NON-BROWSER READING
+//    THE WHATSAPP WEB LOCAL STORAGE
+//    The worm clones the existing WhatsApp Web auth state
+//    rather than scanning a QR. Surface non-browser processes
+//    touching the WhatsApp IndexedDB / Local Storage in the
+//    Chrome / Edge user-data tree.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where (FolderPath has @"\Google\Chrome\User Data" or FolderPath has @"\Microsoft\Edge\User Data")
+| where FolderPath has_any (
+    @"\IndexedDB\https_web.whatsapp.com",
+    @"\Local Storage\leveldb",
+    @"\Session Storage"
+)
+   or FileName has "whatsapp"
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "msedgewebview2.exe", "OneDrive.exe",
+    "explorer.exe", "SearchIndexer.exe",
+    "MsMpEng.exe", "MpDefenderCoreService.exe",
+    "MicrosoftEdgeUpdate.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. HIDDEN / CLONED-PROFILE BROWSER LAUNCH
+//    chrome.exe / msedge.exe spawned with --user-data-dir
+//    pointing at a non-default path, --headless, or
+//    --disable-gpu / --remote-debugging-port. Hallmark of
+//    a WhatsApp Web worm hidden browser instance.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("chrome.exe", "msedge.exe", "brave.exe")
+| where ProcessCommandLine has_any (
+    "--headless", "--disable-gpu",
+    "--remote-debugging-port", "--remote-debugging-pipe",
+    "--user-data-dir="
+)
+| where InitiatingProcessFileName !in~ (
+    "explorer.exe", "msedge.exe", "chrome.exe",
+    "Code.exe", "OUTLOOK.EXE", "Teams.exe", "ms-teams.exe",
+    "MicrosoftEdgeUpdate.exe", "GoogleUpdate.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. OUTLOOK COM AUTOMATION FROM A NON-SHELL PARENT
+//    OUTLOOK.EXE launched by an unusual parent — DllHost,
+//    rundll32, scripts, .NET hosts or a sideloaded Logitech
+//    binary — points at COM-based automation of the mailbox.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("OUTLOOK.EXE", "outlook.exe", "olk.exe")
+| where InitiatingProcessFileName in~ (
+    "DllHost.exe", "rundll32.exe",
+    "powershell.exe", "pwsh.exe",
+    "wscript.exe", "cscript.exe",
+    "mshta.exe", "regsvr32.exe",
+    "LogiAIPromptBuilder.exe"
+)
+   or InitiatingProcessFolderPath has_any (
+       @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+       @":\Users\Public\", @"\OneDrive\"
+   )
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. WPF OVERLAY LOADED INSIDE A SIDELOADED PROCESS
+//    PresentationFramework.dll / PresentationCore.dll loaded
+//    by a process whose parent or own folder is user-writable
+//    — overlay-attack precursor, especially when paired with
+//    a Logitech-named binary.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("PresentationFramework.dll", "PresentationCore.dll", "WindowsBase.dll")
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\"
+)
+| where InitiatingProcessFileName !in~ (
+    "powershell.exe", "pwsh.exe",
+    "msbuild.exe", "devenv.exe", "Code.exe",
+    "WerFault.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. CLOUDFLARE WORKERS C2 BY A NON-BROWSER PROCESS
+//     Browsers legitimately hit *.workers.dev. The TCLBANKER
+//     C2 is fronted on Workers — surface only when a non-
+//     browser binary makes the call.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has ".workers.dev"
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "Teams.exe", "ms-teams.exe",
+    "OUTLOOK.EXE", "OneDrive.exe",
+    "MicrosoftEdgeUpdate.exe", "GoogleUpdate.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. BURST OF OUTBOUND OUTLOOK MAIL — POSSIBLE WORM SPRAY
+//     A user mailbox that suddenly sends outbound mail to a
+//     much higher number of unique recipients than usual is a
+//     plausible TCLBANKER Outlook-worm tell. Threshold tuned
+//     conservatively — pair with #8 for high fidelity.
+// ------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Outbound"
+| summarize
+    OutCount      = count(),
+    DistinctRcpt  = dcount(RecipientEmailAddress),
+    DistinctDomns = dcount(tostring(split(RecipientEmailAddress, "@")[1])),
+    SampleRcpt    = make_set(RecipientEmailAddress, 10)
+    by SenderFromAddress, OutWindow = bin(Timestamp, 1h)
+| where OutCount >= 50 and DistinctRcpt >= 25
+| order by OutCount desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     ZIP arrives → sideloaded Logitech binary loads
+//     screen_retriever DLL → C2 to known IOC domain, all on
+//     the same device within 4 hours. Use for triage of any
+//     suspected TCLBANKER incident.
+// ------------------------------------------------------------
+let Stage1_Zip = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where (FileName endswith ".zip" and FileName matches regex @"^XXL_\d{6,8}[-_]\d{4,6}\.zip$")
+   or SHA256 == "63beb7372098c03baab77e0dfc8e5dca5e0a7420f382708a4df79bed2d900394"
+| project DeviceName, ZipTime = Timestamp,
+          ZipName = FileName, ZipPath = FolderPath;
+let Stage2_DllLoad = DeviceImageLoadEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "screen_retriever_plugin.dll"
+   or SHA256 in (
+        "701d51b7be8b034c860bf97847bd59a87dca8481c4625328813746964995b626",
+        "8a174aa70a4396547045aef6c69eb0259bae1706880f4375af71085eeb537059",
+        "668f932433a24bbae89d60b24eee4a24808fc741f62c5a3043bb7c9152342f40"
+    )
+| project DeviceName, DllTime = Timestamp,
+          DllPath = FolderPath, DllParent = InitiatingProcessFileName;
+let Stage3_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "campanha1-api.ef971a42.workers.dev",
+    "documents.ef971a42.workers.dev",
+    "mxtestacionamentos.com",
+    "arquivos-omie.com",
+    "documentos-online.com",
+    "afonsoferragista.com",
+    "doccompartilhe.com",
+    "recebamais.com"
+)
+| project DeviceName, C2Time = Timestamp,
+          C2Process = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_Zip
+| join kind=inner Stage2_DllLoad on DeviceName
+| where DllTime between (ZipTime .. (ZipTime + 4h))
+| join kind=leftouter Stage3_C2 on DeviceName
+| where C2Time between (DllTime .. (DllTime + 4h))
+| project ZipTime, DllTime, C2Time,
+          DeviceName,
+          ZipName, ZipPath,
+          DllPath, DllParent,
+          C2Process, C2_IP, C2_Url
+| order by ZipTime desc
