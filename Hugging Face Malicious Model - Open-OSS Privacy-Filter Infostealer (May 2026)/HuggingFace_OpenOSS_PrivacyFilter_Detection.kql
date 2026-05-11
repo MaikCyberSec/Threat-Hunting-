@@ -1,0 +1,450 @@
+// ============================================================
+// Hugging Face Malicious Model — "Open-OSS/privacy-filter"
+// Multi-Stage Loader → Rust Infostealer
+// Source:   CyberSecurity News / Hidden Layer (May 11 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1566.002, T1195.002, T1059.001, T1059.003,
+//               T1027, T1140, T1562.001, T1053.005,
+//               T1555.003, T1552.001, T1539, T1041
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Hidden Layer disclosed a malicious Hugging Face repository,
+// "Open-OSS/privacy-filter", that briefly trended at #1 with
+// ~200,000 downloads before takedown. Its model card was copied
+// nearly verbatim from OpenAI's legitimate Privacy Filter project
+// — convincing false legitimacy — and instructed users to clone
+// the repo and run start.bat (Windows) or loader.py (Linux/macOS).
+//
+// KILL CHAIN
+// ---------------------------------------------------------------
+//   1) Hugging Face clone → start.bat / loader.py executed
+//      from the cloned folder.
+//   2) loader.py runs decoy code, then disables SSL verification
+//      and pulls a JSON document from jsonkeeper[.]com whose
+//      "cmd" field is passed to PowerShell with
+//      -ExecutionPolicy Bypass.
+//   3) PowerShell downloads "update.bat" from
+//      api.eth-fastscan[.]org into %TEMP%.
+//   4) update.bat adds Microsoft Defender exclusions for the
+//      payload directories.
+//   5) A scheduled task "MicrosoftEdgeUpdateTaskCore" is created
+//      as a one-shot launcher (it self-deletes after running).
+//   6) Final payload: 10 MB Rust-based infostealer — steals
+//      browser cookies / passwords, SSH keys, VPN configs,
+//      FTP creds, crypto wallet files; takes screenshots;
+//      sandbox-aware (VirtualBox / VMware / Hyper-V / Parallels)
+//      and exfils with Bearer-token POST to recargapopular[.]com.
+//
+// SIBLING REPOSITORIES (same uploader, Apr 24 2025)
+// ---------------------------------------------------------------
+//   anthubBonsai/BonsaiLLM
+//   anthubWen/5BA/BAREPE
+//   anthubWen/ClaudeOpusReasoningDistilled (and variants)
+//
+// IOC NETWORK
+// ---------------------------------------------------------------
+//   recargapopular[.]com       (data exfil)
+//   api.eth-fastscan[.]org     (update.bat host)
+//   jsonkeeper[.]com           (payload-rotation paste service)
+//   welovechinatown[.]info     (secondary C2)
+//
+// IOC FILESYSTEM
+// ---------------------------------------------------------------
+//   %TEMP%\update.bat
+//   %TEMP%\runner.ps1
+//   %TEMP%\runner1
+//   ~/.cache/huggingface/hub/   (Linux/macOS)
+//   %USERPROFILE%\.cache\huggingface\hub\   (Windows)
+//   Scheduled task: MicrosoftEdgeUpdateTaskCore
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate HuggingFace model downloads to the cache
+//     directory — file events alone are not enough. Pair with
+//     batch/PowerShell execution from the same path.
+//   - Real Microsoft Edge updates — pin to the legitimate task
+//     name "MicrosoftEdgeUpdateTaskMachineCore" vs the impostor
+//     "MicrosoftEdgeUpdateTaskCore" used here.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/trending-hugging-face-repository-with-200k-downloads/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. DOCUMENTED C2 / PAYLOAD-HOST DOMAINS
+//    Direct, highest-fidelity hit. Connection to any of the
+//    four documented hosts is essentially diagnostic.
+// ------------------------------------------------------------
+let HF_Domains = dynamic([
+    "recargapopular.com",
+    "api.eth-fastscan.org",
+    "jsonkeeper.com",
+    "welovechinatown.info"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteUrl has_any (HF_Domains)
+   or tostring(parse_url(RemoteUrl).Host) in (HF_Domains)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. start.bat / loader.py EXECUTED FROM A HUGGING FACE
+//    CLONE OR CACHE PATH
+//    The first-stage trigger. Combines filename and origin
+//    folder for high precision.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("start.bat", "loader.py")
+   or ProcessCommandLine has_any ("start.bat", "loader.py")
+| where FolderPath has_any (
+    @"\.cache\huggingface\",
+    @"\huggingface\hub\",
+    @"\privacy-filter\",
+    @"\Open-OSS\",
+    @"\anthubBonsai\",
+    @"\anthubWen\"
+)
+   or InitiatingProcessCommandLine has_any (
+        "privacy-filter", "Open-OSS",
+        "anthubBonsai", "anthubWen",
+        @"\.cache\huggingface\"
+   )
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. POWERSHELL EXECUTION-POLICY BYPASS WITH BASE64 / IEX
+//    INVOKED BY PYTHON
+//    Loader.py shells out to PowerShell with a base64 payload
+//    and policy bypass. Catches the cross-language stage-2
+//    pivot specifically.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("-ExecutionPolicy Bypass", "-ep Bypass", "-ExecutionP")
+| where ProcessCommandLine has_any (
+    "-EncodedCommand", "-enc ",
+    "FromBase64String", "[Convert]::FromBase64",
+    "Invoke-Expression", "IEX",
+    "DownloadString", "Net.WebClient",
+    "Invoke-WebRequest", "iwr "
+)
+| where InitiatingProcessFileName in~ (
+    "python.exe", "pythonw.exe", "py.exe",
+    "cmd.exe", "wscript.exe", "cscript.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. STAGED PAYLOAD FILES DROPPED IN %TEMP%
+//    The campaign's specific staging filenames in the user
+//    temp directory.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("update.bat", "runner.ps1", "runner1", "runner1.exe")
+| where FolderPath has_any (
+    @"\AppData\Local\Temp", @"\Windows\Temp", @"\Temp\"
+)
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. IMPOSTOR SCHEDULED TASK — "MicrosoftEdgeUpdateTaskCore"
+//    Genuine Edge tasks are named "MicrosoftEdgeUpdateTask
+//    MachineCore" / "...UserCore". The campaign uses
+//    "MicrosoftEdgeUpdateTaskCore" — close enough to hide.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName in~ ("schtasks.exe", "powershell.exe", "pwsh.exe")
+    | where ProcessCommandLine has "MicrosoftEdgeUpdateTaskCore"
+    | where not (ProcessCommandLine has_any (
+        "MicrosoftEdgeUpdateTaskMachineCore",
+        "MicrosoftEdgeUpdateTaskUserCore"
+    ))
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FolderPath has @"\Tasks\"
+    | where FileName has "MicrosoftEdgeUpdateTaskCore"
+       and not (FileName has_any (
+            "MicrosoftEdgeUpdateTaskMachineCore",
+            "MicrosoftEdgeUpdateTaskUserCore"
+        ))
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind, AccountName = "",
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. MICROSOFT DEFENDER EXCLUSION ADDED BY BATCH / POWERSHELL
+//    update.bat adds payload-directory exclusions before the
+//    final stage runs. Catches Add-MpPreference and the
+//    cmdline / registry equivalents.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where (FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+             or InitiatingProcessFileName in~ ("cmd.exe", "powershell.exe"))
+    | where ProcessCommandLine has_any (
+        "Add-MpPreference", "Set-MpPreference",
+        "ExclusionPath", "ExclusionProcess", "ExclusionExtension"
+    )
+    | extend Source = "ProcessCmd"
+    | project Timestamp, DeviceName, Source, AccountName,
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceRegistryEvents
+    | where Timestamp > ago(14d)
+    | where RegistryKey has @"SOFTWARE\Microsoft\Windows Defender\Exclusions"
+    | where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+    | extend Source = "Registry"
+    | project Timestamp, DeviceName, Source,
+              AccountName = InitiatingProcessAccountName,
+              FileName = "", ProcessCommandLine = RegistryValueData,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. PYTHON / GIT TOUCHING THE HUGGING FACE HUB CACHE
+//    Surfaces the *first* time a workstation interacts with
+//    HF cache. Use as posture inventory of who in your org
+//    is consuming HF models.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has_any (
+        @"\.cache\huggingface\", "huggingface_hub",
+        "from_pretrained", "snapshot_download",
+        "git clone", "huggingface.co"
+    )
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FolderPath has @"\.cache\huggingface\hub"
+    | where FileName has_any (".bat", ".ps1", ".exe", ".cmd", ".vbs", ".js")
+    | extend EventKind = "FileEventInCache"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = "", FileName, FolderPath,
+              ProcessCommandLine = "",
+              InitiatingProcessFileName
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. JSONKEEPER / PASTE-SERVICE ABUSE BY NON-BROWSER PROCESS
+//    Loader.py pulls its command from jsonkeeper[.]com.
+//    Surface non-browser processes hitting paste services.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "jsonkeeper.com", "pastebin.com",
+    "paste.ee", "rentry.co", "hastebin.com", "gist.githubusercontent.com"
+)
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "Code.exe", "Teams.exe", "ms-teams.exe",
+    "OUTLOOK.EXE", "git.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. CREDENTIAL / WALLET / SSH STORE READ BY NON-BROWSER
+//    Final-stage infostealer behaviour. Catches the Rust
+//    payload touching browser credential stores, SSH key
+//    folder and crypto-wallet files.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (
+    "Login Data", "Cookies", "Local State", "Web Data",
+    "key3.db", "key4.db", "logins.json", "cookies.sqlite",
+    "wallet.dat", "keystore"
+)
+   or FolderPath has_any (
+        @"\.ssh\", @"\Ethereum\keystore",
+        @"\Exodus\exodus.wallet", @"\Electrum\wallets",
+        @"\AppData\Roaming\Atomic\", @"\AppData\Roaming\Bitcoin"
+   )
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "OneDrive.exe", "explorer.exe",
+    "SearchIndexer.exe", "MsMpEng.exe", "MpDefenderCoreService.exe",
+    "MicrosoftEdgeUpdate.exe", "Bitwarden.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. BEARER-TOKEN POST EXFIL TO NON-MICROSOFT DESTINATION
+//     The Rust infostealer compresses stolen data and POSTs
+//     it with a Bearer token. Surface processes whose
+//     command line carries an Authorization header.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessCommandLine has_any (
+    "Authorization: Bearer", "Bearer ey",
+    "Headers.Add(\"Authorization\"", "h.Authorization"
+)
+| where FileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "OUTLOOK.EXE", "Teams.exe", "ms-teams.exe",
+    "OneDrive.exe", "Code.exe", "git.exe", "gh.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. CAMPAIGN REPO NAMES IN ANY COMMAND LINE
+//     Surfaces references to the named campaign repos, even
+//     when the user re-clones to a non-default location.
+// ------------------------------------------------------------
+let RepoNames = dynamic([
+    "Open-OSS/privacy-filter",
+    "Open-OSS",
+    "anthubBonsai/BonsaiLLM",
+    "anthubBonsai",
+    "anthubWen/BAREPE",
+    "anthubWen/ClaudeOpusReasoningDistilled",
+    "anthubWen"
+]);
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has_any (RepoNames)
+       or InitiatingProcessCommandLine has_any (RepoNames)
+    | project Timestamp, DeviceName, AccountName,
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FolderPath has_any (
+        "Open-OSS", "privacy-filter",
+        "anthubBonsai", "anthubWen"
+    )
+    | project Timestamp, DeviceName,
+              AccountName = "",
+              FileName, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     loader.py / start.bat from HF path → PowerShell with
+//     ExecutionPolicy Bypass → update.bat dropped in %TEMP%
+//     → outbound C2 to documented domains. Use for high-
+//     confidence triage of this campaign and re-skinned
+//     variants.
+// ------------------------------------------------------------
+let Stage1_Loader = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where (FileName in~ ("start.bat", "loader.py", "python.exe", "pythonw.exe")
+         and ProcessCommandLine has_any ("loader.py", "start.bat"))
+   or FolderPath has @"\.cache\huggingface\"
+   or FolderPath has @"\privacy-filter\"
+| project DeviceName, LoaderTime = Timestamp,
+          LoaderFile = FileName, LoaderCmd = ProcessCommandLine;
+let Stage2_PowerShell = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("-ExecutionPolicy Bypass", "-ep Bypass")
+| where InitiatingProcessFileName in~ ("python.exe", "pythonw.exe", "py.exe", "cmd.exe")
+| project DeviceName, PsTime = Timestamp,
+          PsCmd = ProcessCommandLine;
+let Stage3_UpdateBat = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "update.bat"
+| where FolderPath has_any (@"\Temp\", @"\AppData\Local\Temp")
+| project DeviceName, BatTime = Timestamp,
+          BatFile = FileName, BatPath = FolderPath;
+let Stage4_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "recargapopular.com", "api.eth-fastscan.org",
+    "jsonkeeper.com", "welovechinatown.info"
+)
+| project DeviceName, C2Time = Timestamp,
+          C2Process = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_Loader
+| join kind=inner Stage2_PowerShell on DeviceName
+| where PsTime between (LoaderTime .. (LoaderTime + 10m))
+| join kind=leftouter Stage3_UpdateBat on DeviceName
+| where BatTime between (PsTime .. (PsTime + 10m))
+| join kind=leftouter Stage4_C2 on DeviceName
+| where C2Time between (PsTime .. (PsTime + 1h))
+| project LoaderTime, PsTime, BatTime, C2Time,
+          DeviceName,
+          LoaderFile, LoaderCmd,
+          PsCmd,
+          BatFile, BatPath,
+          C2Process, C2_IP, C2_Url
+| order by LoaderTime desc
