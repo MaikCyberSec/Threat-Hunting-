@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **May 2026**
+- [Operational AI Abuse - Shadow LLM APIs & AI-Generated Exploit Tooling](<Operational AI Abuse - Shadow LLM APIs & AI-Generated Exploit Tooling (May 2026)>)
 - [Hugging Face Malicious Model - Open-OSS Privacy-Filter Infostealer](<Hugging Face Malicious Model - Open-OSS Privacy-Filter Infostealer (May 2026)>)
 - [TCLBanker - Brazilian Banker with WhatsApp & Outlook Worm Modules](<TCLBanker - Brazilian Banker with WhatsApp & Outlook Worm Modules (May 2026)>)
 - [Microsoft 365 Copilot Hunting - Prompt Injection Posture & Anomalous Usage](<Microsoft 365 Copilot Hunting - Prompt Injection Posture & Anomalous Usage (May 2026)>)
