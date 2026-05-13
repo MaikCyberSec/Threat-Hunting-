@@ -1,0 +1,416 @@
+// ============================================================
+// Zoom Rooms & Workplace VDI Installer Vulnerabilities —
+// Untrusted Search Path + External File-Name/Path Control
+// Source:   CyberSecurity News / Zoom Security Bulletin (May 12 2026)
+//           CVE-2026-30906  (Zoom Rooms Win installer — CWE-426)
+//           CVE-2026-30905  (Zoom Workplace VDI Plugin Win
+//                            Universal Installer — CWE-73)
+//           CVE-2026-30904  (Zoom Workplace iOS, info-disc, low)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1574.001 (DLL Search Order Hijack),
+//               T1574.002 (DLL Side-Loading),
+//               T1134 (Access Token Manipulation / Privilege Esc),
+//               T1218.007 (Msiexec), T1562.001 (Impair Defenses)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Zoom disclosed two High-severity installer flaws on Windows:
+//
+//   - CVE-2026-30906 (Zoom Rooms for Windows installer) is an
+//     untrusted-search-path bug — the installer loads at least
+//     one DLL from a directory under attacker control before
+//     the trusted system search paths. Any low-priv user able
+//     to plant a DLL in the right location can elevate to
+//     installer-context privilege (typically SYSTEM during a
+//     repair / uninstall).
+//
+//   - CVE-2026-30905 (Zoom Workplace VDI Plugin Universal
+//     Installer) is an external-control-of-file-name/path bug
+//     — the installer accepts a path / filename influenced by
+//     the calling user and acts on it during privileged
+//     install / uninstall steps, again yielding privilege
+//     escalation.
+//
+//   - CVE-2026-30904 is a Low-severity iOS protection-mechanism
+//     failure and is out of scope for Windows endpoint hunting.
+//
+// Both Windows bugs require LOCAL + AUTHENTICATED access. No
+// in-the-wild exploitation reported at disclosure, but installer
+// search-path bugs are routinely chained into post-exploit
+// privilege escalation by commodity malware once the technique
+// is public. This pack therefore hunts the *technique class*
+// (Zoom installer running from a user-writable path, loading
+// DLLs from a user-writable path, or producing a privilege
+// uplift) rather than specific IOCs — none were published.
+//
+// AFFECTED ZOOM BINARIES (typical names)
+// ---------------------------------------------------------------
+//   ZoomRoomsInstaller.exe         (Zoom Rooms full installer)
+//   ZoomRoomsInstallerFull.exe
+//   Zoom*VDIPlugin*.exe            (VDI Plugin universal installer)
+//   ZoomInstallerFull.exe          (Zoom Workplace)
+//   ZoomInstaller.exe
+//   Zoom.exe / Zoom_launcher.exe   (post-install runtime)
+//   ZoomAutoUpdater.exe            (background updater)
+//   zCrashReport.exe               (crash handler)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Genuine user-initiated installs of Zoom from Downloads.
+//     Pair the installer-from-user-path hit with the DLL-from-
+//     user-path hit (query #2) for high confidence.
+//   - Enterprise MSI deployments running from network shares or
+//     ConfigMgr cache. Pin trusted package paths in your tune.
+//   - Built-in ZoomAutoUpdater elevation prompts are legitimate
+//     but should still come from %PROGRAMFILES%\Zoom\.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/zoom-rooms-and-workplace-vulnerabilities/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. ZOOM / VDI PLUGIN INSTALLER LAUNCHED FROM A USER-WRITABLE
+//    PATH
+//    Necessary precondition for both bugs. Surfaces every
+//    Zoom installer execution that did NOT originate from a
+//    trusted Program Files / system-package location.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any (
+    "ZoomRoomsInstaller", "ZoomInstaller",
+    "ZoomVDI", "Zoom_VDI",
+    "ZoomWorkplace", "ZoomAutoUpdater"
+)
+   or ProcessVersionInfoOriginalFileName has_any (
+        "ZoomRoomsInstaller", "ZoomInstaller", "ZoomVDI"
+   )
+| where FolderPath !startswith @"C:\Program Files"
+   and FolderPath !startswith @"C:\Program Files (x86)"
+   and FolderPath !startswith @"C:\Windows\Installer"
+   and FolderPath !startswith @"C:\Windows\ccmcache"
+   and FolderPath !startswith @"C:\Windows\SoftwareDistribution"
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel, SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DLL LOADED FROM A USER-WRITABLE PATH BY A ZOOM INSTALLER
+//    The structural CVE-2026-30906 signal. A Zoom installer
+//    process loading a DLL from outside Program Files / System32
+//    is essentially diagnostic of search-path hijack.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any (
+    "ZoomRoomsInstaller", "ZoomInstaller",
+    "ZoomVDI", "Zoom_VDI",
+    "ZoomWorkplace", "ZoomAutoUpdater"
+)
+   or InitiatingProcessVersionInfoOriginalFileName has_any (
+        "ZoomRoomsInstaller", "ZoomInstaller", "ZoomVDI"
+   )
+| where FolderPath !startswith @"C:\Program Files"
+   and FolderPath !startswith @"C:\Program Files (x86)"
+   and FolderPath !startswith @"C:\Windows"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\", @"\ProgramData\"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. ZOOM INSTALLER PRODUCING AN INTEGRITY UPLIFT
+//    The exploitable outcome — a Zoom installer running at
+//    Medium / High integrity spawns a child running at System
+//    (or High from Medium). Catches the privilege escalation
+//    moment of either CVE.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName has_any (
+    "ZoomRoomsInstaller", "ZoomInstaller",
+    "ZoomVDI", "Zoom_VDI",
+    "ZoomWorkplace", "ZoomAutoUpdater"
+)
+| where (InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+         and ProcessIntegrityLevel in~ ("System", "High"))
+   or AccountName =~ "system"
+| where FileName !in~ (
+    "msiexec.exe", "WerFault.exe", "WerFaultSecure.exe",
+    "conhost.exe", "splwow64.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessIntegrityLevel,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. "PLANTED DLL" — DLL/EXE FILES CO-LOCATED WITH A ZOOM
+//    INSTALLER IN DOWNLOADS / TEMP / DESKTOP
+//    Surfaces user-writable folders that contain BOTH a Zoom
+//    installer AND one or more loose DLLs / EXEs — the classic
+//    staging pattern for a search-path hijack.
+// ------------------------------------------------------------
+let ZoomInstallerLocations = DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName has_any (
+    "ZoomRoomsInstaller", "ZoomInstaller",
+    "ZoomVDI", "ZoomWorkplace"
+)
+| where FileName endswith ".exe" or FileName endswith ".msi"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\"
+)
+| project DeviceName, ZoomTime = Timestamp,
+          ZoomFile = FileName, ZoomFolder = FolderPath;
+let LooseDlls = DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName endswith ".dll" or FileName endswith ".exe"
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\"
+)
+| project DeviceName, DllTime = Timestamp,
+          DllFile = FileName, DllFolder = FolderPath,
+          DllSha = SHA256, DllInitiator = InitiatingProcessFileName;
+ZoomInstallerLocations
+| join kind=inner LooseDlls on $left.DeviceName == $right.DeviceName,
+                               $left.ZoomFolder == $right.DllFolder
+| where DllTime between (ZoomTime - 1d .. ZoomTime + 1d)
+| where DllFile !has "Zoom"
+| project ZoomTime, DllTime, DeviceName,
+          ZoomFile, ZoomFolder,
+          DllFile, DllSha, DllInitiator
+| order by ZoomTime desc
+
+
+// ------------------------------------------------------------
+// 5. ZOOM VDI PLUGIN INSTALLER COMMAND LINE WITH USER-CONTROL
+//    OF FILE / PATH (CVE-2026-30905)
+//    Surfaces command-line arguments to the VDI plugin
+//    installer that reference user-writable paths or path-
+//    traversal sequences — the structural shape of the
+//    external-path-control bug.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any ("ZoomVDI", "Zoom_VDI", "ZoomWorkplace")
+   or ProcessCommandLine has_any ("ZoomVDI", "Zoom_VDI", "ZoomWorkplace")
+| where ProcessCommandLine has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\", "..\\", "%TEMP%", "%APPDATA%"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. MSIEXEC RUNNING A ZOOM .MSI FROM A USER-WRITABLE PATH
+//    Captures the LOLBin angle — msiexec /i pointed at a Zoom
+//    package sitting in a user-writable directory.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "msiexec.exe"
+| where ProcessCommandLine has_any ("Zoom", "ZoomRooms", "ZoomVDI", "ZoomWorkplace")
+| where ProcessCommandLine has ".msi"
+| where ProcessCommandLine has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. ZOOM PRODUCT INVENTORY (TVM-DRIVEN POSTURE)
+//    Pulls every device in the fleet running a Zoom product,
+//    so you know your CVE-2026-30906 / 30905 exposure surface
+//    at a glance.
+// ------------------------------------------------------------
+DeviceTvmSoftwareInventory
+| where SoftwareVendor =~ "zoom"
+   or SoftwareName has "Zoom"
+| project DeviceId, DeviceName, OSPlatform, OSVersion,
+          SoftwareVendor, SoftwareName, SoftwareVersion,
+          EndOfSupportStatus
+| order by DeviceName asc
+
+
+// ------------------------------------------------------------
+// 8. ZOOM KNOWN-VULNERABLE CVE LIGHT-UP (TVM)
+//    Direct lookup against the TVM CVE feed for the three new
+//    CVEs. Will populate as Microsoft ingests the advisory.
+// ------------------------------------------------------------
+let ZoomCVEs = dynamic([
+    "CVE-2026-30906", "CVE-2026-30905", "CVE-2026-30904"
+]);
+DeviceTvmSoftwareVulnerabilities
+| where (SoftwareVendor =~ "zoom" or SoftwareName has "Zoom")
+   or CveId in (ZoomCVEs)
+| project DeviceId, DeviceName, OSPlatform,
+          SoftwareVendor, SoftwareName, SoftwareVersion,
+          CveId, VulnerabilitySeverityLevel, CvssScore,
+          IsExploitAvailable, RecommendedSecurityUpdate
+| order by CvssScore desc, DeviceName asc
+
+
+// ------------------------------------------------------------
+// 9. SUSPICIOUS DLL NAMES COLOCATED WITH ZOOM INSTALLER
+//    "Lookalike" or commonly-loaded Windows / Zoom DLLs found
+//    in the same user-writable folder as a Zoom installer —
+//    classic search-path-hijack staging filenames.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".dll"
+| where FileName has_any (
+    "version.dll", "winsta.dll", "uxtheme.dll",
+    "dwmapi.dll", "cryptbase.dll", "wtsapi32.dll",
+    "secur32.dll", "netapi32.dll",
+    "zCommon.dll", "Setup.dll"
+)
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\"
+)
+| join kind=inner (
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FileName has_any (
+        "ZoomRoomsInstaller", "ZoomInstaller",
+        "ZoomVDI", "ZoomWorkplace"
+    )
+    | project DeviceName, ZoomTime = Timestamp,
+              ZoomFile = FileName, ZoomFolder = FolderPath
+) on $left.DeviceName == $right.DeviceName,
+     $left.FolderPath == $right.ZoomFolder
+| project Timestamp, DeviceName,
+          SuspiciousDll = FileName, FolderPath, SHA256,
+          ZoomFile, InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. SUSPICIOUS CHILD OF A ZOOM RUNTIME OR CRASH-HANDLER
+//     Zoom.exe / Zoom_launcher.exe / zCrashReport.exe should
+//     not be spawning cmd / powershell / mshta / rundll32 /
+//     regsvr32. Catches both post-install elevation chains
+//     and unrelated browser-style exploitation.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ (
+    "Zoom.exe", "Zoom_launcher.exe", "ZoomLauncher.exe",
+    "zCrashReport.exe", "ZoomAutoUpdater.exe"
+)
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "mshta.exe", "rundll32.exe", "regsvr32.exe",
+    "wscript.exe", "cscript.exe", "bitsadmin.exe",
+    "certutil.exe", "wmic.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. DEFENDER EXCLUSION ADDED AROUND ZOOM INSTALL PATHS
+//     Post-exploit cover-up — Add-MpPreference / Set-MpPreference
+//     adding ExclusionPath that references a Zoom directory or
+//     a user-writable Zoom-installer staging path.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+| where ProcessCommandLine has_any ("Add-MpPreference", "Set-MpPreference")
+| where ProcessCommandLine has "ExclusionPath"
+| where ProcessCommandLine has "Zoom"
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Zoom installer launched from user-writable path →
+//     untrusted DLL loaded from user-writable path → child
+//     process running at System or High integrity, all on
+//     the same device inside a 30-minute window.
+// ------------------------------------------------------------
+let Stage1_Installer = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName has_any (
+    "ZoomRoomsInstaller", "ZoomInstaller",
+    "ZoomVDI", "Zoom_VDI", "ZoomWorkplace"
+)
+| where FolderPath !startswith @"C:\Program Files"
+   and FolderPath !startswith @"C:\Program Files (x86)"
+| project DeviceName, InstTime = Timestamp,
+          InstFile = FileName, InstPath = FolderPath,
+          InstIntegrity = ProcessIntegrityLevel,
+          InstPid = ProcessId;
+let Stage2_DllLoad = DeviceImageLoadEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName has_any (
+    "ZoomRoomsInstaller", "ZoomInstaller",
+    "ZoomVDI", "ZoomWorkplace"
+)
+| where FolderPath !startswith @"C:\Program Files"
+   and FolderPath !startswith @"C:\Windows"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\", @"\ProgramData\"
+)
+| project DeviceName, DllTime = Timestamp,
+          DllFile = FileName, DllFolder = FolderPath, DllSha = SHA256;
+let Stage3_Elevation = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName has_any (
+    "ZoomRoomsInstaller", "ZoomInstaller",
+    "ZoomVDI", "ZoomWorkplace"
+)
+| where ProcessIntegrityLevel in~ ("System", "High")
+| where FileName !in~ ("msiexec.exe", "WerFault.exe", "conhost.exe")
+| project DeviceName, ElevTime = Timestamp,
+          ElevName = FileName, ElevCmd = ProcessCommandLine,
+          ElevIntegrity = ProcessIntegrityLevel;
+Stage1_Installer
+| join kind=inner Stage2_DllLoad on DeviceName
+| where DllTime between (InstTime .. (InstTime + 30m))
+| join kind=leftouter Stage3_Elevation on DeviceName
+| where ElevTime between (DllTime .. (DllTime + 30m))
+| project InstTime, DllTime, ElevTime,
+          DeviceName,
+          InstFile, InstPath, InstIntegrity,
+          DllFile, DllFolder, DllSha,
+          ElevName, ElevCmd, ElevIntegrity
+| order by InstTime desc
