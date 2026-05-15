@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **May 2026**
+- [Pwn2Own Berlin 2026 Day 1 - Edge Sandbox & Windows LPE & LiteLLM RCE & AI Framework Bugs](<Pwn2Own Berlin 2026 Day 1 - Edge Sandbox & Windows LPE & LiteLLM RCE & AI Framework Bugs (May 2026)>)
 - [TencShell Rshell-derived Framework - Screen Control & Tencent C2 Obfuscation](<TencShell Rshell-derived Framework - Screen Control & Tencent C2 Obfuscation (May 2026)>)
 - [Shai-Hulud Supply Chain Contest - TeamPCP Crowdsourced npm and PyPI Worms](<Shai-Hulud Supply Chain Contest - TeamPCP Crowdsourced npm and PyPI Worms (May 2026)>)
 - [Zoom Rooms & Workplace VDI Installer Vulnerabilities - DLL Hijack & Path Control](<Zoom Rooms & Workplace VDI Installer Vulnerabilities - DLL Hijack & Path Control (May 2026)>)
