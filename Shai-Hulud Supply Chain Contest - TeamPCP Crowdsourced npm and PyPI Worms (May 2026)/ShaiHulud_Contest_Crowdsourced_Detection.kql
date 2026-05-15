@@ -1,0 +1,448 @@
+// ============================================================
+// Shai-Hulud Supply Chain Contest — TeamPCP / BreachForums
+// $1,000 Crowdsourced npm & PyPI Worm Campaign
+// Source:   CyberSecurity News / Socket Research (May 14 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1195.001, T1195.002, T1059.006, T1059.007,
+//               T1552.001, T1552.004, T1555, T1567.001,
+//               T1041, T1027
+// Threat Actor: TeamPCP (with Vect ransomware affiliate ties);
+//               contest hosted on BreachForums; tool is the
+//               open-source Shai-Hulud loader/worm.
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Socket Research uncovered an underground "contest" sponsored by
+// TeamPCP on BreachForums offering $1,000 in Monero to whoever
+// can spread Shai-Hulud-based malicious npm and PyPI packages
+// to the highest weekly / monthly download counts. The scoring
+// system explicitly rewards reckless, worm-style propagation.
+//
+// The technical baseline of Shai-Hulud is already well known
+// from the prior TeamPCP campaigns this repo covers (SAP npm
+// "mini Shai Hulud", Trivy / LiteLLM, Checkmarx KICS):
+//
+//   - Malicious preinstall / postinstall hook in package.json
+//   - Bun runtime fetched during npm or pip install
+//   - Bun-launched obfuscated stage-2 (setup.mjs, execution.js)
+//   - "__decodeScrambled" cipher used for string obfuscation
+//   - Russian-locale early-exit (anti-attribution / anti-CIS)
+//   - TruffleHog or Shai-Hulud's own scanner sweeps the host
+//     for secrets
+//   - Targets stolen: GitHub tokens, .npmrc / .pypirc,
+//     AWS / Azure / GCP / GCloud env vars, Kubernetes service-
+//     account tokens, GitHub Actions runtime secrets, SSH keys
+//   - Exfil to attacker-controlled GitHub repos (often literally
+//     named "Shai-Hulud") + worm-style republish of OTHER
+//     packages owned by compromised maintainers
+//
+// What changes with the contest is the VOLUME and the
+// SOPHISTICATION FLOOR. Crowdsourcing means many new low-skill
+// participants will ship lightly-modified Shai-Hulud variants
+// across hundreds of niche packages. The IOCs will rotate
+// faster than any blocklist can keep up — so this pack hunts
+// the TECHNIQUE CLASS, not specific packages.
+//
+// PAIRS WITH (existing detections in this repo)
+// ---------------------------------------------------------------
+//   SAP npm Supply Chain Compromise - TeamPCP mini Shai Hulud
+//   Checkmarx KICS Supply Chain Compromise - TeamPCP
+//   109 Fake GitHub Repositories - SmartLoader & StealC
+//   Hugging Face Malicious Model - Open-OSS Privacy-Filter
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate Bun installs by developers experimenting with
+//     the runtime. Pin trusted users / projects.
+//   - Security-team workstations running TruffleHog legitimately
+//     against owned repos. Pin those accounts.
+//   - CI/CD runners that legitimately publish npm packages —
+//     tune the worm-spread query #11 with your release cadence.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/hackers-1000-contest-supply-chain-attacks/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. NPM / PIP INSTALL TRIGGERING A PREINSTALL OR POSTINSTALL
+//    LIFECYCLE HOOK THAT SHELLS OUT
+//    The most reliable Shai-Hulud entry point — npm/pnpm/yarn
+//    or pip install spawning node / bun / sh / python that is
+//    NOT part of the package itself but a hook.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ (
+    "npm.cmd", "npm.exe", "npm",
+    "pnpm.cmd", "pnpm.exe", "pnpm",
+    "yarn.cmd", "yarn.exe", "yarn",
+    "node.exe", "node",
+    "pip.exe", "pip3.exe", "pip",
+    "python.exe", "pythonw.exe", "python", "python3"
+)
+| where InitiatingProcessCommandLine has_any (
+    " install", " ci ", " add ", " update",
+    "preinstall", "postinstall"
+)
+| where FileName in~ (
+    "node.exe", "node", "bun.exe", "bun",
+    "sh", "bash", "dash",
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "python.exe", "python", "python3"
+)
+| where ProcessCommandLine has_any (
+    "preinstall", "postinstall",
+    "setup.mjs", "execution.js",
+    "lifecycle", "_phase", "npm-cli.js"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. BUN RUNTIME FETCHED DURING AN NPM / PIP INSTALL
+//    Shai-Hulud routinely downloads Bun as part of the chain.
+//    A package install pulling bun.sh / Bun release artefacts
+//    is highly suggestive.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceNetworkEvents
+    | where Timestamp > ago(14d)
+    | where ActionType == "ConnectionSuccess"
+    | where RemoteUrl has_any ("bun.sh", "bun.com", "oven-sh/bun")
+       or RemoteUrl has "bun-windows-x64"
+       or RemoteUrl has "bun-linux-x64"
+    | where InitiatingProcessFileName in~ (
+        "npm.cmd", "npm.exe", "node.exe", "node",
+        "pip.exe", "pip3.exe", "python.exe", "python3",
+        "sh", "bash", "dash"
+    )
+    | extend EventKind = "Network"
+    | project Timestamp, DeviceName, EventKind,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              RemoteUrl, RemoteIP, FileName = "", FolderPath = ""
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FileName in~ ("bun.exe", "bun")
+    | where InitiatingProcessFileName in~ (
+        "npm.cmd", "npm.exe", "node.exe", "node",
+        "pip.exe", "pip3.exe", "python.exe", "python3"
+    )
+    | extend EventKind = "FileDrop"
+    | project Timestamp, DeviceName, EventKind,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              RemoteUrl = "", RemoteIP = "", FileName, FolderPath
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. "__decodeScrambled" / SHAI-HULUD OBFUSCATION STRING SWEEP
+//    The signature obfuscator used by every Shai-Hulud variant
+//    seen so far. Hits on cmdline, on disk, or in script-block
+//    telemetry.
+// ------------------------------------------------------------
+let ShaiHulud_Markers = dynamic([
+    "__decodeScrambled",
+    "shai-hulud",
+    "ShaiHulud",
+    "shaihulud"
+]);
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has_any (ShaiHulud_Markers)
+       or InitiatingProcessCommandLine has_any (ShaiHulud_Markers)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FileName has_any (ShaiHulud_Markers)
+       or FolderPath has_any (ShaiHulud_Markers)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. NPMRC / PYPIRC / NETRC READ BY NODE / BUN / PYTHON
+//    DURING AN INSTALL
+//    The credential-harvest stage. Reading .npmrc / .pypirc /
+//    .netrc / ~/.gitconfig is normal for the legitimate
+//    install — but reading them from a TRANSIENT process
+//    spawned BY the install is the worm step.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (".npmrc", ".pypirc", ".netrc", "credentials")
+   or FolderPath has_any (
+        @"\.npm\", @"\.config\pip\",
+        @"\.config\gh\", @"\.config\hub",
+        @"\.aws\", @"\.azure\", @"\.gcloud\",
+        @"\.kube\", @"\.ssh\"
+   )
+   or FolderPath has "/var/run/secrets/kubernetes.io"
+| where InitiatingProcessFileName in~ (
+    "node.exe", "node", "bun.exe", "bun",
+    "python.exe", "python", "python3", "pythonw.exe",
+    "sh", "bash"
+)
+| where InitiatingProcessCommandLine has_any (
+    "setup.mjs", "execution.js",
+    "preinstall", "postinstall",
+    "package.json", "lifecycle"
+)
+   or InitiatingProcessFolderPath has_any (@"\node_modules\", @"\site-packages\")
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. TRUFFLEHOG / GITLEAKS RUN ON A WORKSTATION
+//    Shai-Hulud frequently invokes TruffleHog (or its own
+//    secret-scanner) to sweep the host. Legitimate use exists
+//    but is rare outside dedicated security tooling.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (
+    "trufflehog.exe", "trufflehog",
+    "gitleaks.exe", "gitleaks",
+    "detect-secrets.exe", "detect-secrets"
+)
+   or ProcessCommandLine has_any (
+        "trufflehog filesystem", "trufflehog git",
+        "gitleaks detect", "detect-secrets scan"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. SETUP.MJS / EXECUTION.JS DROPPED INSIDE NODE_MODULES
+//    Two filenames consistently seen across Shai-Hulud
+//    variants when they unpack inside a freshly-installed
+//    package directory.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("setup.mjs", "execution.js")
+| where FolderPath has @"\node_modules\"
+   or FolderPath has "/node_modules/"
+| project Timestamp, DeviceName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. CLOUD CREDENTIAL ENVIRONMENT-VARIABLE HARVEST
+//    Surfaces processes that read or pass cloud env vars
+//    during an install — a hallmark of the Shai-Hulud
+//    secret-exfil step on CI / CD runners.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessCommandLine has_any (
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_TENANT_ID",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GH_TOKEN", "GITHUB_TOKEN", "NPM_TOKEN",
+    "process.env", "os.environ"
+)
+| where (InitiatingProcessFileName in~ (
+        "node.exe", "node", "bun.exe", "bun",
+        "python.exe", "python", "python3", "pythonw.exe"
+    ))
+   or InitiatingProcessFolderPath has_any (@"\node_modules\", @"\site-packages\")
+| where InitiatingProcessCommandLine has_any (
+    "setup.mjs", "execution.js",
+    "preinstall", "postinstall", "lifecycle"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. OUTBOUND TO GITHUB FROM CI / CD AGENT DURING INSTALL
+//    Shai-Hulud exfils stolen secrets into attacker-controlled
+//    GitHub repos. A node/bun/python process under a CI/CD
+//    agent talking to github.com OUTSIDE the expected
+//    upload-artifact / release flow is suspicious.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "api.github.com", "github.com",
+    "raw.githubusercontent.com",
+    "uploads.github.com",
+    "api.gitlab.com"
+)
+| where InitiatingProcessFileName in~ (
+    "node.exe", "node", "bun.exe", "bun",
+    "python.exe", "python", "python3", "pythonw.exe"
+)
+| where InitiatingProcessCommandLine has_any (
+    "setup.mjs", "execution.js",
+    "preinstall", "postinstall",
+    "lifecycle", "package.json"
+)
+   or InitiatingProcessFolderPath has_any (@"\node_modules\", @"\site-packages\")
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. RUSSIAN-LOCALE EARLY-EXIT FINGERPRINT
+//    The Shai-Hulud family historically aborts execution on
+//    hosts with Russian locale / language. The check itself
+//    is a unique behavioural marker when seen in npm/pip-
+//    install context.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any (
+    "Intl.DateTimeFormat", "resolvedOptions().locale",
+    "LANG=ru", "LC_ALL=ru", "ru-RU",
+    "process.env.LANG", "process.env.LC_ALL",
+    "navigator.language"
+)
+| where InitiatingProcessFileName in~ ("node.exe", "node", "bun.exe", "bun")
+   or InitiatingProcessFolderPath has_any (@"\node_modules\", @"\site-packages\")
+| project Timestamp, DeviceName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. KUBERNETES SERVICE-ACCOUNT TOKEN ACCESS DURING INSTALL
+//     CI/CD-specific worm signal — a node / bun / python
+//     process reading the in-pod K8s token while running an
+//     install lifecycle hook.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has "/var/run/secrets/kubernetes.io"
+   or FileName =~ "token"
+| where InitiatingProcessFileName in~ (
+    "node", "node.exe", "bun", "bun.exe",
+    "python", "python3", "python.exe", "pythonw.exe"
+)
+| where InitiatingProcessCommandLine has_any (
+    "preinstall", "postinstall",
+    "setup.mjs", "execution.js"
+)
+   or InitiatingProcessFolderPath has_any ("/node_modules/", "/site-packages/")
+| project Timestamp, DeviceName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. POST-INSTALL NPM PUBLISH BURST (WORM SPREAD)
+//     A workstation or CI agent that suddenly publishes
+//     multiple distinct npm packages within a short window
+//     — Shai-Hulud's worm-style republish from stolen tokens.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("npm.cmd", "npm.exe", "node.exe", "node")
+| where ProcessCommandLine has "publish"
+| summarize PublishCount = count(),
+            DistinctPkgs = dcount(ProcessCommandLine),
+            FirstSeen = min(Timestamp),
+            LastSeen  = max(Timestamp)
+    by DeviceName, AccountName, bin(Timestamp, 1h)
+| where PublishCount >= 5 and DistinctPkgs >= 3
+| order by PublishCount desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     npm/pip install → lifecycle hook → cloud env var or
+//     credential file read → GitHub egress, all on the same
+//     device inside a 30-minute window. Use for high-
+//     confidence triage of any suspected contest-driven
+//     Shai-Hulud variant.
+// ------------------------------------------------------------
+let Stage1_Install = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("npm.cmd", "npm.exe", "pnpm.cmd", "pnpm.exe",
+                       "yarn.cmd", "yarn.exe",
+                       "pip.exe", "pip3.exe",
+                       "node.exe", "node", "bun.exe", "bun")
+| where ProcessCommandLine has_any (" install", " ci ", " add ", " update")
+| project DeviceName, InstTime = Timestamp,
+          InstTool = FileName, InstCmd = ProcessCommandLine;
+let Stage2_Hook = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any ("preinstall", "postinstall", "setup.mjs", "execution.js")
+| project DeviceName, HookTime = Timestamp,
+          HookFile = FileName, HookCmd = ProcessCommandLine;
+let Stage3_Creds = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName in~ (".npmrc", ".pypirc", ".netrc")
+   or FolderPath has_any (
+        @"\.aws\", @"\.azure\", @"\.gcloud\",
+        @"\.kube\", @"\.ssh\",
+        "/var/run/secrets/kubernetes.io"
+   )
+| where InitiatingProcessFileName in~ ("node.exe", "node", "bun.exe", "bun",
+                                        "python.exe", "python", "python3")
+| project DeviceName, CredTime = Timestamp,
+          CredFile = FileName, CredFolder = FolderPath;
+let Stage4_Egress = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any ("api.github.com", "uploads.github.com",
+                            "raw.githubusercontent.com", "api.gitlab.com")
+| where InitiatingProcessFileName in~ ("node.exe", "node", "bun.exe", "bun",
+                                        "python.exe", "python", "python3")
+| project DeviceName, EgressTime = Timestamp,
+          EgressProc = InitiatingProcessFileName,
+          EgressUrl = RemoteUrl;
+Stage1_Install
+| join kind=inner Stage2_Hook on DeviceName
+| where HookTime between (InstTime .. (InstTime + 30m))
+| join kind=leftouter Stage3_Creds on DeviceName
+| where CredTime between (HookTime .. (HookTime + 30m))
+| join kind=leftouter Stage4_Egress on DeviceName
+| where EgressTime between (HookTime .. (HookTime + 30m))
+| project InstTime, HookTime, CredTime, EgressTime,
+          DeviceName,
+          InstTool, InstCmd,
+          HookFile, HookCmd,
+          CredFile, CredFolder,
+          EgressProc, EgressUrl
+| order by InstTime desc

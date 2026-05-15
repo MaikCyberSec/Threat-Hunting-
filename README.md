@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **May 2026**
+- [Shai-Hulud Supply Chain Contest - TeamPCP Crowdsourced npm and PyPI Worms](<Shai-Hulud Supply Chain Contest - TeamPCP Crowdsourced npm and PyPI Worms (May 2026)>)
 - [Zoom Rooms & Workplace VDI Installer Vulnerabilities - DLL Hijack & Path Control](<Zoom Rooms & Workplace VDI Installer Vulnerabilities - DLL Hijack & Path Control (May 2026)>)
 - [cPanel CVE-2026-41940 Auth Bypass - Mr_Rot13 Backdoor Campaign](<cPanel CVE-2026-41940 Auth Bypass - Mr_Rot13 Backdoor Campaign (May 2026)>)
 - [Operational AI Abuse - Shadow LLM APIs & AI-Generated Exploit Tooling](<Operational AI Abuse - Shadow LLM APIs & AI-Generated Exploit Tooling (May 2026)>)
