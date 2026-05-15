@@ -1,0 +1,452 @@
+// ============================================================
+// TencShell — Rshell-derived Screen-Control Framework
+// with Tencent-Style C2 Obfuscation
+// Source:   CyberSecurity News / Cato Networks (May 14 2026)
+//           Intercepted at a global manufacturer (India site,
+//           multi-country footprint); third-party user with
+//           legitimate internal access was the initial entry.
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1547.001, T1547.005, T1113, T1056.004,
+//               T1555.003, T1134.005, T1140, T1132, T1071.001,
+//               T1090.001 (SOCKS5)
+// Attribution: Suspected China-linked actor (Cato).
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// TencShell is a custom-extended fork of the open-source Rshell
+// offensive framework. It implements full interactive remote-
+// desktop control on Windows using native APIs (SendInput,
+// MouseClick, KeyTap, GetScreenWebSocket), streams the screen
+// over WebSocket, supports SOCKS5 proxying for command relay,
+// performs UAC bypass without prompting, and disguises its C2
+// as ordinary Tencent application traffic (User-Agent spoof +
+// Tencent Cloud Function Compute fronting via *.fcapp.run).
+//
+// KILL CHAIN
+// ---------------------------------------------------------------
+//   1) Multi-stage dropper delivered to a third-party user
+//      with legitimate internal access (initial vector
+//      undisclosed; likely phish / drive-by).
+//   2) A .woff "font" file masquerades the payload; the dropper
+//      reads it and unpacks Donut shellcode in memory.
+//   3) Donut reflectively loads the TencShell implant. No
+//      malware binary on disk after stage one.
+//   4) Persistence: HKCU\Software\Microsoft\Windows\CurrentVersion
+//      \Run with value name "OneDriveHealthTask".
+//   5) UAC_BYPASS opcode in the implant elevates without a
+//      consent prompt.
+//   6) C2 over HTTPS WebSocket to *.fcapp.run (Tencent Function
+//      Compute) with fake User-Agent; streams screen frames,
+//      receives keyboard/mouse, opens SOCKS5 proxy on demand.
+//   7) Browser credential / cookie / session theft from Chrome
+//      and Edge profile stores for session hijack follow-on.
+//
+// IOC HASHES
+// ---------------------------------------------------------------
+//   SHA1 (TencShell implants):
+//     c3ecb90c9915daa23aec51f93ff8665778866f05
+//     92b2413578c8ba9708df6091660af53acdc505f3
+//     33f6d4f4269cec740a5eb05e41a4c7926742606b
+//     18f22d3337facbbd0047c19f4efdea75ccb9e3ec
+//     793cb9b1d7846afa4fb8e900d6e9ed9501dc3e7e
+//     673b4f2682f29b19ecabf9a6ec9c3042c9b1cfb3
+//     9dbdddf1dda680ab750a707084839fe970266964
+//     957b8eaa7e25b4d9ca1050cd7ab19e4a2add707d
+//
+//   SHA256 (TencShell implants):
+//     14ae8de40153c66455d972e6e98fe06fb68db7301ba126557e96599527bc5509
+//     c1ba73df60e12b3feb8b5574e65cfceb6910460ab7fae2cf5554769fafdad049
+//     e5eff99959683480d2280c931e433af836adf6a8b7a8489b1af17cddcf480cf6
+//
+//   SHA256 (Dropper / payload stages):
+//     30fe91200a2bb4aed13b1a1ba4ec8fd4454566f5929ffed4f537d9a87c1bf118
+//     77f6bec5dd217151fcd03087a6e7ba1070f0fa603801fb128a4097076c9976d3
+//     6ed6058f0b0735ba56b781dea39353625fcb56bc3e77bf2d26a648511d754d21
+//
+// IOC NETWORK
+// ---------------------------------------------------------------
+//   45.64.52.242
+//   192.238.134.166
+//   45.115.38.27
+//   gin-tne-fahcesmukw.cn-hangzhou.fcapp.run
+//
+// IOC REGISTRY
+// ---------------------------------------------------------------
+//   HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+//   Value name: OneDriveHealthTask
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate OneDrive uses task names like "OneDrive Standalone
+//     Update Task v2" and "OneDriveAutoLaunch" — NOT
+//     "OneDriveHealthTask". Easy to allow-list yours.
+//   - Tencent Cloud Function Compute (*.fcapp.run) is a real
+//     legitimate service. Filter for non-browser callers.
+//   - Browsers writing .woff fonts to their own cache are
+//     legitimate — the hunt is for .woff written by non-browser
+//     processes.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/new-malware-framework-enables-screen-control/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN SHA256 / SHA1 HASHES (FILE + PROCESS + IMAGE LOAD)
+//    Direct, highest-fidelity match on the 15 IOC hashes from
+//    Cato Networks. Hits across the three event tables.
+// ------------------------------------------------------------
+let TencShell_SHA1 = dynamic([
+    "c3ecb90c9915daa23aec51f93ff8665778866f05",
+    "92b2413578c8ba9708df6091660af53acdc505f3",
+    "33f6d4f4269cec740a5eb05e41a4c7926742606b",
+    "18f22d3337facbbd0047c19f4efdea75ccb9e3ec",
+    "793cb9b1d7846afa4fb8e900d6e9ed9501dc3e7e",
+    "673b4f2682f29b19ecabf9a6ec9c3042c9b1cfb3",
+    "9dbdddf1dda680ab750a707084839fe970266964",
+    "957b8eaa7e25b4d9ca1050cd7ab19e4a2add707d"
+]);
+let TencShell_SHA256 = dynamic([
+    "14ae8de40153c66455d972e6e98fe06fb68db7301ba126557e96599527bc5509",
+    "c1ba73df60e12b3feb8b5574e65cfceb6910460ab7fae2cf5554769fafdad049",
+    "e5eff99959683480d2280c931e433af836adf6a8b7a8489b1af17cddcf480cf6",
+    "30fe91200a2bb4aed13b1a1ba4ec8fd4454566f5929ffed4f537d9a87c1bf118",
+    "77f6bec5dd217151fcd03087a6e7ba1070f0fa603801fb128a4097076c9976d3",
+    "6ed6058f0b0735ba56b781dea39353625fcb56bc3e77bf2d26a648511d754d21"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (TencShell_SHA256) or SHA1 in (TencShell_SHA1)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA1, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine = ""
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (TencShell_SHA256) or SHA1 in (TencShell_SHA1)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA1, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (TencShell_SHA256) or SHA1 in (TencShell_SHA1)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA1, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DOCUMENTED C2 INFRASTRUCTURE — IPs + fcapp.run DOMAIN
+//    Direct match on the three known C2 IPs and the Tencent
+//    Function Compute domain.
+// ------------------------------------------------------------
+let TencShell_IPs = dynamic([
+    "45.64.52.242", "192.238.134.166", "45.115.38.27"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteIP in (TencShell_IPs)
+   or RemoteUrl has "gin-tne-fahcesmukw.cn-hangzhou.fcapp.run"
+   or tostring(parse_url(RemoteUrl).Host) == "gin-tne-fahcesmukw.cn-hangzhou.fcapp.run"
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. REGISTRY PERSISTENCE — "OneDriveHealthTask" RUN VALUE
+//    Exact persistence string used by TencShell. The legitimate
+//    OneDrive run-key entries are named differently — easy to
+//    catch.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryKey has @"\Software\Microsoft\Windows\CurrentVersion\Run"
+| where RegistryValueName =~ "OneDriveHealthTask"
+   or RegistryValueData has "OneDriveHealthTask"
+| project Timestamp, DeviceName,
+          ActionType, RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. ".WOFF" FONT DROPPED BY A NON-BROWSER PROCESS
+//    TencShell uses a .woff "font" file as the dropper carrier.
+//    A .woff written by anything other than a browser, IDE or
+//    OneDrive sync is suspicious by definition.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".woff"
+   or FileName endswith ".woff2"
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe",
+    "Code.exe", "cursor.exe", "devenv.exe",
+    "OneDrive.exe", "Teams.exe", "ms-teams.exe",
+    "WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE", "OUTLOOK.EXE",
+    "explorer.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. TENCENT FUNCTION COMPUTE (.fcapp.run) FROM NON-BROWSER
+//    Catches C2 hosted on the same Tencent Cloud serverless
+//    platform even after the actor rotates subdomains.
+//    Browsers and Tencent client apps legitimately call .fcapp.run.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has ".fcapp.run"
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "OUTLOOK.EXE", "Teams.exe",
+    "ms-teams.exe", "WeChat.exe", "QQ.exe", "TIM.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. BROWSER CREDENTIAL / COOKIE / SESSION STORE READ BY
+//    NON-BROWSER PROCESS
+//    The post-screen-capture credential tail — Chrome / Edge
+//    "Login Data", "Cookies", "Local State", "Web Data" read
+//    by anything other than the browser itself or trusted
+//    Microsoft / OneDrive tooling.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where (FolderPath has @"\Google\Chrome\User Data"
+         or FolderPath has @"\Microsoft\Edge\User Data"
+         or FolderPath has @"\BraveSoftware\Brave-Browser\User Data"
+         or FolderPath has @"\Mozilla\Firefox\Profiles")
+| where FileName in~ ("Login Data", "Cookies", "Local State", "Web Data",
+                       "logins.json", "key4.db", "cookies.sqlite")
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "OneDrive.exe", "explorer.exe",
+    "SearchIndexer.exe", "MsMpEng.exe", "MpDefenderCoreService.exe",
+    "MicrosoftEdgeUpdate.exe", "Bitwarden.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. SOCKS5 / 1080 OUTBOUND FROM A NON-PROXY-CLIENT PROCESS
+//    TencShell opens a SOCKS5 proxy on demand for command
+//    relay. Surfaces SOCKS-style connections by binaries
+//    other than known proxy clients.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where RemotePort in (1080, 1085, 4145, 9050)
+| where InitiatingProcessFileName !in~ (
+    "ssh.exe", "openssh.exe", "msedge.exe", "chrome.exe",
+    "firefox.exe", "Tor.exe", "tor.exe", "browser.exe"
+)
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+   or RemoteIP in (TencShell_IPs)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. WEBSOCKET (wss://) FROM A NON-BROWSER PROCESS
+//    TencShell streams screen frames over WebSocket. Surfaces
+//    non-browser processes initiating WebSocket connections to
+//    public destinations.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where (RemotePort in (443, 8080, 8443, 9443)
+         and tostring(parse_url(RemoteUrl).Scheme) in~ ("wss", "ws"))
+   or RemoteUrl startswith "wss://"
+   or RemoteUrl startswith "ws://"
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "Teams.exe", "ms-teams.exe",
+    "OUTLOOK.EXE", "Code.exe", "cursor.exe",
+    "slack.exe", "discord.exe", "Zoom.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. UAC-BYPASS LOLBIN HEURISTIC
+//    TencShell carries a UAC_BYPASS opcode. Catches the
+//    common Windows UAC-bypass paths (fodhelper, computer-
+//    defaults, sdclt, eventvwr, slui) when triggered by an
+//    unsigned / user-path parent.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (
+    "fodhelper.exe", "computerdefaults.exe",
+    "sdclt.exe", "eventvwr.exe", "slui.exe",
+    "wsreset.exe", "ie4uinit.exe", "WSReset.exe"
+)
+| where (InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+         and ProcessIntegrityLevel in~ ("High", "System"))
+   or InitiatingProcessFolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+        @"\AppData\Roaming\", @":\Users\Public\"
+   )
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessIntegrityLevel,
+          FileName, ProcessIntegrityLevel, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. DONUT / REFLECTIVE SHELLCODE LOADER HALLMARKS IN CMDLINE
+//     Donut is the loader used to drop TencShell into memory.
+//     Catches the .NET / PowerShell reflection patterns
+//     commonly seen when Donut is invoked from a managed host.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessCommandLine has_any (
+    "VirtualAlloc", "VirtualAllocEx",
+    "WriteProcessMemory", "CreateRemoteThread",
+    "NtCreateThreadEx", "QueueUserAPC",
+    "ReflectivePEInjection", "Invoke-ReflectivePEInjection",
+    "ReflectiveLoader", "DONUT",
+    "Marshal.GetDelegateForFunctionPointer",
+    "kernel32::CreateThread"
+)
+| where FileName in~ (
+    "powershell.exe", "pwsh.exe",
+    "cmd.exe", "rundll32.exe", "regsvr32.exe",
+    "InstallUtil.exe", "RegAsm.exe", "RegSvcs.exe",
+    "MSBuild.exe", "csc.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. FAKE "OneDriveHealthTask" PROCESS HEURISTIC
+//     Catches cases where the registry entry references a
+//     binary path — surfaces the actual executable identified
+//     by the run-key value so you can pivot to it.
+// ------------------------------------------------------------
+let HealthTaskRegEvents = DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where RegistryKey has @"\Software\Microsoft\Windows\CurrentVersion\Run"
+| where RegistryValueName =~ "OneDriveHealthTask"
+   or RegistryValueData has "OneDriveHealthTask"
+| project DeviceName, RegTime = Timestamp,
+          RegValueName = RegistryValueName,
+          RegValueData = RegistryValueData,
+          RegBy = InitiatingProcessFileName;
+HealthTaskRegEvents
+| join kind=leftouter (
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | project ProcTime = Timestamp, DeviceName,
+              ProcFile = FileName, ProcPath = FolderPath,
+              ProcCmd = ProcessCommandLine, ProcSha = SHA256
+) on DeviceName
+| where ProcTime between (RegTime - 1h .. RegTime + 7d)
+| where RegValueData has ProcPath or RegValueData has ProcFile
+| project RegTime, ProcTime, DeviceName,
+          RegValueName, RegValueData, RegBy,
+          ProcFile, ProcPath, ProcSha, ProcCmd
+| order by RegTime desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     .woff dropped by non-browser → "OneDriveHealthTask"
+//     registry persistence → outbound to documented C2 IP or
+//     *.fcapp.run, all on the same device within a 4-hour
+//     window. Use for high-confidence triage of suspected
+//     TencShell incidents.
+// ------------------------------------------------------------
+let Stage1_Woff = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".woff" or FileName endswith ".woff2"
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "Code.exe", "OneDrive.exe",
+    "WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE", "OUTLOOK.EXE",
+    "Teams.exe", "ms-teams.exe", "explorer.exe"
+)
+| project DeviceName, WoffTime = Timestamp,
+          WoffFile = FileName, WoffPath = FolderPath,
+          WoffParent = InitiatingProcessFileName;
+let Stage2_Persistence = DeviceRegistryEvents
+| where Timestamp > ago(7d)
+| where RegistryKey has @"\Software\Microsoft\Windows\CurrentVersion\Run"
+| where RegistryValueName =~ "OneDriveHealthTask"
+   or RegistryValueData has "OneDriveHealthTask"
+| project DeviceName, PersistTime = Timestamp,
+          PersistValue = RegistryValueData;
+let Stage3_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIP in ("45.64.52.242", "192.238.134.166", "45.115.38.27")
+   or RemoteUrl has ".fcapp.run"
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_Woff
+| join kind=inner Stage2_Persistence on DeviceName
+| where PersistTime between (WoffTime .. (WoffTime + 4h))
+| join kind=leftouter Stage3_C2 on DeviceName
+| where C2Time between (PersistTime .. (PersistTime + 4h))
+| project WoffTime, PersistTime, C2Time,
+          DeviceName,
+          WoffFile, WoffPath, WoffParent,
+          PersistValue,
+          C2Proc, C2_IP, C2_Url
+| order by WoffTime desc
