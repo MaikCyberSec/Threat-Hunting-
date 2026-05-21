@@ -1,0 +1,442 @@
+// ============================================================
+// Nx Console VS Code Extension Compromise — TeamPCP Supply
+// Chain → GitHub Internal Repositories Breach
+// Source:   The Hacker News / OX Security / GitHub disclosure
+//           (May 21 2026 — incident May 18 2026 12:30–12:48 UTC)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1195.001, T1195.002, T1505.002, T1552.001,
+//               T1552.004, T1555, T1059.001, T1041, T1567.002
+// Threat Actor: TeamPCP (also responsible for TanStack, OpenAI,
+//               Mistral AI, Grafana Labs supply-chain hits)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// TeamPCP compromised an Nx maintainer system following the
+// TanStack supply-chain attack and pushed a trojanised version
+// of the Nx Console VS Code extension ("nrwl.angular-console")
+// to the Visual Studio Marketplace. The malicious build was
+// live for just 18 minutes (12:30–12:48 UTC, May 18 2026) but
+// during that window auto-update pulled it onto every machine
+// configured to receive it.
+//
+// Quote from OX Security's Nir Zadok:
+//   "The extension looked and behaved like normal Nx Console,
+//    but on startup it silently ran a single shell command that
+//    downloaded and executed a hidden package from a planted
+//    commit on the official nrwl/nx GitHub repository."
+//
+// The shell command was disguised as a "routine MCP setup task."
+// The harvested-credential set the extension targeted is the
+// modern developer workstation in one breath:
+//
+//   - 1Password vaults
+//   - Anthropic Claude Code configurations
+//   - npm credentials (.npmrc)
+//   - GitHub credentials (gh CLI hosts.yml, PATs)
+//   - AWS credentials
+//
+// The stolen GitHub credentials were used to access ~3,800
+// GitHub INTERNAL repositories — GitHub itself was the breached
+// org. GitHub states no customer-facing data was impacted; the
+// scope was internal repos, support interactions, and customer
+// info held inside GitHub's own systems.
+//
+// This pack pairs with the existing TeamPCP detections in this
+// repo (Checkmarx KICS, SAP npm Shai-Hulud, Shai-Hulud Contest,
+// 109 Fake GitHub Repos). It focuses on what's hunt-able on
+// the *endpoint* side of the chain — the developer workstation
+// that ran the extension.
+//
+// KEY ARTEFACTS
+// ---------------------------------------------------------------
+//   Extension identifier:
+//     nrwl.angular-console (also published as nrwl.nx-console)
+//
+//   VS Code / Cursor extension install paths (Windows):
+//     %USERPROFILE%\.vscode\extensions\nrwl.angular-console-*
+//     %USERPROFILE%\.vscode-server\extensions\nrwl.angular-console-*
+//     %USERPROFILE%\.cursor\extensions\nrwl.angular-console-*
+//
+//   Credential paths targeted:
+//     %LOCALAPPDATA%\1Password\, %APPDATA%\1Password\
+//     %USERPROFILE%\.claude\
+//     %USERPROFILE%\.npmrc, %APPDATA%\npm\.npmrc
+//     %USERPROFILE%\.config\gh\hosts.yml
+//     %USERPROFILE%\.aws\credentials, %USERPROFILE%\.aws\config
+//     %USERPROFILE%\.gitconfig (PATs sometimes here)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate Nx Console builds (versions OUTSIDE the
+//     May 18 2026 12:30–12:48 UTC window).
+//   - Developers running `code` from a terminal and shelling out
+//     for legitimate tasks — pair the parent + command-line
+//     filters in queries #2 / #3 for high fidelity.
+//   - Real MCP server setup tasks for Anthropic / OpenAI tooling.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://thehackernews.com/2026/05/github-internal-repositories-breached.html
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. NX CONSOLE EXTENSION INSTALL / UPDATE EVENTS
+//    Direct, highest-fidelity hit. Surfaces every workstation
+//    that received the nrwl.angular-console extension package
+//    files in the affected window — and going forward.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has_any (
+    @"\.vscode\extensions\nrwl.angular-console",
+    @"\.vscode\extensions\nrwl.nx-console",
+    @"\.vscode-server\extensions\nrwl.angular-console",
+    @"\.vscode-server\extensions\nrwl.nx-console",
+    @"\.cursor\extensions\nrwl.angular-console",
+    @"\.cursor\extensions\nrwl.nx-console"
+)
+   or FileName has "nrwl.angular-console"
+   or FileName has "nrwl.nx-console"
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. VS CODE / CURSOR SPAWNING A SHELL ON STARTUP
+//    Code.exe / cursor.exe parenting a shell soon after the
+//    extension folder was modified — the classic "extension
+//    activation runs a command" tell.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("Code.exe", "Code - Insiders.exe", "cursor.exe", "node.exe")
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "sh", "bash", "dash", "zsh",
+    "curl.exe", "curl", "wget", "wget.exe",
+    "git.exe", "git"
+)
+| where ProcessCommandLine has_any (
+    "raw.githubusercontent.com", "api.github.com",
+    "curl ", "Invoke-WebRequest", "iwr ", "wget",
+    "git clone", "node -e", "bash -c", "sh -c",
+    "FromBase64String", "IEX", "Invoke-Expression",
+    "MCP setup", "mcp-setup", "mcp_setup"
+)
+   or InitiatingProcessCommandLine has_any (
+        "nrwl.angular-console", "nrwl.nx-console"
+   )
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. CODE.EXE / CURSOR.EXE → CURL / GIT PULLING FROM GITHUB
+//    The "hidden package from a planted commit" download.
+//    Surfaces VS Code / Cursor pulling raw content or
+//    cloning from the nrwl/nx repo specifically.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("Code.exe", "Code - Insiders.exe", "cursor.exe", "node.exe")
+| where RemoteUrl has_any (
+    "raw.githubusercontent.com/nrwl/nx",
+    "github.com/nrwl/nx/raw",
+    "github.com/nrwl/nx/archive",
+    "api.github.com/repos/nrwl/nx"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. 1PASSWORD VAULT FILES READ BY NON-1PASSWORD PROCESS
+//    The trojanised extension targets 1Password vaults. Any
+//    non-1Password process touching the vault database is a
+//    near-diagnostic credential-theft signal.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any (
+    @"\1Password\", @"\AgileBits\", @"\1Password 7\",
+    @"\1Password 8\", @"\OPVault"
+)
+   or FileName has_any (
+        ".opvault", ".agilekeychain",
+        "1password-vault", "default.sqlite"
+   )
+| where InitiatingProcessFileName !in~ (
+    "1Password.exe", "1Password 7.exe", "1Password 8.exe",
+    "op.exe", "1Password-BrowserSupport.exe",
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "OneDrive.exe", "MsMpEng.exe", "MpDefenderCoreService.exe",
+    "explorer.exe", "SearchIndexer.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. CLAUDE CODE CONFIG (~/.claude/) ACCESS BY NON-CLAUDE
+//    PROCESS
+//    Claude Code stores API keys, sessions and MCP config under
+//    %USERPROFILE%\.claude\. Read access by a non-Claude
+//    process during an extension lifecycle is highly suspicious.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has @"\.claude\"
+   or FileName in~ (".claude.json", "settings.local.json", "credentials.json")
+| where InitiatingProcessFileName !in~ (
+    "claude.exe", "claude-code.exe", "claude-cli.exe",
+    "Code.exe", "Code - Insiders.exe", "cursor.exe",
+    "OneDrive.exe", "explorer.exe",
+    "MsMpEng.exe", "MpDefenderCoreService.exe"
+)
+| where InitiatingProcessCommandLine has_any (
+    "curl", "wget", "Invoke-WebRequest", "iwr ",
+    "node -e", "bash -c", "sh -c",
+    "FromBase64String", "IEX", "Invoke-Expression",
+    "tar ", "zip ", "7z"
+)
+   or InitiatingProcessFolderPath has @"\.vscode\extensions\"
+   or InitiatingProcessFolderPath has @"\.cursor\extensions\"
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. GH CLI / GITHUB PAT FILES READ BY NON-GH PROCESS
+//    `~/.config/gh/hosts.yml` and `~/.gitconfig` hold GitHub
+//    tokens. Reads from VS Code-spawned shells / extension
+//    contexts is the classic harvest path.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where (FolderPath has @"\.config\gh"
+         or FileName in~ ("hosts.yml", "config.yml", ".gitconfig", ".netrc"))
+| where InitiatingProcessFileName !in~ (
+    "gh.exe", "gh", "git.exe", "git", "Code.exe",
+    "Code - Insiders.exe", "cursor.exe", "OUTLOOK.EXE",
+    "msedge.exe", "chrome.exe", "explorer.exe",
+    "OneDrive.exe", "MsMpEng.exe"
+)
+   or InitiatingProcessCommandLine has_any (
+        "curl", "wget", "Invoke-WebRequest",
+        "node -e", "bash -c", "sh -c",
+        "FromBase64String", "IEX"
+   )
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. AWS CREDENTIALS ACCESS BY VS CODE / EXTENSION CONTEXT
+//    `~/.aws/credentials` and `~/.aws/config` are explicit
+//    harvest targets. Surface reads by a Code.exe-parented
+//    shell or by anything under an extension folder.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has @"\.aws"
+   or FileName in~ ("credentials", "config")
+| where FolderPath has @"\.aws"
+| where InitiatingProcessFileName !in~ (
+    "aws.exe", "aws", "Code.exe", "cursor.exe",
+    "terraform.exe", "pulumi.exe",
+    "OneDrive.exe", "explorer.exe", "MsMpEng.exe"
+)
+   or InitiatingProcessFolderPath has_any (
+        @"\.vscode\extensions\", @"\.cursor\extensions\"
+   )
+| where InitiatingProcessCommandLine has_any (
+    "curl", "wget", "Invoke-WebRequest",
+    "node -e", "bash -c", "sh -c",
+    "FromBase64String", "IEX"
+)
+   or InitiatingProcessFolderPath has_any (
+        @"\.vscode\extensions\", @"\.cursor\extensions\"
+   )
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. CHILD PROCESS EXECUTED FROM INSIDE A VS CODE EXTENSION
+//    FOLDER
+//    Anything inside `\.vscode\extensions\<id>\` spawning a
+//    new process is worth surfacing — even if the extension
+//    itself is harmless, this is where you'll see the next
+//    compromised marketplace publisher.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFolderPath has_any (
+    @"\.vscode\extensions\",
+    @"\.vscode-server\extensions\",
+    @"\.cursor\extensions\"
+)
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "sh", "bash", "dash", "zsh",
+    "curl.exe", "curl", "wget", "wget.exe",
+    "node.exe", "node", "python.exe", "python", "python3"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. CODE.EXE / CURSOR.EXE OUTBOUND TO PASTE / RELAY SERVICES
+//    Exfil endpoints commonly used to ship harvested
+//    credentials out of a compromised dev workstation.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where InitiatingProcessFileName in~ ("Code.exe", "Code - Insiders.exe", "cursor.exe", "node.exe")
+| where RemoteUrl has_any (
+    "gist.githubusercontent.com",
+    "pastebin.com", "paste.ee", "rentry.co",
+    "hastebin.com", "0bin.net", "anonfiles.com",
+    "transfer.sh", "file.io",
+    "webhook.site", "ngrok.io",
+    "discord.com/api/webhooks", "discordapp.com/api/webhooks"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. RECENT VS CODE EXTENSION INSTALLS POSTURE
+//     Fleet-wide list of all extension folder creates in the
+//     last 7 days — your "what was installed during the
+//     compromise window" report. Pair with the May 18 2026
+//     12:30–12:48 UTC range as a filter when investigating.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType == "FileCreated"
+| where FolderPath has_any (
+    @"\.vscode\extensions\", @"\.vscode-server\extensions\",
+    @"\.cursor\extensions\"
+)
+| where FileName endswith "package.json"
+| extend ExtId = extract(@"extensions[\\/]([^\\/]+)[\\/]", 1, FolderPath)
+| summarize InstallTime = max(Timestamp),
+            DistinctVersions = dcount(FolderPath)
+    by DeviceName, ExtId
+| where isnotempty(ExtId)
+| order by InstallTime desc
+
+
+// ------------------------------------------------------------
+// 11. "MCP SETUP" / "ROUTINE TASK" PRETEXT IN COMMAND LINES
+//     The article calls out that the malicious shell command
+//     was disguised as a "routine MCP setup task". Catches
+//     variants of that pretext on Windows / Linux / macOS.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any (
+    "MCP setup", "mcp-setup", "mcp_setup",
+    "routine setup", "routine MCP",
+    "post-install setup", "auto-configure MCP",
+    "configure-mcp", "install-mcp"
+)
+| where (InitiatingProcessFileName in~ ("Code.exe", "Code - Insiders.exe", "cursor.exe", "node.exe")
+         or InitiatingProcessFolderPath has @"\.vscode\extensions\"
+         or InitiatingProcessFolderPath has @"\.cursor\extensions\")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Nx Console extension install / update → Code.exe spawns
+//     a shell that pulls from GitHub raw / api.github.com →
+//     credential file read (1Password / Claude / gh / aws /
+//     npm) on the same device within a 30-minute window.
+//     Use for high-confidence triage.
+// ------------------------------------------------------------
+let Stage1_ExtInstall = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has_any (
+    @"\.vscode\extensions\nrwl.angular-console",
+    @"\.vscode\extensions\nrwl.nx-console",
+    @"\.cursor\extensions\nrwl.angular-console",
+    @"\.cursor\extensions\nrwl.nx-console"
+)
+| project DeviceName, ExtTime = Timestamp,
+          ExtFile = FileName, ExtPath = FolderPath;
+let Stage2_Shell = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("Code.exe", "Code - Insiders.exe", "cursor.exe", "node.exe")
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe",
+                       "sh", "bash", "curl.exe", "curl", "wget", "node.exe", "node")
+| where ProcessCommandLine has_any (
+    "raw.githubusercontent.com", "api.github.com",
+    "curl ", "Invoke-WebRequest", "iwr ", "wget",
+    "node -e", "bash -c", "sh -c"
+)
+| project DeviceName, ShellTime = Timestamp,
+          ShellFile = FileName, ShellCmd = ProcessCommandLine;
+let Stage3_CredRead = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where (FolderPath has @"\.aws"
+         or FolderPath has @"\.config\gh"
+         or FolderPath has @"\.claude\"
+         or FolderPath has @"\1Password\"
+         or FileName in~ (".npmrc", "hosts.yml", "credentials"))
+| where InitiatingProcessFileName !in~ (
+    "1Password.exe", "1Password 7.exe", "1Password 8.exe",
+    "aws.exe", "gh.exe", "git.exe",
+    "claude.exe", "claude-code.exe",
+    "explorer.exe", "OneDrive.exe", "MsMpEng.exe"
+)
+| project DeviceName, CredTime = Timestamp,
+          CredFile = FileName, CredFolder = FolderPath,
+          CredBy = InitiatingProcessFileName;
+Stage1_ExtInstall
+| join kind=inner Stage2_Shell on DeviceName
+| where ShellTime between (ExtTime .. (ExtTime + 30m))
+| join kind=leftouter Stage3_CredRead on DeviceName
+| where CredTime between (ShellTime .. (ShellTime + 30m))
+| project ExtTime, ShellTime, CredTime,
+          DeviceName,
+          ExtFile, ExtPath,
+          ShellFile, ShellCmd,
+          CredBy, CredFile, CredFolder
+| order by ExtTime desc
