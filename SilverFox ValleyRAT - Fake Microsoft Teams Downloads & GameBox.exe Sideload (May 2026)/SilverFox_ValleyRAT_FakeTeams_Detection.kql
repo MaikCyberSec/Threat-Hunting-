@@ -1,0 +1,467 @@
+// ============================================================
+// SilverFox ValleyRAT — Fake Microsoft Teams Downloads +
+// GameBox.exe (Tencent) DLL Sideload
+// Source:   CyberSecurity News / K7 Security Labs (May 21 2026)
+//           Campaign active since mid-April 2026.
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1036.004, T1140, T1574.002, T1112,
+//               T1562.001, T1547.001, T1053.005,
+//               T1056.001, T1115, T1005
+// Threat Actor: SilverFox APT (China; Chinese-language
+//               artefacts and log strings in samples)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// SilverFox is running a fake-Microsoft-Teams download campaign
+// that lands ValleyRAT — a feature-rich RAT with clipboard
+// monitoring, keystroke logging, password and crypto-wallet
+// theft, and dynamic in-memory payload swapping.
+//
+// The deception is well constructed: a typosquatted download
+// page hands the victim an NSIS-based installer in a ZIP. The
+// installer kicks off the REAL Microsoft Teams installer as
+// cover, while in the background it drops:
+//
+//   - GameBox.exe   — a legitimate, signed Tencent binary
+//                     used as a DLL-sideload carrier
+//   - utility.dll   — the malicious loader sideloaded by
+//                     GameBox.exe (MD5 18F3E85D72…F0F)
+//   - user.dat      — AES-at-rest, decrypted in-memory; the
+//                     final payload (MD5 8F9DE887E9…319)
+//
+// Persistence is a service named "_CCGDAT" with auto-restart.
+// Defender is weakened via PowerShell exclusion writes. The
+// real Teams install proceeds normally so the user never
+// notices.
+//
+// K7 quote:
+//   "This campaign reflects a well-structured intrusion chain
+//    combining social engineering with advanced post-
+//    exploitation capabilities."
+//
+// IOCs — NETWORK
+// ---------------------------------------------------------------
+//   teams-securecall[.]com   (typosquatted Teams download site)
+//   teamszs[.]com            (typosquatted Teams download site)
+//   103.215.77.17            (ValleyRAT C2)
+//
+// IOCs — FILESYSTEM
+// ---------------------------------------------------------------
+//   98653.2.87.teamsx.zip   MD5 709604CE58E3F8255587AC9253DB6994
+//   utility.dll             MD5 18F3E85D7237E3CAC0AD13BDCF513F0F
+//   user.dat                MD5 8F9DE887E9AED9D580F386BA2D191319
+//   GameBox.exe             (legitimate Tencent binary; abused)
+//
+// SERVICE / PERSISTENCE
+// ---------------------------------------------------------------
+//   Service name: _CCGDAT  (auto-restart)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate Tencent GameBox installations on consumer or
+//     APAC-region machines. Pin to known signer + Program Files
+//     install path.
+//   - Legitimate IT pushing Teams via MSI from ConfigMgr —
+//     filter MSI source path.
+//   - Pre-existing services starting with an underscore — pin
+//     a deny-list to "_CCGDAT" specifically rather than
+//     "any service starting with underscore."
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/hackers-use-fake-microsoft-teams-downloads-to-deploy-valleyrat-malware/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN MD5 HASHES (FILE + PROCESS)
+//    Direct hit on the three documented MD5s from K7. Defender
+//    surfaces both MD5 and SHA256 in DeviceFileEvents /
+//    DeviceProcessEvents.
+// ------------------------------------------------------------
+let ValleyRAT_MD5 = dynamic([
+    "709604ce58e3f8255587ac9253db6994",
+    "18f3e85d7237e3cac0ad13bdcf513f0f",
+    "8f9de887e9aed9d580f386ba2d191319"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (ValleyRAT_MD5)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine = ""
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (ValleyRAT_MD5)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (ValleyRAT_MD5)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DOCUMENTED C2 / TYPOSQUAT DOMAINS
+//    Connections to either of the typosquatted Teams sites
+//    or the ValleyRAT C2 IP. Near-diagnostic.
+// ------------------------------------------------------------
+let ValleyRAT_Net = dynamic([
+    "teams-securecall.com",
+    "teamszs.com"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteIP == "103.215.77.17"
+   or RemoteUrl has_any (ValleyRAT_Net)
+   or tostring(parse_url(RemoteUrl).Host) in (ValleyRAT_Net)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. NAMED ARTEFACTS — utility.dll / user.dat / GameBox.exe
+//    OUTSIDE OFFICIAL TENCENT INSTALL PATHS
+//    Catches the sideload chain by filename. GameBox.exe is
+//    legitimate when installed by Tencent; suspect when
+//    sitting in a user-writable folder.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ ("utility.dll", "user.dat", "GameBox.exe")
+    | where FolderPath !startswith @"C:\Program Files\Tencent"
+       and FolderPath !startswith @"C:\Program Files (x86)\Tencent"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "GameBox.exe"
+    | where FolderPath !startswith @"C:\Program Files\Tencent"
+       and FolderPath !startswith @"C:\Program Files (x86)\Tencent"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. utility.dll LOADED BY GameBox.exe FROM A USER-WRITABLE
+//    PATH — THE SIDELOAD MOMENT
+//    The exact CVE-shaped event in MDE telemetry.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(60d)
+| where FileName =~ "utility.dll"
+| where InitiatingProcessFileName =~ "GameBox.exe"
+   or InitiatingProcessFolderPath !startswith @"C:\Program Files\Tencent"
+| where FolderPath !startswith @"C:\Program Files"
+   and FolderPath !startswith @"C:\Windows"
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, MD5, SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. "_CCGDAT" SERVICE CREATION / REGISTRATION
+//    The persistence service. Surfaces sc.exe / PowerShell
+//    that creates a service named _CCGDAT plus the registry
+//    write under \Services\_CCGDAT.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where (FileName in~ ("sc.exe", "powershell.exe", "pwsh.exe", "cmd.exe"))
+    | where ProcessCommandLine has "_CCGDAT"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceRegistryEvents
+    | where Timestamp > ago(60d)
+    | where RegistryKey has @"\SYSTEM\CurrentControlSet\Services\_CCGDAT"
+    | extend EventKind = "Registry"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = InitiatingProcessAccountName,
+              FileName = "", FolderPath = RegistryKey,
+              ProcessCommandLine = RegistryValueData,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. DEFENDER EXCLUSION ADDED BY POWERSHELL / CMD
+//    ValleyRAT drops Defender exclusions via PowerShell before
+//    landing the payload. Generic catch worth keeping always-on.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+| where ProcessCommandLine has_any (
+    "Add-MpPreference", "Set-MpPreference"
+)
+| where ProcessCommandLine has_any (
+    "ExclusionPath", "ExclusionProcess", "ExclusionExtension"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. TEAMS NSIS / ZIP INSTALLER DROPPED FROM BROWSER /
+//    DOWNLOAD CONTEXT WITH NON-OFFICIAL NAMES
+//    Catches "teamsx", "MSTeamsSetup_*", "Teams_Setup_*" ZIP
+//    / EXE drops that did NOT come from microsoft.com.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where (FileName matches regex @"(?i)teams.{0,8}(setup|installer|x).{0,8}\.(zip|exe|msi)"
+         or FileName has "teamsx"
+         or FileName has "MSTeamsSetup"
+         or FileName has "98653.2.87.teamsx")
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\"
+)
+| where InitiatingProcessFileName in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe",
+    "OUTLOOK.EXE", "Teams.exe", "ms-teams.exe",
+    "explorer.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256, MD5,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. PARALLEL "REAL TEAMS + STAGER" LAUNCH PATTERN
+//    The trojanised installer kicks off the real Teams setup
+//    as cover. Surface devices that ran a Teams installer
+//    from a user-writable path AND also produced an obvious
+//    sideload candidate within the same hour.
+// ------------------------------------------------------------
+let TeamsInstallerInUserPath = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName has_any ("Teams", "MSTeams", "teamsx")
+| where (FileName endswith ".exe" or FileName endswith ".msi")
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\"
+)
+| project DeviceName, TeamsTime = Timestamp,
+          TeamsFile = FileName, TeamsPath = FolderPath,
+          TeamsCmd = ProcessCommandLine;
+let SideloadCandidate = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("utility.dll", "user.dat", "GameBox.exe")
+| where FolderPath !startswith @"C:\Program Files\Tencent"
+| project DeviceName, SideloadTime = Timestamp,
+          SideloadFile = FileName, SideloadPath = FolderPath,
+          SideloadBy = InitiatingProcessFileName;
+TeamsInstallerInUserPath
+| join kind=inner SideloadCandidate on DeviceName
+| where SideloadTime between (TeamsTime - 30m .. TeamsTime + 1h)
+| project TeamsTime, SideloadTime, DeviceName,
+          TeamsFile, TeamsPath, TeamsCmd,
+          SideloadFile, SideloadPath, SideloadBy
+| order by TeamsTime desc
+
+
+// ------------------------------------------------------------
+// 9. GAMEBOX.EXE SPAWNING SHELLS OR REACHING TO THE INTERNET
+//    Tencent's GameBox is a desktop launcher — it should not
+//    be spawning cmd / PowerShell, and it should not be
+//    making outbound non-Tencent connections.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName =~ "GameBox.exe"
+    | where FileName in~ (
+        "cmd.exe", "powershell.exe", "pwsh.exe",
+        "rundll32.exe", "regsvr32.exe", "mshta.exe",
+        "wscript.exe", "cscript.exe",
+        "curl.exe", "bitsadmin.exe", "certutil.exe"
+    )
+    | extend EventKind = "ChildProcess"
+    | project Timestamp, DeviceName, EventKind,
+              InitiatingProcessFileName, InitiatingProcessFolderPath,
+              InitiatingProcessCommandLine,
+              FileName, FolderPath, ProcessCommandLine,
+              RemoteIP = "", RemoteUrl = ""
+),
+(
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName =~ "GameBox.exe"
+    | where ActionType == "ConnectionSuccess"
+    | where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+    | where not (RemoteUrl has_any ("tencent.com", "qq.com", "qpic.cn"))
+    | extend EventKind = "Network"
+    | project Timestamp, DeviceName, EventKind,
+              InitiatingProcessFileName, InitiatingProcessFolderPath,
+              InitiatingProcessCommandLine,
+              FileName = "", FolderPath = "", ProcessCommandLine = "",
+              RemoteIP, RemoteUrl
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. ADJACENT TEAMS-TYPOSQUAT DOMAIN HEURISTIC
+//     Surfaces other "teams*" lookalike domains your fleet
+//     reaches — useful for catching adjacent SilverFox
+//     infrastructure beyond the two documented domains.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| extend Host = tolower(tostring(parse_url(RemoteUrl).Host))
+| where Host startswith "teams" or Host has "msteams"
+| where Host !endswith "microsoft.com"
+   and Host !endswith "office.com"
+   and Host !endswith "office365.com"
+   and Host !endswith "skype.com"
+   and Host !endswith "teams.cdn.office.net"
+   and Host !endswith "trafficmanager.net"
+   and Host !endswith "msftpcs.com"
+| summarize Hits = count(),
+            Procs = make_set(InitiatingProcessFileName, 5),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by DeviceName, Host
+| order by Hits desc
+
+
+// ------------------------------------------------------------
+// 11. CLIPBOARD / KEY HOOK API PATTERNS IN POWERSHELL
+//     ValleyRAT supports clipboard monitoring and key-logging.
+//     If any of the chain re-uses PowerShell wrappers, you'll
+//     see these P/Invoke patterns on cmdline / script blocks.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName in~ ("powershell.exe", "pwsh.exe")
+    | where ProcessCommandLine has_any (
+        "SetWindowsHookEx", "WH_KEYBOARD_LL",
+        "GetClipboardData", "OpenClipboard",
+        "GetAsyncKeyState", "GetKeyState",
+        "AddClipboardFormatListener"
+    )
+    | extend Body = ProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("PowerShellCommand", "ScriptContent")
+    | extend Body = tostring(parse_json(AdditionalFields).Command)
+    | where isnotempty(Body)
+    | where Body has_any (
+        "SetWindowsHookEx", "WH_KEYBOARD_LL",
+        "GetClipboardData", "AddClipboardFormatListener",
+        "GetAsyncKeyState"
+    )
+)
+| project Timestamp, DeviceName, FileName,
+          InitiatingProcessFileName, Body
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Fake-Teams ZIP drop / Teams installer in user path →
+//     GameBox.exe + utility.dll sideload → _CCGDAT service
+//     created → outbound to 103.215.77.17. Same device,
+//     2-hour window.
+// ------------------------------------------------------------
+let Stage1_FakeTeams = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where (FileName matches regex @"(?i)teams.{0,8}(setup|installer|x).{0,8}\.(zip|exe|msi)"
+         or FileName has "teamsx"
+         or tolower(MD5) == "709604ce58e3f8255587ac9253db6994")
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\"
+)
+| project DeviceName, ZipTime = Timestamp,
+          ZipName = FileName, ZipPath = FolderPath;
+let Stage2_Sideload = DeviceImageLoadEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "utility.dll"
+   or tolower(MD5) == "18f3e85d7237e3cac0ad13bdcf513f0f"
+| where InitiatingProcessFileName =~ "GameBox.exe"
+   or InitiatingProcessFolderPath !startswith @"C:\Program Files\Tencent"
+| project DeviceName, DllTime = Timestamp,
+          DllPath = FolderPath, DllParent = InitiatingProcessFileName;
+let Stage3_Service = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has "_CCGDAT"
+| project DeviceName, SvcTime = Timestamp,
+          SvcCmd = ProcessCommandLine;
+let Stage4_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIP == "103.215.77.17"
+   or RemoteUrl has_any ("teams-securecall.com", "teamszs.com")
+| project DeviceName, C2Time = Timestamp,
+          C2Process = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_FakeTeams
+| join kind=inner Stage2_Sideload on DeviceName
+| where DllTime between (ZipTime .. (ZipTime + 1h))
+| join kind=leftouter Stage3_Service on DeviceName
+| where SvcTime between (DllTime .. (DllTime + 1h))
+| join kind=leftouter Stage4_C2 on DeviceName
+| where C2Time between (DllTime .. (DllTime + 2h))
+| project ZipTime, DllTime, SvcTime, C2Time,
+          DeviceName,
+          ZipName, ZipPath,
+          DllPath, DllParent,
+          SvcCmd,
+          C2Process, C2_IP, C2_Url
+| order by ZipTime desc
