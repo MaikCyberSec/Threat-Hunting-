@@ -1,0 +1,415 @@
+// ============================================================
+// Kali365 — Phishing-as-a-Service against Microsoft 365
+// via OAuth Device Code Flow Abuse
+// Source:   CyberSecurity News (May 2026) — FBI IC3 alert
+//           I-052126-PSA; first observed April 2026.
+// Platform: Microsoft Defender XDR + Defender for Cloud Apps
+//           + Defender for Office 365 (Advanced Hunting)
+// MITRE ATT&CK: T1566.002, T1111, T1528, T1550.001,
+//               T1078.004
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Kali365 is a subscription-based Phishing-as-a-Service kit sold
+// on Telegram. It targets Microsoft 365 specifically and abuses
+// Microsoft's own OAuth Device Code Authorization flow:
+//
+//   1) Lure — AI-generated phishing email impersonating
+//      Microsoft, OneDrive, Teams or a document-share notice.
+//      The email contains a short device code and tells the
+//      victim to enter it on the LEGITIMATE Microsoft device-
+//      login page (microsoft.com/devicelogin or
+//      login.microsoftonline.com/common/oauth2/deviceauth).
+//   2) Authorize — the victim enters the code on the real
+//      Microsoft page and signs in with their real credentials
+//      and MFA. The flow looks normal from the victim's side.
+//   3) Token Theft — the device-code request was started by
+//      the actor; the resulting access + refresh tokens are
+//      delivered to the actor's session, not the victim's.
+//   4) Persistence — refresh tokens give the actor durable
+//      access. Because no fresh authentication happens after
+//      the code is entered, MFA challenges do not fire on
+//      follow-on resource access.
+//
+// FBI note: "Because credentials are not directly stolen,
+// traditional security alerts may not be triggered, thereby
+// increasing dwell time."
+//
+// This pack therefore complements the existing
+// "Entra ID Conditional Access Bypass — Device Code &
+// Phantom Device Registration" detection in this repo by
+// focusing on the PhaaS angle: lure delivery, AI-generated
+// email templates, mass distribution, no-MFA-trigger token
+// re-use, and Telegram-operator panel patterns.
+//
+// LICENSING NOTES
+// ---------------------------------------------------------------
+//   AADSignInEventsBeta       — Entra ID P1/P2 sign-in log
+//                                ingestion into Defender XDR.
+//   CloudAppEvents            — Defender for Cloud Apps.
+//   EmailEvents / UrlClickEvents — Defender for Office 365.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate Device Code workflows for Azure CLI, kiosk
+//     sign-ins, or shared-tenant devices. Tune by user, app
+//     or location.
+//   - First-party Microsoft emails referencing the genuine
+//     devicelogin URL — pair the lure detection (query #1)
+//     with the recipient burst pattern (query #3) for high
+//     fidelity.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/kali365-phaas-microsoft-365/
+//   FBI IC3 alert I-052126-PSA
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. INBOUND EMAIL CONTAINING DEVICE CODE LURE LANGUAGE
+//    Catches the lure delivery — phrasing and URLs typical of
+//    Kali365-style device code phishing. Body content is not
+//    directly hunt-able in MDE so the catch is on subject,
+//    sender domain and embedded URL hostnames.
+// ------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(14d)
+| where EmailDirection == "Inbound"
+| where Subject has_any (
+    "device code", "device login", "verification code",
+    "complete sign-in", "complete sign in",
+    "Microsoft authorization code",
+    "Teams access code", "OneDrive access code"
+)
+| where UrlCount > 0
+| where SenderFromDomain !endswith "microsoft.com"
+   and SenderFromDomain !endswith "office.com"
+   and SenderFromDomain !endswith "office365.com"
+   and SenderFromDomain !endswith "outlook.com"
+| project Timestamp, RecipientEmailAddress,
+          SenderFromAddress, SenderFromDomain,
+          Subject, AttachmentCount, UrlCount,
+          DeliveryAction, ConfidenceLevel,
+          NetworkMessageId, ThreatTypes
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. URL CLICK TO MICROSOFT DEVICE-LOGIN ENDPOINTS FROM EMAIL
+//    Catches the click — surfaces inbox→browser pivots that
+//    land on Microsoft's legitimate device-code page. By
+//    itself benign; high-value as a join key with queries
+//    #1 and #5.
+// ------------------------------------------------------------
+UrlClickEvents
+| where Timestamp > ago(14d)
+| where Url has_any (
+    "microsoft.com/devicelogin",
+    "aka.ms/devicelogin",
+    "login.microsoftonline.com/common/oauth2/deviceauth",
+    "login.microsoftonline.com/organizations/oauth2/deviceauth",
+    "login.microsoft.com/common/oauth2/deviceauth"
+)
+| project Timestamp, AccountUpn, NetworkMessageId,
+          Url, UrlChain, ActionType, IPAddress,
+          UrlDomain = tostring(parse_url(Url).Host)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. MASS-DISTRIBUTION SIGNATURE — SAME LURE TO MANY RECIPIENTS
+//    PhaaS kits send the same lure template to many recipients
+//    from a small set of senders. Surface bursts.
+// ------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| where Subject has_any (
+    "device code", "device login", "verification code",
+    "complete sign-in", "Microsoft authorization code"
+)
+| summarize
+    DistinctRecipients = dcount(RecipientEmailAddress),
+    DistinctSenders    = dcount(SenderFromAddress),
+    DistinctDomains    = dcount(SenderFromDomain),
+    FirstSeen          = min(Timestamp),
+    LastSeen           = max(Timestamp),
+    SampleSubjects     = make_set(Subject, 5)
+    by Bucket = bin(Timestamp, 1h)
+| where DistinctRecipients >= 5
+| order by DistinctRecipients desc
+
+
+// ------------------------------------------------------------
+// 4. AI-GENERATED PHISHING TEMPLATE FINGERPRINTS
+//    Kali365 ships AI-generated lure templates. Catches
+//    common LLM-template artefacts in subject lines /
+//    attachment names — phrasing that rarely appears in
+//    legitimate Microsoft notifications.
+// ------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(14d)
+| where EmailDirection == "Inbound"
+| where Subject has_any (
+    "your action is required",
+    "kindly verify",
+    "to maintain uninterrupted access",
+    "due to recent security enhancements",
+    "as part of our ongoing commitment",
+    "please complete the verification process",
+    "we have detected unusual activity"
+)
+| project Timestamp, RecipientEmailAddress,
+          SenderFromAddress, SenderFromDomain,
+          Subject, UrlCount, DeliveryAction,
+          ConfidenceLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. DEVICE CODE SUCCESS WITH NO MFA CHALLENGE ON FOLLOW-ON
+//    The Kali365 outcome — a Device Code grant succeeds and
+//    the same account immediately accesses sensitive
+//    resources at AuthenticationRequirement =
+//    singleFactorAuthentication, because the underlying
+//    refresh token already encodes prior MFA.
+// ------------------------------------------------------------
+let DeviceCodeSuccess = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or AuthenticationDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| project AccountObjectId, AccountUpn, DcTime = Timestamp,
+          DcIP = IPAddress, DcCountry = Country;
+let NoMFAResource = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationRequirement =~ "singleFactorAuthentication"
+| where ResourceDisplayName has_any (
+    "Microsoft Graph", "Exchange", "SharePoint", "OneDrive",
+    "Teams", "Outlook", "Azure"
+)
+| project AccountObjectId, AccountUpn, AccessTime = Timestamp,
+          AccessApp = Application,
+          AccessResource = ResourceDisplayName,
+          AccessIP = IPAddress, AccessCountry = Country,
+          AccessUA = UserAgent;
+DeviceCodeSuccess
+| join kind=inner NoMFAResource on AccountObjectId
+| where AccessTime between (DcTime .. (DcTime + 24h))
+| project DcTime, AccessTime, AccountUpn,
+          DcIP, AccessIP, DcCountry, AccessCountry,
+          AccessApp, AccessResource, AccessUA
+| order by DcTime desc
+
+
+// ------------------------------------------------------------
+// 6. NEW IP / USER-AGENT AGAINST DEVICE CODE SUCCESS
+//    First-time (IP, UserAgent) pair seen against a user on
+//    a Device Code success — the Kali365-operator side of
+//    the flow.
+// ------------------------------------------------------------
+let SeenPairs = AADSignInEventsBeta
+| where Timestamp between (ago(30d) .. ago(1d))
+| where ErrorCode == 0
+| summarize by AccountObjectId, IPAddress, UserAgent;
+AADSignInEventsBeta
+| where Timestamp > ago(1d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| join kind=leftanti SeenPairs on AccountObjectId, IPAddress, UserAgent
+| project Timestamp, AccountUpn, IPAddress, Country,
+          UserAgent, Application, ResourceDisplayName,
+          DeviceTrustType, IsCompliant, IsManaged,
+          ConditionalAccessStatus
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. CONDITIONAL ACCESS "NOT APPLIED" ON DEVICE CODE SUCCESS
+//    Gap analysis — Device Code sign-ins to sensitive
+//    resources where CA policies did not apply. These are the
+//    Kali365 success cases inside your tenant.
+// ------------------------------------------------------------
+AADSignInEventsBeta
+| where Timestamp > ago(14d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| where ConditionalAccessStatus =~ "notApplied"
+   or isempty(ConditionalAccessStatus)
+| project Timestamp, AccountUpn, ResourceDisplayName,
+          Application, IPAddress, Country, UserAgent,
+          DeviceTrustType, IsCompliant, IsManaged,
+          ConditionalAccessStatus, RiskLevelDuringSignIn
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. TELEGRAM API EGRESS FROM CORPORATE ENDPOINTS
+//    Kali365 is sold and operated through Telegram. Operators
+//    sometimes mis-configure tooling and call the Bot API
+//    from a victim or test workstation. Surface non-personal
+//    Telegram traffic on managed devices.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "api.telegram.org",
+    "core.telegram.org",
+    "t.me"
+)
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "Telegram.exe", "tdesktop.exe", "TelegramDesktop.exe",
+    "Code.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. TOKEN REPLAY ACROSS MULTIPLE RESOURCES IN MINUTES
+//    Post-token use — a stolen refresh / access token is used
+//    to enumerate Graph, Exchange, SharePoint and OneDrive
+//    in quick succession. Five+ distinct resources within
+//    15 minutes is anomalous for normal interactive use.
+// ------------------------------------------------------------
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has_any ("Device Code", "refreshToken", "Refresh Token")
+   or RawEventData has_any ("deviceCode", "refresh_token")
+| summarize
+    DistinctResources = dcount(ResourceDisplayName),
+    SampleResources   = make_set(ResourceDisplayName, 8),
+    Hits              = count()
+    by AccountUpn, IPAddress, bin(Timestamp, 15m)
+| where DistinctResources >= 5
+| order by DistinctResources desc
+
+
+// ------------------------------------------------------------
+// 10. EMAIL → CLICK → DEVICE CODE SUCCESS — CHAIN MATCH
+//     The cleanest end-to-end PhaaS signature. An inbound
+//     lure to a recipient, followed by a click on a device-
+//     login URL, followed by a Device Code success for the
+//     same user.
+// ------------------------------------------------------------
+let Lures = EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| where Subject has_any (
+    "device code", "device login", "verification code",
+    "complete sign-in", "Microsoft authorization code"
+)
+| project LureTime = Timestamp, Recipient = tolower(RecipientEmailAddress),
+          LureSender = SenderFromAddress, LureSubject = Subject,
+          NetworkMessageId;
+let Clicks = UrlClickEvents
+| where Timestamp > ago(7d)
+| where Url has_any (
+    "microsoft.com/devicelogin", "aka.ms/devicelogin",
+    "login.microsoftonline.com/common/oauth2/deviceauth"
+)
+| project ClickTime = Timestamp, Clicker = tolower(AccountUpn),
+          NetworkMessageId, ClickUrl = Url;
+let DcSuccess = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| project DcTime = Timestamp, DcUser = tolower(AccountUpn),
+          DcIP = IPAddress, DcCountry = Country,
+          DcResource = ResourceDisplayName;
+Lures
+| join kind=inner Clicks on NetworkMessageId
+| where ClickTime between (LureTime .. (LureTime + 24h))
+| join kind=inner DcSuccess on $left.Clicker == $right.DcUser
+| where DcTime between (ClickTime .. (ClickTime + 1h))
+| project LureTime, ClickTime, DcTime,
+          Recipient, LureSender, LureSubject,
+          ClickUrl, DcIP, DcCountry, DcResource
+| order by LureTime desc
+
+
+// ------------------------------------------------------------
+// 11. TENANT-WIDE DEVICE CODE POSTURE SUMMARY
+//     Daily count of Device Code sign-ins per app + per
+//     country. Pin as a saved query — sudden jumps indicate
+//     PhaaS activity reaching your tenant.
+// ------------------------------------------------------------
+AADSignInEventsBeta
+| where Timestamp > ago(30d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| summarize
+    Successes        = count(),
+    DistinctUsers    = dcount(AccountObjectId),
+    DistinctIPs      = dcount(IPAddress),
+    SampleResources  = make_set(ResourceDisplayName, 5)
+    by Application, Country, bin(Timestamp, 1d)
+| order by Timestamp desc, Successes desc
+
+
+// ------------------------------------------------------------
+// 12. RISK-RANKED POSTURE — KALI365 EXPOSURE PER USER
+//     Combines: received a device-code lure, clicked a
+//     device-login URL, had a Device Code success, and had
+//     a no-MFA follow-on resource access — into a per-user
+//     risk score.
+// ------------------------------------------------------------
+let LureUsers = EmailEvents
+| where Timestamp > ago(14d)
+| where EmailDirection == "Inbound"
+| where Subject has_any (
+    "device code", "device login", "verification code"
+)
+| summarize LuresReceived = count() by User = tolower(RecipientEmailAddress);
+let ClickUsers = UrlClickEvents
+| where Timestamp > ago(14d)
+| where Url has_any (
+    "microsoft.com/devicelogin", "aka.ms/devicelogin",
+    "login.microsoftonline.com/common/oauth2/deviceauth"
+)
+| summarize Clicks = count() by User = tolower(AccountUpn);
+let DcUsers = AADSignInEventsBeta
+| where Timestamp > ago(14d)
+| where ErrorCode == 0
+| where AuthenticationProcessingDetails has "Device Code"
+   or RawEventData has "deviceCode"
+| summarize DcSuccesses = count() by User = tolower(AccountUpn);
+let NoMfaUsers = AADSignInEventsBeta
+| where Timestamp > ago(14d)
+| where ErrorCode == 0
+| where AuthenticationRequirement =~ "singleFactorAuthentication"
+| where ResourceDisplayName has_any (
+    "Microsoft Graph", "Exchange", "SharePoint", "OneDrive"
+)
+| summarize SingleFactorHits = count() by User = tolower(AccountUpn);
+LureUsers
+| join kind=fullouter ClickUsers on User
+| join kind=fullouter DcUsers on User
+| join kind=fullouter NoMfaUsers on User
+| extend U = coalesce(User, User1, User2, User3)
+| extend LuresReceived    = coalesce(LuresReceived, 0),
+         Clicks           = coalesce(Clicks, 0),
+         DcSuccesses      = coalesce(DcSuccesses, 0),
+         SingleFactorHits = coalesce(SingleFactorHits, 0)
+| extend RiskScore =
+       iff(LuresReceived    >= 1, 1, 0)
+     + iff(Clicks           >= 1, 2, 0)
+     + iff(DcSuccesses      >= 1, 3, 0)
+     + iff(SingleFactorHits >= 1, 3, 0)
+| where RiskScore >= 3
+| project User = U, LuresReceived, Clicks, DcSuccesses,
+          SingleFactorHits, RiskScore
+| order by RiskScore desc, DcSuccesses desc

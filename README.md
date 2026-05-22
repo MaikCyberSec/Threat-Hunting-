@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **May 2026**
+- [Kali365 PhaaS - OAuth Device Code Phishing-as-a-Service vs Microsoft 365](<Kali365 PhaaS - OAuth Device Code Phishing-as-a-Service vs Microsoft 365 (May 2026)>)
 - [SilverFox ValleyRAT - Fake Microsoft Teams Downloads & GameBox.exe Sideload](<SilverFox ValleyRAT - Fake Microsoft Teams Downloads & GameBox.exe Sideload (May 2026)>)
 - [Nx Console VS Code Extension Compromise - TeamPCP GitHub Internal Repos Breach](<Nx Console VS Code Extension Compromise - TeamPCP GitHub Internal Repos Breach (May 2026)>)
 - [Windows MiniPlasma Zero-Day - Cloud Filter Driver LPE Re-Released (CVE-2020-17103)](<Windows MiniPlasma Zero-Day - Cloud Filter Driver LPE Re-Released (CVE-2020-17103, May 2026)>)
