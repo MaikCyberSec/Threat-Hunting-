@@ -1,0 +1,534 @@
+// ============================================================
+// JINX-0164 — LinkedIn Social Engineering, AUDIOFIX + MINIRAT,
+// Fake "Microsoft Teams / Slack" Meeting Spoofs, Crypto-Org
+// Targeting + @velora-dex/sdk npm Supply Chain
+// Source:   CyberSecurity News / Wiz.io CIRT (May 29 2026)
+// Platform: Microsoft Defender for Endpoint on Windows + macOS
+//           (Advanced Hunting)
+// MITRE ATT&CK: T1566, T1598, T1556, T1005, T1115, T1187,
+//               T1056, T1056.004, T1555, T1056.001, T1041,
+//               T1547.013, T1547.015, T1195.002
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Wiz disclosed JINX-0164, a financially-motivated cluster
+// active since mid-2025 that targets cryptocurrency
+// organisations via LinkedIn social engineering. Fake-recruiter
+// profiles message engineers with job-offer pretexts; the
+// interview invitation links to a spoofed "Microsoft Teams"
+// or "Slack" page; the candidate is told to install a missing
+// codec or driver to join — that's the dropper.
+//
+// Two main malware families:
+//
+//   - AUDIOFIX  (Python-compiled, ARM64 / x86_64) — info-stealer
+//     and backdoor. Masquerades as macOS coreaudiod or as
+//     "ChromeUpdater". Persistence via LaunchAgent plists named
+//     after Microsoft Teams / Aircall helpers. AES-256-CBC C2
+//     with the *shared* embedded key
+//     "v59l2uwlow9s1ebuscgfg9k9r4voxkbs".
+//
+//   - MINIRAT   (Go-based, lightweight) — persistent shell,
+//     command execution, file movement. LaunchAgent disguised
+//     as "com.apple.Terminal.profiler". Delivered via a
+//     trojanised npm package "@velora-dex/sdk@4.9.1" published
+//     April 7 2026, with malicious code in a preinstall hook
+//     and "nord-stream@localhost.com" git-metadata
+//     impersonation in branch "dev_remote_ea5Eu/test/v1".
+//
+// Operator-side infra is routed via Astrill VPN (a DPRK
+// fingerprint historically), ExpressVPN and Mullvad.
+//
+// IOCs — NETWORK
+// ---------------------------------------------------------------
+//   C2:
+//     datahub[.]ink       208.115.220.17, 185.175.59.85
+//     cloud-sync[.]online
+//     byte-io[.]us
+//   Payload delivery:
+//     apple[.]driver-store[.]com
+//     apple[.]driver-update[.]io
+//     driver-updater[.]net, driver-hub[.]net, drvstore[.]com
+//   Meeting spoof:
+//     bitget-meeting[.]com, teamicrosoft[.]com, teams[.]cam,
+//     live[.]us[.]org, us03-slack[.]online, live[.]ong
+//   Delivery / support IPs:
+//     89.36.224.5, 185.100.85.250, 84.32.83.250,
+//     153.92.126.84, 45.45.217.242, 163.172.53.20
+//
+// IOCs — HASHES (SHA256)
+// ---------------------------------------------------------------
+//   MINIRAT:
+//     0a8ab3d16b12d3a453ee5a3208fe04744ad54514ef8ea27bb8fe32679efad270
+//     0b028b781950641818800fee2b4bf68e4ef2bcee53fe71a21755275ba10875f5
+//     a35d2b67fa478a7174e308b43ce30bf69b3bc6f44fa76197fdf95fc2fbc1cf7d
+//   AUDIOFIX:
+//     65cba741fe30fa4799fb9002ea8de6d96042a59159dd7c3419c766af24c7a8b4
+//     0b1a36a31b952341a534fe24890f1ed2921ee259773cff46e4f6273b8c4d5e3a
+//     e8ee6f5145c9d503c5130bfc6585567f6e19d409158c3c0ca0b259f1875b1a2f
+//     3e3901519c2305fbe9d5483b7234c25c6d2b562512916481d96f26b849c7d4e1
+//   Droppers:
+//     9c2ce925133a3bf5a924063bbef8df49918d5b7258695c1894cd18c75970157a
+//     402625ec79e3573a80b6de9b33fc1e503e3c7803603cd958ddd515fb0e4a3c91
+//     b6cab0b3aa8e56e2427f486c74588d598ae58bb0cbc0eda6939fe171cb4f2d89
+//     d4e863f9818bfb2f1dd932df6441dff204e6142c3bdb55b298cb08dc7b6a9f12
+//     c6ef82d2864dfd26f117a1ef5602679153423f2742970a7949cec72722f0a0b3
+//     2a10ffe0367bb1b26ba2c3bc600892c21074725c0b8c9dc9161e6ceb339f4d5c
+//
+// PERSISTENCE PATHS (macOS)
+// ---------------------------------------------------------------
+//   ~/Library/LaunchAgents/com.microsoft.teams.coreaudiod.plist
+//   ~/Library/LaunchAgents/io.aircall.workspace.helper.plist
+//   ~/Library/LaunchAgents/com.apple.Terminal.profiler.plist
+//
+// EXFIL ARTEFACTS
+// ---------------------------------------------------------------
+//   ~/.zsh_cache   (XOR-encoded stolen macOS passwords)
+//   /helper.log    (activity log)
+//   /tokens.txt    (Discord tokens)
+//   /clip          (clipboard capture dump)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Genuine npm packages from @velora-dex (any version OTHER
+//     than v4.9.1 published 7 April 2026).
+//   - Real Astrill / ExpressVPN / Mullvad clients on user-owned
+//     BYOD — tune by corporate vs personal device.
+//   - Aircall / MS Teams legitimate helper LaunchAgents — pin
+//     the exact filename "io.aircall.workspace.helper.plist"
+//     against the real Aircall installer signer.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/jinx-0164-threat-actor-using-linkedin-social-engineering/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN SHA256 HASHES (FILE + PROCESS + IMAGE LOAD)
+//    Direct hit on the 13 documented SHA256s — surfaces any
+//    Windows/macOS endpoint that touched any sample.
+// ------------------------------------------------------------
+let Jinx_SHA256 = dynamic([
+    // MINIRAT
+    "0a8ab3d16b12d3a453ee5a3208fe04744ad54514ef8ea27bb8fe32679efad270",
+    "0b028b781950641818800fee2b4bf68e4ef2bcee53fe71a21755275ba10875f5",
+    "a35d2b67fa478a7174e308b43ce30bf69b3bc6f44fa76197fdf95fc2fbc1cf7d",
+    // AUDIOFIX
+    "65cba741fe30fa4799fb9002ea8de6d96042a59159dd7c3419c766af24c7a8b4",
+    "0b1a36a31b952341a534fe24890f1ed2921ee259773cff46e4f6273b8c4d5e3a",
+    "e8ee6f5145c9d503c5130bfc6585567f6e19d409158c3c0ca0b259f1875b1a2f",
+    "3e3901519c2305fbe9d5483b7234c25c6d2b562512916481d96f26b849c7d4e1",
+    // Droppers
+    "9c2ce925133a3bf5a924063bbef8df49918d5b7258695c1894cd18c75970157a",
+    "402625ec79e3573a80b6de9b33fc1e503e3c7803603cd958ddd515fb0e4a3c91",
+    "b6cab0b3aa8e56e2427f486c74588d598ae58bb0cbc0eda6939fe171cb4f2d89",
+    "d4e863f9818bfb2f1dd932df6441dff204e6142c3bdb55b298cb08dc7b6a9f12",
+    "c6ef82d2864dfd26f117a1ef5602679153423f2742970a7949cec72722f0a0b3",
+    "2a10ffe0367bb1b26ba2c3bc600892c21074725c0b8c9dc9161e6ceb339f4d5c"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (Jinx_SHA256)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine = ""
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (Jinx_SHA256)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where SHA256 in (Jinx_SHA256)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DOCUMENTED C2 / DELIVERY / MEETING-SPOOF DOMAINS + IPs
+//    Direct match on every documented infrastructure node.
+// ------------------------------------------------------------
+let Jinx_Domains = dynamic([
+    "datahub.ink",
+    "cloud-sync.online",
+    "byte-io.us",
+    "apple.driver-store.com",
+    "apple.driver-update.io",
+    "driver-updater.net",
+    "driver-hub.net",
+    "drvstore.com",
+    "bitget-meeting.com",
+    "teamicrosoft.com",
+    "teams.cam",
+    "live.us.org",
+    "us03-slack.online",
+    "live.ong"
+]);
+let Jinx_IPs = dynamic([
+    "208.115.220.17", "185.175.59.85",
+    "89.36.224.5",
+    "185.100.85.250", "84.32.83.250",
+    "153.92.126.84", "45.45.217.242", "163.172.53.20"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteIP in (Jinx_IPs)
+   or RemoteUrl has_any (Jinx_Domains)
+   or tostring(parse_url(RemoteUrl).Host) in (Jinx_Domains)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. MALICIOUS LAUNCHAGENT PLIST PATHS (macOS)
+//    The three documented persistence files, plus the broader
+//    "Microsoft Teams / Aircall / Apple Terminal" masquerade
+//    pattern in ~/Library/LaunchAgents/.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has "/Library/LaunchAgents"
+| where FileName in~ (
+    "com.microsoft.teams.coreaudiod.plist",
+    "io.aircall.workspace.helper.plist",
+    "com.apple.Terminal.profiler.plist"
+)
+   or (FileName has_any ("coreaudiod", "Terminal.profiler", "aircall.workspace")
+       and FileName endswith ".plist")
+| where InitiatingProcessFileName !in~ (
+    "installer", "Installer", "system_installd",
+    "softwareupdated", "softwareupdate",
+    "jamfdaemon", "kandji-agent", "mosyleagent",
+    "Microsoft Teams", "Microsoft AutoUpdate",
+    "Aircall.app", "Aircall"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. "ChromeUpdater" / "coreaudiod" MASQUERADE OUTSIDE
+//    SYSTEM PATHS
+//    AUDIOFIX masquerades as macOS coreaudiod and is saved as
+//    ChromeUpdater. coreaudiod normally lives under
+//    /System/Library/Frameworks. Any binary with these names
+//    outside the trusted system paths is suspect.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FileName in~ ("coreaudiod", "ChromeUpdater")
+       or FileName endswith "ChromeUpdater"
+    | where not (FolderPath startswith "/System/Library/")
+    | where not (FolderPath startswith @"C:\Program Files\Google\Chrome")
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ ("coreaudiod", "ChromeUpdater")
+       or FileName endswith "ChromeUpdater"
+    | where not (FolderPath startswith "/System/Library/")
+    | where not (FolderPath startswith @"C:\Program Files\Google\Chrome")
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. EMBEDDED AES-256-CBC KEY STRING
+//    "v59l2uwlow9s1ebuscgfg9k9r4voxkbs" is the shared C2 key
+//    inside AUDIOFIX. Any cmdline / file containing this
+//    string is a direct hit.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has "v59l2uwlow9s1ebuscgfg9k9r4voxkbs"
+       or InitiatingProcessCommandLine has "v59l2uwlow9s1ebuscgfg9k9r4voxkbs"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has "v59l2uwlow9s1ebuscgfg9k9r4voxkbs"
+       or FolderPath has "v59l2uwlow9s1ebuscgfg9k9r4voxkbs"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. TROJANISED npm PACKAGE @velora-dex/sdk@4.9.1
+//    Catches install / import of the malicious version
+//    published April 7 2026, plus references to the actor's
+//    git-metadata signature.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(90d)
+    | where ProcessCommandLine has_any (
+        "@velora-dex/sdk@4.9.1",
+        "@velora-dex/sdk",
+        "velora-dex",
+        "nord-stream",
+        "nord-stream@localhost.com",
+        "dev_remote_ea5Eu"
+    )
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(90d)
+    | where FolderPath has @"\node_modules\@velora-dex\sdk"
+       or FolderPath has "/node_modules/@velora-dex/sdk"
+       or FileName has_any ("nord-stream", "velora-dex")
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. DRIVER-UPDATE / DRIVER-STORE LOOKALIKE DOMAIN ACCESS
+//    Broader heuristic — catches the actor's adjacent
+//    delivery domains beyond the six specifically documented.
+//    "Driver update" lookalike domains are how the LinkedIn
+//    fake-meeting "missing codec" pretext lands.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| extend Host = tolower(tostring(parse_url(RemoteUrl).Host))
+| where Host matches regex @"^(apple\.)?(driver|drv)[-.]?(store|update|updater|hub)[\.\-][a-z]{2,}$"
+   or Host has_any ("driver-store", "driver-update", "driver-updater", "driver-hub", "drvstore")
+| where not (Host endswith "apple.com" or Host endswith "microsoft.com")
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl, Host
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. EXFIL ARTEFACT FILES — .zsh_cache / helper.log / tokens.txt / clip
+//    File-event hits on the four documented exfil staging
+//    files. Highly specific.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ (".zsh_cache", "helper.log", "tokens.txt", "clip")
+| where InitiatingProcessFileName !in~ (
+    "git.exe", "git", "Code.exe", "cursor.exe",
+    "msedge.exe", "chrome.exe", "firefox.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. ASTRILL / EXPRESSVPN / MULLVAD PROCESS PRESENCE ON
+//    CORPORATE ENDPOINTS
+//    Operator-side fingerprint — JINX-0164 routes via these
+//    commercial VPNs. Astrill in particular is a long-standing
+//    DPRK / Lazarus operator marker. Pair with sign-ins or
+//    file activity in the same window for high fidelity.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any (
+    "AstrillVPN", "astrill",
+    "ExpressVPN", "expressvpn",
+    "Mullvad", "mullvad",
+    "MullvadVPN"
+)
+   or ProcessVersionInfoOriginalFileName has_any ("Astrill", "ExpressVPN", "Mullvad")
+   or ProcessVersionInfoCompanyName has_any ("Astrill", "ExpressVPN", "Mullvad")
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessVersionInfoCompanyName, ProcessVersionInfoOriginalFileName,
+          InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. CRYPTO WALLET / BROWSER CREDENTIAL ACCESS BY NON-BROWSER
+//    PROCESS
+//    AUDIOFIX's primary objective. Surfaces non-browser
+//    processes reading the common wallet extension stores
+//    plus Login Data / Cookies / Local State across browsers.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where (FileName in~ ("Login Data", "Cookies", "Local State", "Web Data",
+                        "logins.json", "key4.db", "cookies.sqlite",
+                        "wallet.dat", "metamask", "phantom", "trezor"))
+   or FolderPath has_any (
+        @"\Local Extension Settings\nkbihfbeogaeaoehlefnkodbefgpgknn",  // MetaMask Chrome
+        @"\Local Extension Settings\bfnaelmomeimhlpmgjnjophhpkkoljpa",  // Phantom Chrome
+        "Library/Application Support/Exodus",
+        "Library/Application Support/Electrum",
+        "Library/Application Support/Atomic",
+        @"\Ethereum\keystore",
+        @"\Exodus\exodus.wallet"
+   )
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "OneDrive.exe", "explorer.exe",
+    "SearchIndexer.exe", "MsMpEng.exe", "MpDefenderCoreService.exe",
+    "MicrosoftEdgeUpdate.exe", "Bitwarden.exe",
+    "Safari", "Google Chrome", "Firefox"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. NPM INSTALL → SHELL FROM NODE_MODULES (PREINSTALL HOOK)
+//    The @velora-dex/sdk@4.9.1 path lands shell execution
+//    from inside node_modules. Catches the structural
+//    hook-abuse pattern even on renamed packages.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFolderPath has @"node_modules"
+| where FileName in~ (
+    "sh", "bash", "dash", "zsh",
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "curl.exe", "curl", "wget", "wget.exe",
+    "node.exe", "node"
+)
+| where ProcessCommandLine has_any (
+    "curl ", "wget ", "Invoke-WebRequest",
+    "node -e", "bash -c", "sh -c",
+    "FromBase64String", "IEX", "Invoke-Expression",
+    "preinstall", "postinstall"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Driver-update lookalike domain access → dropper file
+//     write → LaunchAgent persistence plist → outbound to
+//     documented C2, same device within a 4-hour window.
+// ------------------------------------------------------------
+let Stage1_Lure = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "apple.driver-store.com", "apple.driver-update.io",
+    "driver-updater.net", "driver-hub.net", "drvstore.com",
+    "bitget-meeting.com", "teamicrosoft.com", "teams.cam",
+    "live.us.org", "us03-slack.online", "live.ong"
+)
+| project DeviceName, LureTime = Timestamp,
+          LureProc = InitiatingProcessFileName,
+          LureUrl = RemoteUrl;
+let Stage2_Dropper = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("coreaudiod", "ChromeUpdater")
+   or SHA256 in (
+        "9c2ce925133a3bf5a924063bbef8df49918d5b7258695c1894cd18c75970157a",
+        "402625ec79e3573a80b6de9b33fc1e503e3c7803603cd958ddd515fb0e4a3c91",
+        "b6cab0b3aa8e56e2427f486c74588d598ae58bb0cbc0eda6939fe171cb4f2d89",
+        "d4e863f9818bfb2f1dd932df6441dff204e6142c3bdb55b298cb08dc7b6a9f12",
+        "c6ef82d2864dfd26f117a1ef5602679153423f2742970a7949cec72722f0a0b3",
+        "2a10ffe0367bb1b26ba2c3bc600892c21074725c0b8c9dc9161e6ceb339f4d5c"
+   )
+| project DeviceName, DropTime = Timestamp,
+          DropFile = FileName, DropPath = FolderPath, DropSha = SHA256;
+let Stage3_Persist = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath has "/Library/LaunchAgents"
+| where FileName endswith ".plist"
+| where (FileName has_any ("coreaudiod", "Terminal.profiler", "aircall.workspace")
+         or FileName in~ ("com.microsoft.teams.coreaudiod.plist",
+                          "io.aircall.workspace.helper.plist",
+                          "com.apple.Terminal.profiler.plist"))
+| project DeviceName, PersistTime = Timestamp,
+          PlistName = FileName, PlistPath = FolderPath;
+let Stage4_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIP in ("208.115.220.17", "185.175.59.85",
+                      "89.36.224.5", "185.100.85.250",
+                      "84.32.83.250", "153.92.126.84",
+                      "45.45.217.242", "163.172.53.20")
+   or RemoteUrl has_any ("datahub.ink", "cloud-sync.online", "byte-io.us")
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_Lure
+| join kind=inner Stage2_Dropper on DeviceName
+| where DropTime between (LureTime .. (LureTime + 1h))
+| join kind=leftouter Stage3_Persist on DeviceName
+| where PersistTime between (DropTime .. (DropTime + 1h))
+| join kind=leftouter Stage4_C2 on DeviceName
+| where C2Time between (DropTime .. (DropTime + 4h))
+| project LureTime, DropTime, PersistTime, C2Time,
+          DeviceName,
+          LureProc, LureUrl,
+          DropFile, DropPath, DropSha,
+          PlistName, PlistPath,
+          C2Proc, C2_IP, C2_Url
+| order by LureTime desc
