@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **May 2026**
+- [The Gentlemen Ransomware - Fortinet CVE-2024-55591 & G-BOT C2](<The Gentlemen Ransomware - Fortinet CVE-2024-55591 & G-BOT C2 (May 2026)>)
 - [Jinx-0164 LinkedIn Social Engineering - AUDIOFIX & MINIRAT vs Crypto Orgs](<Jinx-0164 LinkedIn Social Engineering - AUDIOFIX & MINIRAT vs Crypto Orgs (May 2026)>)
 - [Kali365 PhaaS - OAuth Device Code Phishing-as-a-Service vs Microsoft 365](<Kali365 PhaaS - OAuth Device Code Phishing-as-a-Service vs Microsoft 365 (May 2026)>)
 - [SilverFox ValleyRAT - Fake Microsoft Teams Downloads & GameBox.exe Sideload](<SilverFox ValleyRAT - Fake Microsoft Teams Downloads & GameBox.exe Sideload (May 2026)>)
