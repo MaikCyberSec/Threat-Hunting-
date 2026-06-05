@@ -1,0 +1,406 @@
+// ============================================================
+// VECT 2.0 (DEVMAN 3.0) — Ransomware whose Decryptor Cannot
+// Decrypt: Catch It BEFORE the .vect Rename Finishes
+// Source:   CyberSecurity News / Morphisec (June 5 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1486, T1490, T1083, T1059.001, T1112,
+//               T1562.001
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Morphisec disclosed VECT 2.0 (also branded DEVMAN 3.0), a
+// 64-bit Windows PE ransomware whose encryption pipeline is so
+// badly broken that even paying the ransom does NOT recover
+// files. The crew is shipping the locker anyway.
+//
+// Key implementation defects (defender-relevant):
+//
+//   1) The .vect extension is appended to the target file
+//      BEFORE encryption starts. The malware renames first
+//      and only then opens the file to overwrite its content.
+//      That gives endpoint defenders an unusually clean early-
+//      warning signal: a burst of *.vect renames precedes any
+//      actual encryption.
+//
+//   2) Files larger than 128 KB are split into four 32 KB
+//      blocks each encrypted with a different ChaCha20-IETF
+//      key — but only the LAST key is persisted to disk.
+//      Three quarters of large files are therefore destroyed
+//      irrecoverably.
+//
+//   3) Files in the 32-128 KB band fail mid-encryption because
+//      the destination buffer is undersized. The result is
+//      partial corruption with no recovery path.
+//
+//   4) Threads share global buffers and race against each
+//      other, occasionally trashing one another's filenames
+//      and content.
+//
+//   5) Only a 12-byte trailer (the last ChaCha20 nonce) is
+//      written. No version field, no chunk map, no original
+//      file size. Even with the key, recovery is impossible
+//      for split files.
+//
+// Morphisec's bottom line: "Behavioural endpoint protection is
+// far better suited to catching this threat early in the chain.
+// Once files have been processed by VECT, even paying the
+// ransom offers no guarantee of a full recovery."
+//
+// This pack therefore HUNTS THE BEHAVIOURAL CHAIN — there are
+// no hashes, no C2 IPs and no ransom-note filename disclosed.
+// The first three queries are designed to trigger before the
+// encryptor finishes its first batch of files.
+//
+// IOCs (DISCLOSED)
+// ---------------------------------------------------------------
+//   .vect          (file extension appended pre-encryption)
+//   DEVMAN 3.0     (alternate branding)
+//   ChaCha20-IETF  (encryption scheme; 12-byte nonce)
+//   64-bit PE      (Windows binary type)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate developer projects that happen to use a .vect
+//     extension (vector files in some graphics workflows).
+//     Pair the rename-volume signal with directory-spread
+//     to suppress.
+//   - Backup or archival tools that rename files in bulk —
+//     pin to known signers and paths.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/vect-2-0-ransomware-can-damage-files-its-own-decryptor/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. ".vect" FILE RENAME / CREATION EVENTS
+//    The single highest-fidelity early-warning signal in this
+//    pack. The malware writes .vect BEFORE encryption starts,
+//    so renames here race ahead of the actual data loss.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileRenamed", "FileCreated", "FileModified")
+| where FileName endswith ".vect"
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          PreviousFileName, PreviousFolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. MASS .vect RENAME BURST BY ONE PROCESS
+//    A single process renaming dozens of files to .vect inside
+//    a short window — the encryption-pipeline start. Tuned
+//    conservatively (10 renames / 5 minutes / 3 folders);
+//    drop the thresholds further on a quiet host.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileRenamed", "FileModified", "FileCreated")
+| where FileName endswith ".vect"
+| summarize
+    RenameCount      = count(),
+    DistinctFolders  = dcount(FolderPath),
+    DistinctOriginalExt = dcount(extract(@"\.([^.]+)$", 1, tostring(PreviousFileName))),
+    FirstSeen        = min(Timestamp),
+    LastSeen         = max(Timestamp),
+    SampleFiles      = make_set(FileName, 10)
+    by DeviceName, InitiatingProcessFileName,
+       InitiatingProcessId, bin(Timestamp, 5m)
+| where RenameCount >= 10 and DistinctFolders >= 3
+| order by RenameCount desc
+
+
+// ------------------------------------------------------------
+// 3. FILES RENAMED FROM ORIGINAL EXTENSION → .vect
+//    Confirms the rename direction (good-doc → .vect) rather
+//    than legitimate writes of .vect files. Pivots on
+//    PreviousFileName so it can ignore .vect→.vect noise.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType == "FileRenamed"
+| where FileName endswith ".vect"
+| where PreviousFileName != ""
+   and not (PreviousFileName endswith ".vect")
+| extend OriginalExt = tolower(extract(@"\.([^.]+)$", 1, tostring(PreviousFileName)))
+| where OriginalExt in~ (
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "pdf", "rtf", "txt", "csv",
+    "zip", "rar", "7z", "tar", "gz",
+    "sql", "mdb", "bak", "db", "sqlite",
+    "vhd", "vhdx", "vmdk", "ova",
+    "jpg", "jpeg", "png", "tiff", "psd",
+    "mp3", "mp4", "mov", "avi",
+    "ai", "eps", "indd"
+)
+| project Timestamp, DeviceName, AccountName,
+          PreviousFileName, FileName, FolderPath,
+          OriginalExt,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. "DEVMAN" STRING SWEEP
+//    Catches the DEVMAN 3.0 alternate branding wherever it
+//    appears — cmdlines, filenames, folder paths or ransom
+//    note artefacts.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName has "DEVMAN"
+       or ProcessCommandLine has_any ("DEVMAN", "DEVMAN 3.0", "DEVMAN3")
+       or InitiatingProcessCommandLine has_any ("DEVMAN", "DEVMAN 3.0")
+       or ProcessVersionInfoOriginalFileName has "DEVMAN"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has "DEVMAN"
+       or FolderPath has "DEVMAN"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. CROSS-DIRECTORY FILE MUTATION BY ONE PROCESS
+//    VECT performs wide directory traversal with a short
+//    exclusion list. A single process modifying files across
+//    20+ distinct folders in under 10 minutes is consistent
+//    with the locker enumeration step — even before any .vect
+//    extension appears on disk.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileModified", "FileRenamed")
+| summarize
+    Mutations      = count(),
+    Folders        = dcount(FolderPath),
+    DistinctFiles  = dcount(FileName),
+    FirstSeen      = min(Timestamp),
+    LastSeen       = max(Timestamp)
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessId,
+       bin(Timestamp, 10m)
+| where Folders >= 20 and Mutations >= 100
+| extend WindowSec = datetime_diff('second', LastSeen, FirstSeen)
+| where WindowSec <= 1200
+| order by Folders desc
+
+
+// ------------------------------------------------------------
+// 6. HIGH-VALUE TARGET-FILE READ BURST
+//    Catches the enumeration phase against the file classes
+//    VECT prioritises — documents, databases, virtual disks,
+//    backups, archives. A burst of OPENS across these
+//    extensions from a non-application process is the read-
+//    ahead step before mass mutation.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(24h)
+| where ActionType == "FileModified"
+| extend Ext = tolower(extract(@"\.([^.]+)$", 1, tostring(FileName)))
+| where Ext in~ (
+    "doc","docx","xls","xlsx","ppt","pptx","pdf",
+    "zip","rar","7z","tar","gz",
+    "sql","mdb","bak","db","sqlite",
+    "vhd","vhdx","vmdk","ova",
+    "psd","ai","indd"
+)
+| summarize Touches = count(), DistinctFolders = dcount(FolderPath),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            SampleExts = make_set(Ext, 8)
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessId,
+       bin(Timestamp, 10m)
+| where Touches >= 100 and DistinctFolders >= 10
+| order by Touches desc
+
+
+// ------------------------------------------------------------
+// 7. SHADOW COPY DELETION / BACKUP TAMPERING
+//    Generic ransomware pre-encryption move. Catches it for
+//    VECT and for every other locker.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where (FileName =~ "vssadmin.exe"
+         and ProcessCommandLine has_any ("delete shadows", "delete catalog"))
+   or (FileName =~ "wmic.exe"
+       and ProcessCommandLine has "shadowcopy" and ProcessCommandLine has "delete")
+   or (FileName =~ "wbadmin.exe"
+       and ProcessCommandLine has_any ("delete catalog", "delete backup", "delete systemstatebackup"))
+   or (FileName =~ "bcdedit.exe"
+       and ProcessCommandLine has_any ("recoveryenabled no", "bootstatuspolicy ignoreallfailures"))
+   or (FileName in~ ("powershell.exe", "pwsh.exe")
+       and ProcessCommandLine has_any (
+            "Remove-WmiObject -Class Win32_ShadowCopy",
+            "Get-WmiObject Win32_Shadowcopy",
+            "Get-CimInstance Win32_Shadowcopy"
+       ))
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. CHACHA20 / NONCE-WRITE FINGERPRINTS IN POWERSHELL OR .NET
+//    Catches script-wrapped builds. The 12-byte nonce + ChaCha
+//    keywords are diagnostic of the VECT encryption scheme.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe",
+                           "InstallUtil.exe", "RegAsm.exe", "MSBuild.exe",
+                           "csc.exe", "node.exe", "python.exe")
+    | where ProcessCommandLine has_any (
+        "ChaCha20", "ChaCha20IETF", "chacha20-ietf",
+        "ChaCha20Poly1305", "Chacha20",
+        "ietf nonce", "12-byte nonce",
+        "ChaChaEngine"
+    )
+    | extend Body = ProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("PowerShellCommand", "ScriptContent")
+    | extend Body = tostring(parse_json(AdditionalFields).Command)
+    | where isnotempty(Body)
+    | where Body has_any ("ChaCha20", "ChaCha20IETF", "ChaCha20Poly1305")
+)
+| project Timestamp, DeviceName, FileName,
+          InitiatingProcessFileName, Body
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. RANSOM-NOTE / README ARTEFACTS WIDELY DROPPED
+//    Catches generic ransom-note drops (the article does not
+//    name the VECT note filename, so this is broad). Surfaces
+//    any .txt / .html / .hta file with "ransom" / "decrypt" /
+//    "recover" / "your files" in the name dropped across many
+//    folders by a single process.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".txt" or FileName endswith ".html"
+   or FileName endswith ".hta" or FileName endswith ".htm"
+| where FileName has_any (
+    "READ_ME", "README", "HOW_TO", "DECRYPT", "RECOVER",
+    "YOUR_FILES", "ransom", "RANSOM", "VECT", "vect",
+    "DEVMAN", "decryptor"
+)
+| summarize DropCount = count(),
+            DistinctFolders = dcount(FolderPath),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            SampleNames = make_set(FileName, 8)
+    by DeviceName, InitiatingProcessFileName, bin(Timestamp, 30m)
+| where DropCount >= 5 and DistinctFolders >= 3
+| order by DropCount desc
+
+
+// ------------------------------------------------------------
+// 10. DEFENDER DISABLE / EXCLUSION ADDED IMMEDIATELY BEFORE
+//     LARGE FILE WRITES
+//     Generic pre-encryption defence-evasion move. Pair with
+//     queries #2 / #5 to confirm the window matches.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+| where ProcessCommandLine has_any (
+    "Add-MpPreference", "Set-MpPreference",
+    "DisableRealtimeMonitoring",
+    "Set-MpPreference -DisableRealtimeMonitoring",
+    "ExclusionPath", "ExclusionProcess", "ExclusionExtension"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. PROCESS HEAVILY MULTITHREADED + WIDE DIRECTORY TRAVERSAL
+//     Combines queries #5 and #6 angles. Surfaces single
+//     parent ProcessIDs producing simultaneous file activity
+//     across many folders — VECT's race-prone worker pool.
+// ------------------------------------------------------------
+let WideMutation = DeviceFileEvents
+| where Timestamp > ago(24h)
+| where ActionType in ("FileModified", "FileRenamed", "FileCreated")
+| summarize
+    Mutations = count(),
+    Folders   = dcount(FolderPath),
+    DistinctExts = dcount(tolower(extract(@"\.([^.]+)$", 1, tostring(FileName))))
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessId, bin(Timestamp, 5m)
+| where Folders >= 15 and Mutations >= 200;
+let RenameToVect = DeviceFileEvents
+| where Timestamp > ago(24h)
+| where FileName endswith ".vect"
+| summarize VectRenames = count() by DeviceName, InitiatingProcessFileName, InitiatingProcessId;
+WideMutation
+| join kind=inner RenameToVect on DeviceName, InitiatingProcessFileName, InitiatingProcessId
+| project DeviceName, InitiatingProcessFileName, InitiatingProcessId,
+          Mutations, Folders, DistinctExts, VectRenames
+| order by Mutations desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (CATCH-IT-EARLY HIGH FIDELITY)
+//     Shadow-copy delete OR Defender exclusion → mass .vect
+//     rename burst, same device + same process lineage,
+//     within a 30-minute window. This is your STOP-THE-
+//     ENCRYPTOR alert. Pin it as a custom detection.
+// ------------------------------------------------------------
+let Stage1_Pre = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where (FileName =~ "vssadmin.exe" and ProcessCommandLine has "delete shadows")
+   or (FileName =~ "wbadmin.exe" and ProcessCommandLine has "delete")
+   or (FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+       and ProcessCommandLine has_any (
+            "Add-MpPreference", "Set-MpPreference",
+            "DisableRealtimeMonitoring"
+       ))
+| project DeviceName, PreTime = Timestamp,
+          PreFile = FileName, PreCmd = ProcessCommandLine,
+          PreParent = InitiatingProcessFileName;
+let Stage2_VectRename = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName endswith ".vect"
+| summarize VectRenames = count(),
+            DistinctFolders = dcount(FolderPath),
+            FirstRename = min(Timestamp),
+            LastRename  = max(Timestamp)
+    by DeviceName, InitiatingProcessFileName
+| where VectRenames >= 10 and DistinctFolders >= 3;
+Stage1_Pre
+| join kind=inner Stage2_VectRename on DeviceName
+| where FirstRename between (PreTime .. (PreTime + 30m))
+| project PreTime, FirstRename, LastRename,
+          DeviceName,
+          PreFile, PreCmd, PreParent,
+          VectRenames, DistinctFolders,
+          InitiatingProcessFileName
+| order by PreTime desc

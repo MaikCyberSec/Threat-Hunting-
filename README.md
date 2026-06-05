@@ -35,6 +35,9 @@ All queries are built for:
 
 ### Recent Additions
 
+**June 2026**
+- [Vect 2.0 DEVMAN 3.0 - Broken Ransomware Decryptor & Race Conditions](<Vect 2.0 DEVMAN 3.0 - Broken Ransomware Decryptor & Race Conditions (June 2026)>)
+
 **May 2026**
 - [The Gentlemen Ransomware - Fortinet CVE-2024-55591 & G-BOT C2](<The Gentlemen Ransomware - Fortinet CVE-2024-55591 & G-BOT C2 (May 2026)>)
 - [Jinx-0164 LinkedIn Social Engineering - AUDIOFIX & MINIRAT vs Crypto Orgs](<Jinx-0164 LinkedIn Social Engineering - AUDIOFIX & MINIRAT vs Crypto Orgs (May 2026)>)
