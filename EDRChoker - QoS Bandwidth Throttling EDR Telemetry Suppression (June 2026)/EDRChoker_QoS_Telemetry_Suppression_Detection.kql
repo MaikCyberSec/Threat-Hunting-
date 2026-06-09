@@ -1,0 +1,386 @@
+// ============================================================
+// EDRCHOKER — QoS-Based Bandwidth Throttling to Suppress EDR
+// Telemetry (pacer.sys NDIS LWF; "EDR mute" without WFP)
+// Source:   Zero Salarium / Two Seven One Three (@TwoSevenOneT)
+//           https://github.com/TwoSevenOneT/EDRChoker
+//           Published June 7 2026.
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1562.001 (Impair Defenses: Disable or Modify
+//               Tools), T1562.004 (Disable or Modify System
+//               Firewall — applied loosely to QoS), T1059.001,
+//               T1112
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// EDRChoker is a public technique that abuses Windows' built-in
+// policy-based Quality of Service (QoS) to choke an EDR
+// agent's outbound bandwidth to as little as 8 BITS per second,
+// forcing connection timeouts every time the agent tries to
+// upload telemetry. The result: the agent looks alive locally
+// but cannot reach its backend. The SOC sees no alert because
+// no alert ever leaves the box.
+//
+// The clever part — and what makes EDRChoker so dangerous — is
+// where in the network stack the throttling happens:
+//
+//   Application → tcpip.sys → WFP → NDIS boundary → pacer.sys → NIC
+//
+// Previous EDR-muting tools (EDRSilencer and friends) installed
+// WFP filters at Layer 3. WFP generates packet-block / packet-
+// drop events that most EDRs already monitor. EDRChoker drops
+// down to pacer.sys at the NDIS layer — BELOW WFP — where the
+// only artefact is a benign-looking PowerShell QoS policy
+// invocation.
+//
+// THE PRIMITIVE
+// ---------------------------------------------------------------
+//   PowerShell:
+//     New-NetQosPolicy -AppPathNameMatchCondition <edr.exe> \
+//       -ThrottleRateActionBitsPerSecond 8
+//
+//   Registry persistence (typical):
+//     HKLM\SOFTWARE\Policies\Microsoft\Windows\QoS\<name>
+//     HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\QoS
+//
+//   Driver involved: pacer.sys (NDIS Lightweight Filter)
+//
+// AUTHOR QUOTE
+//   "If we limit their bandwidth to a very low rate (under
+//    1 KB/s), we can cause the EDR agent to time out whenever
+//    it tries to send any packet to the server."
+//
+// VENDOR-AGNOSTIC TARGETING
+// ---------------------------------------------------------------
+// The PoC reads a list of EDR process names from a file and
+// applies one QoS policy per name. Demonstrated against Elastic
+// Defend but works against any EDR. This pack therefore hunts
+// the QoS *primitive* and any QoS policy whose AppName filter
+// matches a known EDR binary.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate IT applying QoS for video-conferencing apps
+//     (Teams, Zoom) or backup tooling. Pin known app names.
+//   - GPO-pushed QoS at scale — record the policy template
+//     so per-host deviations stand out.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://www.zerosalarium.com/2026/06/edrchoker-choking-telemetry-stream-block-edr.html
+//   https://github.com/TwoSevenOneT/EDRChoker
+//   https://youtu.be/hj05mT-45bo
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. POWERSHELL — New-NetQosPolicy WITH ThrottleRate
+//    The exact primitive. Direct catch on the cmdlet plus the
+//    throttle-rate parameter.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any (
+    "New-NetQosPolicy",
+    "Set-NetQosPolicy"
+)
+| where ProcessCommandLine has_any (
+    "ThrottleRateActionBitsPerSecond",
+    "ThrottleRate",
+    "-AppPathNameMatchCondition",
+    "AppPathName"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. QoS POLICY APPLIED TO A KNOWN EDR / SECURITY-AGENT
+//    BINARY
+//    Highest-fidelity tell: any QoS policy referencing a
+//    known EDR process name in the AppPath filter.
+// ------------------------------------------------------------
+let EDRBinaries = dynamic([
+    "MsSense.exe", "MsSenseCli.exe", "SenseIR.exe",
+    "SenseSampleUploader.exe", "MpDefenderCoreService.exe",
+    "MsMpEng.exe", "NisSrv.exe", "SecurityHealthService.exe",
+    "CSFalconService.exe", "CSFalconContainer.exe",
+    "SentinelAgent.exe", "SentinelServiceHost.exe", "SentinelHelperService.exe",
+    "cb.exe", "RepMgr.exe", "RepUtils.exe", "RepUx.exe",
+    "SophosNtpService.exe", "SophosClean.exe", "Sophos*",
+    "TmListen.exe", "NTRTScan.exe", "TMBMSRV.exe",
+    "elastic-agent.exe", "elastic-endpoint.exe",
+    "cyserver.exe", "cytool.exe", "cyveraservice.exe", "cytray.exe",
+    "MfeAvSvc.exe", "macmnsvc.exe",
+    "ekrn.exe", "egui.exe",
+    "BdServiceHost.exe", "bdagent.exe"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("New-NetQosPolicy", "Set-NetQosPolicy", "AppPathName")
+| where ProcessCommandLine has_any (EDRBinaries)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. EDRChoker PoC BINARY / REPO NAME
+//    Direct hit on the public PoC name and the GitHub
+//    repository it lives in.
+// ------------------------------------------------------------
+let Choker_Markers = dynamic([
+    "EDRChoker",
+    "edrchoker",
+    "TwoSevenOneT/EDRChoker",
+    "TwoSevenOneT",
+    "TwoSevenOneT.github"
+]);
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (Choker_Markers)
+       or ProcessCommandLine has_any (Choker_Markers)
+       or InitiatingProcessCommandLine has_any (Choker_Markers)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (Choker_Markers)
+       or FolderPath has_any (Choker_Markers)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. QoS POLICY REGISTRY KEY WRITES
+//    Catches the persistence side regardless of how the
+//    policy was applied (cmdlet, GPO, direct registry edit).
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryKey has_any (
+    @"\SOFTWARE\Policies\Microsoft\Windows\QoS\",
+    @"\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\QoS",
+    @"\SYSTEM\CurrentControlSet\Services\Tcpip\QoS",
+    @"\SYSTEM\CurrentControlSet\Services\Psched"
+)
+   or RegistryValueName has_any (
+        "ThrottleRate", "AppName", "DSCPValue"
+   )
+| project Timestamp, DeviceName,
+          ActionType, RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. SUSPICIOUS LOW THROTTLE RATE (BELOW 1 KB/S)
+//    The author specifically notes "under 1 KB/s" is enough
+//    to break the agent. Surfaces explicit low values on the
+//    command line.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has "ThrottleRateActionBitsPerSecond"
+| extend RateMatch = extract(@"ThrottleRateActionBitsPerSecond\s+(\d+)", 1, tostring(ProcessCommandLine))
+| extend Rate = toint(RateMatch)
+| where isnotempty(RateMatch) and Rate > 0 and Rate < 8192   // < 1 KB/s
+| project Timestamp, DeviceName, AccountName,
+          Rate, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. ANY NEW NetQos POLICY WITH AN AppPath OF *.EXE
+//    A broader generic catch. NetQos policies legitimately
+//    exist for traffic shaping (Teams, Zoom). Surface every
+//    new policy targeting a specific .exe AppPath so SOC can
+//    triage against the trusted-app baseline.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("New-NetQosPolicy", "Set-NetQosPolicy")
+| where ProcessCommandLine has_any ("AppPathName", "-AppPathNameMatchCondition")
+| where ProcessCommandLine matches regex @"(?i)AppPath(NameMatchCondition)?\s+[""']?[^\s""']+\.exe"
+| project Timestamp, DeviceName, AccountName,
+          ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. POWERSHELL QoS CMDLET INVOKED BY UNEXPECTED PARENT
+//    A QoS policy change from a sideloaded binary, scripting
+//    host, browser child or service account is almost never
+//    legitimate.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any (
+    "New-NetQosPolicy", "Set-NetQosPolicy",
+    "Get-NetQosPolicy", "Remove-NetQosPolicy"
+)
+| where InitiatingProcessFileName !in~ (
+    "explorer.exe", "cmd.exe",
+    "WindowsTerminal.exe", "wt.exe",
+    "WindowsPackageManagerServer.exe",
+    "MMC.exe", "GPMC.exe", "gpscript.exe",
+    "Code.exe", "cursor.exe", "devenv.exe",
+    "OneDrive.exe", "Teams.exe", "ms-teams.exe",
+    "ScCom.exe", "msiexec.exe", "TiWorker.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. SENSE / DEFENDER AGENT GOES SILENT (HEARTBEAT GAP)
+//    Indirect signal — a device that normally streams MDE
+//    telemetry every few minutes suddenly stops. Combine with
+//    a recent QoS event for a confident triage signal.
+// ------------------------------------------------------------
+let LastDeviceSeen = DeviceInfo
+| summarize LastDeviceInfo = max(Timestamp) by DeviceName, DeviceId;
+let LastProcessSeen = DeviceProcessEvents
+| where Timestamp > ago(2h)
+| summarize RecentEvents = count(),
+            LastProcess = max(Timestamp)
+    by DeviceName;
+LastDeviceSeen
+| join kind=leftouter LastProcessSeen on DeviceName
+| where isnull(LastProcess)
+   or LastProcess < ago(30m)
+| where LastDeviceInfo > ago(1d)
+| project DeviceName, DeviceId, LastDeviceInfo, LastProcess, RecentEvents
+| order by LastProcess asc
+
+
+// ------------------------------------------------------------
+// 9. GROUP POLICY OBJECT (GPO) QoS CHANGES
+//    Catches policy-driven applications of the same primitive
+//    — a domain-wide attacker rolling EDRChoker via GPO.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where RegistryKey has @"\Microsoft\Windows\Policies\QoS"
+   or RegistryKey has @"\Group Policy\History\"
+   or RegistryKey has @"\Policies\Microsoft\Windows\QoS\"
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated", "RegistryKeyRenamed")
+| project Timestamp, DeviceName,
+          ActionType, RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessAccountName,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. QoS POLICY REMOVAL IMMEDIATELY AFTER ACTIVITY
+//     The clean-up step. An actor may remove the policy at
+//     the end of an intrusion to hide their tracks.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any (
+    "Remove-NetQosPolicy",
+    "Disable-NetQosFlowControl",
+    "Remove-Item.*QoS",
+    "reg delete.*Policies\\Microsoft\\Windows\\QoS"
+)
+   or (ProcessCommandLine has "reg" and ProcessCommandLine has @"Policies\Microsoft\Windows\QoS" and ProcessCommandLine has "delete")
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. PSCHED / PACER.SYS UNUSUAL INTERACTIONS
+//     The driver behind the technique. Loads or service
+//     restarts of Psched / pacer.sys from non-system parents
+//     are worth surfacing.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has_any ("Psched", "pacer.sys", "pacer ")
+    | where FileName in~ ("sc.exe", "powershell.exe", "pwsh.exe", "net.exe", "fltMC.exe")
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "pacer.sys"
+    | where InitiatingProcessFolderPath !startswith @"C:\Windows\"
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     A QoS policy is created targeting an EDR / Defender
+//     binary → the same device's EDR / process telemetry
+//     immediately goes quiet (gap > 30m). Use as a high-
+//     confidence "EDR muted" alert.
+// ------------------------------------------------------------
+let QosAgainstEDR = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("New-NetQosPolicy", "Set-NetQosPolicy")
+| where ProcessCommandLine has_any (
+    "MsSense", "MsMpEng", "MpDefenderCoreService",
+    "CSFalcon", "SentinelAgent", "SentinelHelperService",
+    "elastic-agent", "elastic-endpoint",
+    "RepMgr", "cb.exe", "cyserver", "ekrn", "BdServiceHost"
+)
+| project DeviceName, QosTime = Timestamp,
+          QosCmd = ProcessCommandLine,
+          QosParent = InitiatingProcessFileName;
+let TelemetryGap = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| summarize LastEvent = max(Timestamp), EventsLast30m = countif(Timestamp > ago(30m))
+    by DeviceName
+| where EventsLast30m == 0
+| project DeviceName, LastEvent;
+QosAgainstEDR
+| join kind=inner TelemetryGap on DeviceName
+| where LastEvent between (QosTime .. (QosTime + 1h))
+| project QosTime, LastEvent, DeviceName,
+          QosCmd, QosParent
+| order by QosTime desc

@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **June 2026**
+- [EDRChoker - QoS Bandwidth Throttling EDR Telemetry Suppression](<EDRChoker - QoS Bandwidth Throttling EDR Telemetry Suppression (June 2026)>)
 - [Pink Hacking Group (CL-CRI-1147) - Vishing & Session Cookie Theft & M365 Auto-Exfil](<Pink Hacking Group (CL-CRI-1147) - Vishing & Session Cookie Theft & M365 Auto-Exfil (June 2026)>)
 - [Vect 2.0 DEVMAN 3.0 - Broken Ransomware Decryptor & Race Conditions](<Vect 2.0 DEVMAN 3.0 - Broken Ransomware Decryptor & Race Conditions (June 2026)>)
 
