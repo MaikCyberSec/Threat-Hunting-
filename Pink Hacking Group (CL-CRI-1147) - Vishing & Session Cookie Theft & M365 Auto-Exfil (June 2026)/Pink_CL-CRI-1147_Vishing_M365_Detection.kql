@@ -1,0 +1,407 @@
+// ============================================================
+// PINK (CL-CRI-1147) — Vishing-Driven Session Cookie Theft +
+// Microsoft 365 Automation-Tool Exfiltration
+// Source:   CyberSecurity News / Unit 42 + Google TIG
+//           (June 8 2026). Suspected rebrand of BlackFile
+//           and the interim "Redact" operation. Affiliated
+//           with the broader Com network — Lapsus$ /
+//           Scattered Spider / ShinyHunters tradecraft.
+// Platform: Microsoft Defender XDR + Defender for Cloud Apps
+//           + Defender for Office 365 (Advanced Hunting)
+// MITRE ATT&CK: T1566.002, T1566.004 (vishing),
+//               T1598.004, T1539, T1550.001 (token reuse),
+//               T1078.004, T1020, T1567.002
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Unit 42 (Palo Alto Networks) and Google Threat Intelligence
+// Group disclosed Pink (tracked as CL-CRI-1147), a data-theft-
+// extortion group whose leak site went live on May 31, 2026.
+// The crew is highly likely a rebrand of the retired BlackFile
+// operation (May 2026) and the brief "Redact" interim brand.
+// Tradecraft is consistent with the Com network: aggressive
+// social engineering, no ransomware deployment, pure data
+// extortion.
+//
+// KILL CHAIN
+// ---------------------------------------------------------------
+//   1) Voice phishing (vishing). Pink callers impersonate
+//      internal IT, walk the victim to a passkey-themed
+//      phishing page, and harvest credentials plus the
+//      authenticated SESSION COOKIE — bypassing MFA entirely.
+//   2) The stolen session is replayed against the victim's
+//      Microsoft 365 account. From there, Pink uses native
+//      Microsoft automation tools (Power Automate / Graph /
+//      Power Apps) to enumerate and bulk-download OneDrive
+//      and SharePoint files within minutes.
+//   3) Extortion notes are sent from the compromised mailbox
+//      and Teams account. 72-hour payment deadline. The leak
+//      site is the leverage; there is no encrypter.
+//   4) Fileless / in-memory tooling, sandbox-aware, and
+//      explicit avoidance of traditional EDR-triggering
+//      droppers. Detection has to be cloud-side and
+//      identity-side, not endpoint-binary-side.
+//
+// IOCs — NETWORK
+// ---------------------------------------------------------------
+//   Phishing / cookie-theft domains:
+//     passkeyadd.com
+//     passkeydeploy.com
+//     deploypasskey.com
+//   Hosting infrastructure:
+//     185.178.208.153   (DDoS-Guard linked)
+//     172.93.100.252
+//     96.232.20.66
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate Power Automate flows that touch SharePoint
+//     in bulk. Pin trusted flow owners + flow IDs.
+//   - "Session expired, re-authenticate" prompts in real
+//     Microsoft mail — pair the URL with sender domain.
+//   - Pen-test / red-team exercises using similar tradecraft —
+//     coordinate with your offensive team.
+//
+// LICENSING NOTES
+// ---------------------------------------------------------------
+//   AADSignInEventsBeta — Entra ID P1/P2 sign-in ingestion.
+//   CloudAppEvents       — Defender for Cloud Apps.
+//   EmailEvents /
+//   UrlClickEvents       — Defender for Office 365.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/new-pink-hacking-group-attacking-enterprise-users/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN INFRASTRUCTURE — IPs + PHISHING DOMAINS
+//    Direct, highest-fidelity hit on the documented Pink
+//    phishing infrastructure.
+// ------------------------------------------------------------
+let Pink_Domains = dynamic([
+    "passkeyadd.com",
+    "passkeydeploy.com",
+    "deploypasskey.com"
+]);
+let Pink_IPs = dynamic([
+    "185.178.208.153",
+    "172.93.100.252",
+    "96.232.20.66"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteIP in (Pink_IPs)
+   or RemoteUrl has_any (Pink_Domains)
+   or tostring(parse_url(RemoteUrl).Host) in (Pink_Domains)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. URL CLICKS TO PINK PHISHING DOMAINS FROM EMAIL
+//    The endpoint-side equivalent — Defender for Office 365
+//    SafeLinks click telemetry. Catches users who clicked the
+//    passkey-themed lure regardless of where the click came
+//    from (email / Teams / browser).
+// ------------------------------------------------------------
+UrlClickEvents
+| where Timestamp > ago(60d)
+| where Url has_any (
+    "passkeyadd", "passkeydeploy", "deploypasskey"
+)
+   or tostring(parse_url(Url).Host) in~ (
+        "passkeyadd.com", "passkeydeploy.com", "deploypasskey.com"
+   )
+| project Timestamp, AccountUpn, NetworkMessageId,
+          Url, UrlChain, ActionType, IPAddress
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. INBOUND EMAIL CARRYING THE PINK VISHING / PASSKEY LURE
+//    Catches the delivery side — emails that drop the phishing
+//    URL, plus subjects referencing passkey enrolment /
+//    session re-auth / IT-helpdesk pretexts Pink uses to
+//    legitimise the follow-on phone call.
+// ------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(60d)
+| where EmailDirection == "Inbound"
+| where Subject has_any (
+    "passkey", "Passkey enrolment", "session expired",
+    "re-authenticate", "IT helpdesk", "verify your access",
+    "complete your sign-in", "device registration"
+)
+   or Url has_any ("passkeyadd", "passkeydeploy", "deploypasskey")
+| where SenderFromDomain !endswith "microsoft.com"
+   and SenderFromDomain !endswith "office.com"
+   and SenderFromDomain !endswith "office365.com"
+| project Timestamp, RecipientEmailAddress,
+          SenderFromAddress, SenderFromDomain,
+          Subject, AttachmentCount, UrlCount,
+          DeliveryAction, ConfidenceLevel,
+          NetworkMessageId, ThreatTypes
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. SESSION-COOKIE REPLAY ANOMALY — SAME USER, NEW IP, SOON
+//    AFTER A CLICK
+//    Pink steals an authenticated session cookie via the
+//    phishing page; replaying it produces a sign-in from a
+//    fresh IP / UA while the original session is still alive.
+// ------------------------------------------------------------
+let Clicks = UrlClickEvents
+| where Timestamp > ago(7d)
+| where Url has_any ("passkeyadd", "passkeydeploy", "deploypasskey")
+| project ClickTime = Timestamp, User = tolower(AccountUpn);
+let RecentSignins = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| project SiTime = Timestamp, User = tolower(AccountUpn),
+          SiIP = IPAddress, SiCountry = Country,
+          SiUA = UserAgent, SiApp = Application,
+          SiResource = ResourceDisplayName;
+Clicks
+| join kind=inner RecentSignins on User
+| where SiTime between (ClickTime .. (ClickTime + 4h))
+| summarize DistinctIPs = dcount(SiIP),
+            DistinctCountries = dcount(SiCountry),
+            SamplesIP = make_set(SiIP, 5),
+            SamplesCountry = make_set(SiCountry, 3),
+            FirstSeen = min(SiTime), LastSeen = max(SiTime)
+    by User, ClickTime
+| where DistinctIPs >= 2
+| order by ClickTime desc
+
+
+// ------------------------------------------------------------
+// 5. POST-CLICK BULK OneDrive / SharePoint DOWNLOAD BURST
+//    The Pink exfil step. A user who clicked a Pink lure
+//    suddenly downloads / syncs hundreds of files from
+//    OneDrive or SharePoint inside an hour.
+// ------------------------------------------------------------
+let LureClickUsers = UrlClickEvents
+| where Timestamp > ago(7d)
+| where Url has_any ("passkeyadd", "passkeydeploy", "deploypasskey")
+| project ClickTime = Timestamp, User = tolower(AccountUpn);
+let Exfil = CloudAppEvents
+| where Timestamp > ago(7d)
+| where Application has_any ("SharePoint", "OneDrive")
+| where ActionType has_any (
+    "FileDownloaded", "FileSyncDownloadedFull",
+    "FileExported", "FileAccessed"
+)
+| summarize ExfilCount = count(),
+            ExfilStart = min(Timestamp),
+            ExfilEnd   = max(Timestamp),
+            Apps       = make_set(Application, 3)
+    by User = tolower(AccountDisplayName), bin(Timestamp, 1h)
+| where ExfilCount >= 100;
+LureClickUsers
+| join kind=inner Exfil on User
+| where ExfilStart between (ClickTime .. (ClickTime + 4h))
+| project ClickTime, ExfilStart, ExfilEnd,
+          User, ExfilCount, Apps
+| order by ClickTime desc
+
+
+// ------------------------------------------------------------
+// 6. POWER AUTOMATE / POWER APPS FLOW CREATION OR
+//    MODIFICATION — POST-COMPROMISE MISUSE
+//    Pink uses Microsoft's own automation surface to scale
+//    exfil. Surface flow / connection / app creation events,
+//    especially from accounts that recently clicked the lure.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where Application has_any ("Power Platform", "Power Apps",
+                              "Microsoft Power Automate", "Microsoft Flow",
+                              "Microsoft Power Apps")
+| where ActionType has_any (
+    "CreateFlow", "TurnOnFlow", "EditFlow",
+    "CreateConnection", "CreateConnector",
+    "CreateApp", "PublishApp", "UpdateFlow"
+)
+| project Timestamp, ActionType, Application,
+          AccountDisplayName, AccountObjectId,
+          IPAddress, CountryCode,
+          UserAgent, RawEventData
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. EXTORTION-STYLE OUTBOUND MAIL FROM A COMPROMISED MAILBOX
+//    Pink delivers the ransom note from inside the victim's
+//    own Outlook account. Surfaces outbound emails containing
+//    extortion keywords and short deadlines.
+// ------------------------------------------------------------
+EmailEvents
+| where Timestamp > ago(30d)
+| where EmailDirection == "Outbound"
+| where Subject has_any (
+    "data leak", "your data", "exposed", "leak site",
+    "we have your", "ransom", "72 hours",
+    "payment required", "extortion"
+)
+   or Subject matches regex @"(?i)(deadline|payment).{0,40}(72|seventy.?two).?hours?"
+| project Timestamp, SenderFromAddress, SenderFromDomain,
+          RecipientEmailAddress, Subject,
+          AttachmentCount, UrlCount,
+          DeliveryAction, NetworkMessageId
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. EXTORTION-STYLE TEAMS CHAT FROM AN INTERNAL ACCOUNT
+//    Same threat language pushed through Teams chat by a
+//    compromised internal identity. Requires Defender for
+//    Cloud Apps to ingest Teams chat events.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where Application == "Microsoft Teams"
+| where ActionType has_any ("MessageSent", "ChatCreated")
+| extend Raw = tostring(RawEventData)
+| where Raw has_any (
+    "data leak", "leak site", "72 hours", "extortion",
+    "payment required", "we have your", "exfiltrated"
+)
+| project Timestamp, ActionType, AccountDisplayName, AccountObjectId,
+          IPAddress, CountryCode, ISP, Raw
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. NEW OAUTH CONSENT FOR HIGH-SCOPE GRAPH APPS
+//    Pink occasionally grants a persistent OAuth app to keep
+//    Graph access alive after the session cookie is rotated.
+//    Surfaces consents for Files / Mail / Sites / Chat scopes.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where ActionType has_any (
+    "Consent to application", "Add app role assignment",
+    "Add OAuth2PermissionGrant", "Add delegated permission grant"
+)
+| extend Raw = tostring(RawEventData)
+| where Raw has_any (
+    "Files.Read.All", "Files.ReadWrite.All",
+    "Mail.Read", "Mail.ReadBasic", "Mail.ReadWrite",
+    "Sites.Read.All", "Sites.ReadWrite.All",
+    "Chat.Read.All", "ChannelMessage.Read.All",
+    "User.Read.All", "Directory.Read.All"
+)
+| project Timestamp, ActionType, AccountDisplayName, AccountObjectId,
+          IPAddress, CountryCode, Raw
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. IMPOSSIBLE TRAVEL ON A USER WHO CLICKED THE LURE
+//     Catches Pink operator sign-ins from geo A while the
+//     real user is still active from geo B — the classic
+//     session-replay fingerprint.
+// ------------------------------------------------------------
+let Clickers = UrlClickEvents
+| where Timestamp > ago(7d)
+| where Url has_any ("passkeyadd", "passkeydeploy", "deploypasskey")
+| project ClickTime = Timestamp, User = tolower(AccountUpn);
+let UserSignins = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| project SiTime = Timestamp, User = tolower(AccountUpn),
+          SiCountry = Country, SiIP = IPAddress;
+Clickers
+| join kind=inner UserSignins on User
+| where SiTime between (ClickTime - 1h .. ClickTime + 24h)
+| summarize Countries = make_set(SiCountry, 5),
+            DistinctCountries = dcount(SiCountry),
+            FirstSeen = min(SiTime), LastSeen = max(SiTime)
+    by User
+| where DistinctCountries >= 2
+| order by DistinctCountries desc
+
+
+// ------------------------------------------------------------
+// 11. COM NETWORK ADJACENT INFRASTRUCTURE HEURISTIC
+//     Pink shares tradecraft with Lapsus$ / Scattered Spider /
+//     ShinyHunters. Pivots on commonly reused phishing-page
+//     URL patterns ("passkey*", "mfa-*", "*-helpdesk*",
+//     "okta-*", "duo-*") to catch adjacent infra beyond the
+//     three documented Pink domains.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| extend Host = tolower(tostring(parse_url(RemoteUrl).Host))
+| where Host has_any (
+    "passkey", "okta-", "duo-", "mfa-", "auth-",
+    "-helpdesk", "-itsupport", "-securelogin",
+    "session-expired", "reauth-"
+)
+| where not (Host endswith "microsoft.com"
+             or Host endswith "okta.com"
+             or Host endswith "duosecurity.com"
+             or Host endswith "duo.com")
+| summarize Hits = count(),
+            Procs = make_set(InitiatingProcessFileName, 5),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by DeviceName, Host
+| order by Hits desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Vishing click → fresh IP sign-in → bulk SharePoint /
+//     OneDrive exfil → extortion mail from the same mailbox,
+//     all inside a 24-hour window.
+// ------------------------------------------------------------
+let Stage1_Click = UrlClickEvents
+| where Timestamp > ago(7d)
+| where Url has_any ("passkeyadd", "passkeydeploy", "deploypasskey")
+| project ClickTime = Timestamp, User = tolower(AccountUpn);
+let Stage2_NewSignin = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| project SiTime = Timestamp, User = tolower(AccountUpn),
+          SiIP = IPAddress, SiUA = UserAgent,
+          SiCountry = Country, SiResource = ResourceDisplayName;
+let Stage3_Exfil = CloudAppEvents
+| where Timestamp > ago(7d)
+| where Application has_any ("SharePoint", "OneDrive")
+| where ActionType has_any ("FileDownloaded", "FileSyncDownloadedFull", "FileAccessed", "FileExported")
+| summarize ExfilCount = count(), ExfilStart = min(Timestamp), ExfilEnd = max(Timestamp)
+    by User = tolower(AccountDisplayName)
+| where ExfilCount >= 100;
+let Stage4_Extortion = EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Outbound"
+| where Subject has_any (
+    "data leak", "leak site", "72 hours", "ransom",
+    "payment required", "exfiltrated", "extortion"
+)
+| project ExtortionTime = Timestamp,
+          User = tolower(SenderFromAddress),
+          ExtortionTo = RecipientEmailAddress,
+          ExtortionSubject = Subject;
+Stage1_Click
+| join kind=inner Stage2_NewSignin on User
+| where SiTime between (ClickTime .. (ClickTime + 4h))
+| join kind=inner Stage3_Exfil on User
+| where ExfilStart between (ClickTime .. (ClickTime + 8h))
+| join kind=leftouter Stage4_Extortion on User
+| where ExtortionTime between (ClickTime .. (ClickTime + 24h))
+| project ClickTime, SiTime, ExfilStart, ExfilEnd, ExtortionTime,
+          User,
+          SiIP, SiCountry, SiResource,
+          ExfilCount,
+          ExtortionTo, ExtortionSubject
+| order by ClickTime desc
