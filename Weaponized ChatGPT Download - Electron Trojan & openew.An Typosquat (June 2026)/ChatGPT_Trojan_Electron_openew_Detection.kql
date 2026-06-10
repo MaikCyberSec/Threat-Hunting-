@@ -1,0 +1,464 @@
+// ============================================================
+// WEAPONIZED CHATGPT DOWNLOAD — Inno-Setup-Wrapped Electron
+// Trojan Distributed via "openew[.]An" Typosquat + Malvertising
+// Source:   CyberSecurity News / Evalian SOC (June 4 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1583.001 (typosquat), T1566.002, T1204.002,
+//               T1140, T1547.001, T1059.001, T1218.011,
+//               T1071.004 (DNS-over-HTTPS), T1027
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Evalian's SOC team disclosed a malvertising-driven campaign
+// that uses a typosquatted OpenAI domain ("openew[.]An") to
+// distribute a trojanised "ChatGPT" desktop installer. The
+// chain is well crafted:
+//
+//   - Inno Setup installer wrapper (Chat_GPT.exe) signed with a
+//     legitimate-but-unrelated certificate issued to a Dutch
+//     holding company, "F.F.A.P. Hurkmans Beheer B.V.",
+//     enough to bypass casual user suspicion.
+//   - Inside: a Chromium-based Electron application bundling
+//     a heavily obfuscated JavaScript payload "winter.js"
+//     plus Node.js modules child_process / fs / systeminformation.
+//   - First-run drops a Chromium-style profile under
+//     %AppData%\Satoshi and gates further execution behind a
+//     CAPTCHA challenge — defeating most sandboxes.
+//   - On user interaction, winter.js shells out to PowerShell
+//     with -ExecutionPolicy Unrestricted to deliver the next
+//     stage, then beacons via DNS-over-HTTPS (Cloudflare /
+//     Google) to blend with normal traffic.
+//
+// PLATFORMS: Windows AND macOS (separate payload SHA256s
+// disclosed for each).
+//
+// DOCUMENTED IOCs
+// ---------------------------------------------------------------
+//   Domain:        openew[.]An             (Namecheap registrar)
+//   Hosting IP:    144.172.104.205        (RouterHosting ASN)
+//   Installer:     Chat_GPT.exe
+//   Code-signing:  "F.F.A.P. Hurkmans Beheer B.V."
+//                  (legit Dutch entity, certificate abused)
+//   Profile dir:   %AppData%\Satoshi
+//   Obfuscated:    winter.js
+//
+//   Windows SHA256:
+//     56CC26E88C064B0C423AA8AD6530E58F91D1E4D28FAB1A8BCEDEF16A6582B4D2
+//   macOS SHA256:
+//     7E5B708F6659B1FAD3AAE7B589A706434FBF21708AEEC5AF5910189B96E25FEF
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate OpenAI desktop app (current builds are named
+//     "ChatGPT.exe", not "Chat_GPT.exe", and are signed by
+//     OpenAI, not by an unrelated Dutch holding company).
+//   - Electron-based developer tools spawning PowerShell for
+//     genuine reasons (VS Code, Slack, Discord). Pair the
+//     spawn with the cmdline / cert / domain filters for
+//     fidelity.
+//   - F.F.A.P. Hurkmans Beheer B.V. is a real Dutch holding
+//     company — the *cert* is abused, the company is not at
+//     fault. Treat the certificate subject as IOC, not the
+//     organisation.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/weaponized-chatgpt-download-site-delivers-malware/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN SHA256 HASHES (FILE + PROCESS + IMAGE LOAD)
+//    Direct hit on the Windows + macOS payload hashes.
+// ------------------------------------------------------------
+let ChatGPT_Trojan_SHA256 = dynamic([
+    "56cc26e88c064b0c423aa8ad6530e58f91d1e4d28fab1a8bcedef16a6582b4d2",
+    "7e5b708f6659b1fad3aae7b589a706434fbf21708aeec5af5910189b96e25fef"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (ChatGPT_Trojan_SHA256)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine = ""
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (ChatGPT_Trojan_SHA256)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (ChatGPT_Trojan_SHA256)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DOCUMENTED INFRASTRUCTURE — openew[.]An + 144.172.104.205
+//    Direct match on the typosquat domain and the
+//    RouterHosting C2 IP.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteIP == "144.172.104.205"
+   or RemoteUrl has_any ("openew.an", "openew.ai", "openew.")
+   or tostring(parse_url(RemoteUrl).Host) startswith "openew."
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. INSTALLER FILE NAME "Chat_GPT.exe" / TYPOSQUAT VARIANTS
+//    Catches the documented installer plus near-variants —
+//    the underscore is the key tell against the real OpenAI
+//    "ChatGPT.exe" desktop app.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FileName =~ "Chat_GPT.exe"
+       or FileName has_any (
+            "ChatGPT_Setup", "Chat-GPT-Setup",
+            "Chat_GPT_Setup", "ChatGPT-Installer",
+            "OpenAI_Setup", "OpenAI-Installer",
+            "Chat_GPT_Installer"
+       )
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "Chat_GPT.exe"
+       or FileName has "Chat_GPT"
+       or ProcessVersionInfoOriginalFileName =~ "Chat_GPT.exe"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. ABUSED CODE-SIGNING CERTIFICATE — "F.F.A.P. Hurkmans Beheer"
+//    Cross-references DeviceFileEvents against
+//    DeviceFileCertificateInfo on SHA1. Surfaces every
+//    workstation that touched a binary signed under this
+//    certificate subject, regardless of filename.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(90d)
+| where FileName endswith ".exe" or FileName endswith ".dll" or FileName endswith ".msi"
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| join kind=inner (
+    DeviceFileCertificateInfo
+    | where Signer has_any (
+        "F.F.A.P. Hurkmans Beheer",
+        "Hurkmans Beheer",
+        "F.F.A.P."
+    )
+       or Issuer has_any ("F.F.A.P. Hurkmans Beheer", "Hurkmans Beheer")
+    | project SHA1, Signer, Issuer, IsTrusted, IsRootSignerMicrosoft
+) on $left.SHA1 == $right.SHA1
+| project Timestamp, DeviceName, ActionType,
+          FileName, FolderPath, SHA1, SHA256,
+          Signer, Issuer, IsTrusted,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. "%AppData%\Satoshi" PROFILE DIRECTORY CREATION
+//    The malware's Chromium-style profile path. Highly
+//    distinctive and worth flagging on any file event under
+//    that directory.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where FolderPath has @"\AppData\Roaming\Satoshi"
+   or FolderPath has @"\AppData\Local\Satoshi"
+   or FolderPath has @":\Users\Public\Satoshi"
+| where InitiatingProcessFileName !in~ (
+    "Bitcoin.exe", "bitcoin-qt.exe"   // legitimate apps that may use a Satoshi path
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. "winter.js" / OBFUSCATED ELECTRON PAYLOAD REFERENCES
+//    Catches the named JavaScript payload on disk or in
+//    command lines. Combined with a Chat_GPT-named parent
+//    process this is essentially diagnostic.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "winter.js"
+       and FolderPath has_any (@"\AppData\Roaming\", @"\AppData\Local\", @"\Satoshi\")
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has "winter.js"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. ELECTRON / NODE.JS APP SPAWNING POWERSHELL WITH
+//    EXECUTION-POLICY UNRESTRICTED
+//    The Chat_GPT trojan shells from Electron into PowerShell.
+//    Catches the technique generically — useful well beyond
+//    this single campaign.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any (
+    "-ExecutionPolicy Unrestricted",
+    "-ep Unrestricted",
+    "-ExecutionP Unr"
+)
+| where InitiatingProcessFileName !in~ (
+    "Code.exe", "Code - Insiders.exe", "cursor.exe",
+    "WindowsTerminal.exe", "wt.exe",
+    "explorer.exe", "msiexec.exe",
+    "OneDriveSetup.exe", "TiWorker.exe"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\AppData\Local\", @"\AppData\Roaming\",
+    @"\Downloads\", @"\Temp\",
+    @":\Users\Public\", @"\OneDrive\"
+)
+   or InitiatingProcessFileName has_any ("Chat_GPT", "ChatGPT", "Electron", "electron")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. CHATGPT / OPENAI LOOKALIKE DOMAIN DOWNLOADS
+//    Catches the browser-side delivery context: downloads from
+//    domains that LOOK like OpenAI / ChatGPT but are not the
+//    legitimate hostnames. Tune the allow-list to your fleet.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| extend Host = tolower(tostring(parse_url(RemoteUrl).Host))
+| where Host has_any ("chatgpt", "openai", "openew", "open-ai")
+| where Host !endswith "openai.com"
+   and Host !endswith "chatgpt.com"
+   and Host !endswith "oaiusercontent.com"
+   and Host !endswith "googleapis.com"
+   and Host !endswith "google.com"
+   and Host !endswith "azureedge.net"
+   and Host !endswith "azure.com"
+| where InitiatingProcessFileName in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe",
+    "OUTLOOK.EXE"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl, Host
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. DOH (DNS-over-HTTPS) ABUSE FROM A NON-BROWSER PROCESS
+//    The trojan blends C2 with Cloudflare / Google DoH
+//    endpoints. Surface non-browser processes hitting the
+//    public DoH resolvers — a strong tradecraft signal.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "cloudflare-dns.com", "1.1.1.1", "1.0.0.1",
+    "dns.google", "8.8.8.8", "8.8.4.4",
+    "mozilla.cloudflare-dns.com", "dns.quad9.net",
+    "dns.adguard.com"
+)
+| where RemotePort in (443, 853)
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "OUTLOOK.EXE",
+    "Teams.exe", "ms-teams.exe",
+    "dnsproxy.exe", "yogadns.exe", "AdGuardSvc.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. INNO SETUP INSTALLER WITH CHATGPT / OPENAI NAMING IN A
+//     USER-WRITABLE PATH
+//     Surfaces the dropper context. Inno Setup writes
+//     identifiable temp folders ("\_setup-*", "is-*.tmp") plus
+//     binaries whose ProductName / OriginalFileName references
+//     the lure.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("FileCreated", "FileModified")
+    | where FolderPath has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp"
+    )
+    | where (FileName endswith ".exe" or FileName endswith ".msi")
+    | where FileName has_any ("ChatGPT", "Chat_GPT", "OpenAI", "Open_AI", "Chat-GPT")
+    | extend EventKind = "FileDrop"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessVersionInfoOriginalFileName has "Inno Setup"
+       or ProcessVersionInfoFileDescription has "Inno Setup"
+    | where ProcessCommandLine has_any ("ChatGPT", "Chat_GPT", "OpenAI", "Chat-GPT")
+       or FileName has_any ("ChatGPT", "Chat_GPT", "OpenAI", "Chat-GPT")
+    | extend EventKind = "InnoSetupExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256 = "",
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. NODE.JS / ELECTRON RUNTIME LAUNCHED FROM A USER-WRITABLE
+//     PATH WITH SHELL-OUT BEHAVIOUR
+//     Generic catch — Electron applications launched from
+//     %APPDATA% or Downloads that spawn shells / curl / wget.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFolderPath has_any (
+    @"\AppData\Local\", @"\AppData\Roaming\",
+    @"\Downloads\", @"\Temp\", @":\Users\Public\"
+)
+| where InitiatingProcessFileName has_any ("Chat_GPT", "electron", "Electron", "node.exe")
+   or InitiatingProcessVersionInfoOriginalFileName has_any ("electron", "Electron")
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "curl.exe", "curl", "wget", "wget.exe",
+    "rundll32.exe", "regsvr32.exe", "mshta.exe",
+    "wscript.exe", "cscript.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Browser pulled installer from a "openew*" or chatgpt-
+//     lookalike domain → Chat_GPT-named installer ran from a
+//     user-writable path → %AppData%\Satoshi profile created
+//     → outbound to the documented C2 IP, all on the same
+//     device inside a 2-hour window.
+// ------------------------------------------------------------
+let Stage1_Lure = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| extend Host = tolower(tostring(parse_url(RemoteUrl).Host))
+| where Host startswith "openew."
+   or (Host has "chatgpt" and Host !endswith "openai.com" and Host !endswith "chatgpt.com")
+   or RemoteIP == "144.172.104.205"
+| project DeviceName, LureTime = Timestamp,
+          LureProc = InitiatingProcessFileName,
+          LureHost = Host, LureUrl = RemoteUrl;
+let Stage2_Install = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName has_any ("Chat_GPT", "ChatGPT", "Chat-GPT")
+   or tolower(SHA256) in (
+        "56cc26e88c064b0c423aa8ad6530e58f91d1e4d28fab1a8bcedef16a6582b4d2"
+   )
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp"
+)
+| project DeviceName, InstallTime = Timestamp,
+          InstallFile = FileName, InstallPath = FolderPath,
+          InstallSha = SHA256;
+let Stage3_Profile = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath has @"\AppData\Roaming\Satoshi"
+   or FolderPath has @"\AppData\Local\Satoshi"
+| where ActionType in ("FileCreated", "FileModified")
+| project DeviceName, ProfileTime = Timestamp,
+          ProfileFile = FileName, ProfilePath = FolderPath;
+let Stage4_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIP == "144.172.104.205"
+   or RemoteUrl has "openew."
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_Lure
+| join kind=inner Stage2_Install on DeviceName
+| where InstallTime between (LureTime .. (LureTime + 1h))
+| join kind=leftouter Stage3_Profile on DeviceName
+| where ProfileTime between (InstallTime .. (InstallTime + 30m))
+| join kind=leftouter Stage4_C2 on DeviceName
+| where C2Time between (InstallTime .. (InstallTime + 2h))
+| project LureTime, InstallTime, ProfileTime, C2Time,
+          DeviceName,
+          LureProc, LureHost,
+          InstallFile, InstallPath, InstallSha,
+          ProfileFile, ProfilePath,
+          C2Proc, C2_IP, C2_Url
+| order by LureTime desc

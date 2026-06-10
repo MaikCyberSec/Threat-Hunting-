@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **June 2026**
+- [Weaponized ChatGPT Download - Electron Trojan & openew.An Typosquat](<Weaponized ChatGPT Download - Electron Trojan & openew.An Typosquat (June 2026)>)
 - [RoguePlanet - Windows Defender TOCTOU Race LPE via ISO & Junction](<RoguePlanet - Windows Defender TOCTOU Race LPE via ISO & Junction (June 2026)>)
 - [EDRChoker - QoS Bandwidth Throttling EDR Telemetry Suppression](<EDRChoker - QoS Bandwidth Throttling EDR Telemetry Suppression (June 2026)>)
 - [Pink Hacking Group (CL-CRI-1147) - Vishing & Session Cookie Theft & M365 Auto-Exfil](<Pink Hacking Group (CL-CRI-1147) - Vishing & Session Cookie Theft & M365 Auto-Exfil (June 2026)>)
