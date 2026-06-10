@@ -1,0 +1,431 @@
+// ============================================================
+// ROGUEPLANET — Windows Defender TOCTOU Race LPE
+// via ISO Mount + NTFS Junction Redirection
+// Source:   CyberSecurity News (June 10 2026)
+//           PoC: Nightmare Eclipse / Chaotic Eclipse / Dead
+//                Eclipse — released publicly on GitHub.
+//           Huntress confirmed in-the-wild use of the same
+//           operator's prior tooling (BlueHammer, RedSun,
+//           UnDefend).
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1068, T1134.004, T1547, T1548, T1574.011,
+//               T1562.001, T1027
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// RoguePlanet is the fourth Defender-LPE family from the
+// Nightmare-Eclipse operator in 2026 (after BlueHammer,
+// RedSun and MiniPlasma). It abuses a Time-of-Check to
+// Time-of-Use (TOCTOU) race in Microsoft Defender's file-
+// remediation engine: between the moment Defender validates
+// a path and the moment it performs the privileged write,
+// an attacker swaps an NTFS junction so the write lands
+// inside C:\Windows\System32 instead of the original target.
+//
+// Confirmed on FULLY PATCHED Windows 10 / 11 as of the
+// June 2026 Patch Tuesday. Standard-user-to-SYSTEM. Required
+// pre-condition: the user can mount ISO images (which the
+// default Windows policy allows). That requirement is what
+// keeps Windows Server out of scope for this specific PoC.
+//
+// EXPLOITATION CHAIN
+// ---------------------------------------------------------------
+//   1) Standard user mounts an ISO image (or otherwise stages
+//      a writable path Defender will scan).
+//   2) Attacker drops a malicious / EICAR-style file Defender
+//      will move during remediation.
+//   3) Attacker races to replace the staging directory with
+//      an NTFS junction pointing to C:\Windows\System32.
+//   4) Defender, running as SYSTEM, performs the remediation
+//      write into System32 — landing the attacker's payload.
+//   5) Attacker triggers the planted file and obtains SYSTEM.
+//
+// FAMILY LINEAGE — NIGHTMARE-ECLIPSE 2026 DEFENDER LPEs
+// ---------------------------------------------------------------
+//   BlueHammer    (CVE-2026-33825, Apr 2026, patched)
+//   RedSun        (Apr 2026, unpatched at disclosure)
+//   MiniPlasma    (CVE-2020-17103 re-released, May 2026)
+//   RoguePlanet   (June 2026, no CVE yet)
+//   Other tools:  UnDefend, YellowKey, GreenPlasma
+//
+// IN-THE-WILD STATUS
+// ---------------------------------------------------------------
+//   Huntress documented real-world intrusions using BlueHammer,
+//   RedSun and UnDefend BEFORE RoguePlanet's public release.
+//   Treat the operator's prior tooling as confirmed in-the-
+//   wild and assume RoguePlanet will follow quickly.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Genuine IT mounting ISOs to install software — pair the
+//     mount event with the junction creation in the same
+//     short window for high fidelity.
+//   - Legitimate junctions inside user profile folders are
+//     common (OneDrive, Dropbox); the System32 target is the
+//     diagnostic feature, not the junction itself.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/windows-defender-0-day-exploit-rogueplanet/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. POC BINARY / OPERATOR NAME REFERENCES
+//    Direct, highest-fidelity hit. Surfaces "RoguePlanet"
+//    plus the Nightmare-Eclipse lineage of aliases on cmd
+//    line, in filenames, and in repo path references.
+// ------------------------------------------------------------
+let RoguePlanet_Markers = dynamic([
+    "RoguePlanet", "rogueplanet",
+    "Nightmare-Eclipse", "Nightmare_Eclipse",
+    "Chaotic-Eclipse", "Chaotic_Eclipse",
+    "Dead-Eclipse", "Dead_Eclipse",
+    "BlueHammer", "RedSun", "UnDefend",
+    "YellowKey", "GreenPlasma", "MiniPlasma"
+]);
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (RoguePlanet_Markers)
+       or ProcessCommandLine has_any (RoguePlanet_Markers)
+       or InitiatingProcessCommandLine has_any (RoguePlanet_Markers)
+       or ProcessVersionInfoOriginalFileName has_any (RoguePlanet_Markers)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (RoguePlanet_Markers)
+       or FolderPath has_any (RoguePlanet_Markers)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. NTFS JUNCTION CREATION TARGETING C:\Windows\System32
+//    The diagnostic primitive. Catches `mklink /J`,
+//    `New-Item -ItemType Junction`, fsutil reparse, or any
+//    cmdline that creates a junction whose target is inside
+//    System32.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where (FileName =~ "cmd.exe" and ProcessCommandLine has_any ("mklink /J", "mklink /j", "mklink /D /J"))
+   or (FileName in~ ("powershell.exe", "pwsh.exe")
+       and ProcessCommandLine has_any (
+            "New-Item -ItemType Junction",
+            "New-Item -ItemType SymbolicLink",
+            "ItemType Junction", "ItemType SymbolicLink"
+       ))
+   or (FileName =~ "fsutil.exe" and ProcessCommandLine has "reparsepoint")
+| where ProcessCommandLine has_any (
+    @"\Windows\System32", @"\windows\system32",
+    "System32", "system32"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessIntegrityLevel, ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. ISO MOUNT EVENTS BY A STANDARD / LOW-INTEGRITY USER
+//    Pre-requisite. Surfaces every ISO mount initiated outside
+//    a UAC consent / MSI installer trustpath.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where (FileName in~ ("powershell.exe", "pwsh.exe")
+         and ProcessCommandLine has_any ("Mount-DiskImage", "Mount-VHD", "-ImagePath"))
+   or (FileName =~ "diskpart.exe"
+       and ProcessCommandLine has_any ("select vdisk", "attach vdisk"))
+   or (FileName =~ "explorer.exe"
+       and ProcessCommandLine has_any (".iso", ".img", ".vhd", ".vhdx"))
+   or (ProcessCommandLine has_any (".iso\"", ".iso ", "\\.iso")
+       and ProcessCommandLine has_any ("Mount", "mount", "Attach"))
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+   or AccountName !~ "system"
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. ISO FILE CREATION / WRITE IN USER-WRITABLE PATHS
+//    Catches the ISO drop side — particularly ISOs that land
+//    via email or browser download, the typical RoguePlanet
+//    staging step.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".iso"
+   or FileName endswith ".img"
+   or FileName endswith ".vhdx"
+   or FileName endswith ".vhd"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\",
+    @"\Content.Outlook\", @"\INetCache\"
+)
+| where InitiatingProcessFileName in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe",
+    "OUTLOOK.EXE", "olk.exe",
+    "Teams.exe", "ms-teams.exe",
+    "explorer.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. EICAR / TEST-MALWARE DROP IN A USER-CONTROLLED PATH
+//    The trigger for Defender remediation. Surfaces EICAR-
+//    style files dropped in user-writable paths — the bait
+//    for the TOCTOU race.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName has_any ("eicar", "EICAR")
+   or FileName endswith ".eicar.com"
+   or FileName endswith ".com"   // EICAR-classic extension
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\",
+    @"\Cloud\", @"\Drive\"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. MsMpEng.exe / MpDefenderCoreService.exe REMEDIATION WRITES
+//    OUTSIDE EXPECTED LOCATIONS
+//    The exploit's payoff — Defender (SYSTEM) writing into
+//    paths it would not normally write to. Surfaces MsMpEng
+//    or MpDefenderCoreService FileEvents in System32 or other
+//    sensitive folders.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ (
+    "MsMpEng.exe", "MpDefenderCoreService.exe",
+    "NisSrv.exe", "MpCmdRun.exe", "MsSense.exe"
+)
+| where FolderPath startswith @"C:\Windows\System32"
+   or FolderPath startswith @"C:\Windows\SysWOW64"
+   or FolderPath has @"\Tasks\"
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName !endswith ".log"
+   and FileName !endswith ".tmp"
+   and FileName !endswith "MpEnginePolicy.xml"
+| project Timestamp, DeviceName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. STANDARD-USER → SYSTEM-INTEGRITY CHILD WITHOUT UAC
+//    The exploitable outcome. A Medium-integrity user process
+//    producing a SYSTEM child without going through a trusted
+//    installer / consent.exe / TrustedInstaller path.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessIntegrityLevel =~ "System"
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+| where InitiatingProcessFileName !in~ (
+    "consent.exe", "RuntimeBroker.exe", "msiexec.exe",
+    "TiWorker.exe", "TrustedInstaller.exe",
+    "OneDriveSetup.exe", "OneDrive.exe", "OneDriveStandaloneUpdater.exe",
+    "WerFault.exe", "WerFaultSecure.exe", "wuauclt.exe",
+    "sihost.exe", "fontdrvhost.exe", "userinit.exe",
+    "winlogon.exe", "wininit.exe",
+    "MsMpEng.exe", "MpDefenderCoreService.exe"
+)
+| where FileName !in~ (
+    "consent.exe", "WerFault.exe", "WerFaultSecure.exe",
+    "conhost.exe", "splwow64.exe", "smartscreen.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessIntegrityLevel,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. ISO MOUNT + JUNCTION CREATION WITHIN MINUTES
+//    The two structural primitives of RoguePlanet on the same
+//    device inside a 10-minute window — strong triage signal.
+// ------------------------------------------------------------
+let MountEvents = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where (ProcessCommandLine has_any ("Mount-DiskImage", "Mount-VHD", ".iso", ".vhdx"))
+   or (FileName =~ "explorer.exe" and ProcessCommandLine has_any (".iso", ".img"))
+| project DeviceName, MountTime = Timestamp,
+          MountCmd = ProcessCommandLine,
+          MountProc = FileName;
+let JunctionEvents = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where (FileName =~ "cmd.exe" and ProcessCommandLine has "mklink /J")
+   or (FileName in~ ("powershell.exe", "pwsh.exe")
+       and ProcessCommandLine has_any ("New-Item -ItemType Junction", "ItemType Junction"))
+   or (FileName =~ "fsutil.exe" and ProcessCommandLine has "reparsepoint")
+| project DeviceName, JunctionTime = Timestamp,
+          JunctionCmd = ProcessCommandLine;
+MountEvents
+| join kind=inner JunctionEvents on DeviceName
+| where JunctionTime between (MountTime - 5m .. MountTime + 10m)
+| project MountTime, JunctionTime, DeviceName,
+          MountProc, MountCmd, JunctionCmd
+| order by MountTime desc
+
+
+// ------------------------------------------------------------
+// 9. JUNCTION CREATION BY A NON-IT PARENT
+//    Filters generic legitimate use of junctions (OneDrive,
+//    Dropbox, Visual Studio, npm) and surfaces only suspect
+//    parent contexts.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where (FileName =~ "cmd.exe" and ProcessCommandLine has_any ("mklink /J", "mklink /D"))
+   or (FileName in~ ("powershell.exe", "pwsh.exe")
+       and ProcessCommandLine has_any ("New-Item -ItemType Junction", "New-Item -ItemType SymbolicLink"))
+| where InitiatingProcessFileName !in~ (
+    "OneDrive.exe", "Dropbox.exe", "GoogleDriveFS.exe",
+    "devenv.exe", "Code.exe", "node.exe",
+    "msiexec.exe", "TrustedInstaller.exe",
+    "explorer.exe", "WindowsTerminal.exe", "wt.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine,
+          InitiatingProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. NIGHTMARE-ECLIPSE GITHUB CLONE / DOWNLOAD REFERENCES
+//     Catches `git clone` or curl/wget pulling from any
+//     repository under the operator's lineage of aliases.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where ProcessCommandLine has_any (
+    "Nightmare-Eclipse", "Nightmare_Eclipse",
+    "Chaotic-Eclipse", "Dead-Eclipse",
+    "github.com/Nightmare-Eclipse",
+    "github.com/Chaotic-Eclipse",
+    "github.com/Dead-Eclipse",
+    "raw.githubusercontent.com/Nightmare-Eclipse",
+    "raw.githubusercontent.com/Chaotic-Eclipse"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. DEFENDER EXCLUSION ADDED RIGHT BEFORE A JUNCTION OR
+//     ISO MOUNT
+//     Pre-exploit defence-evasion move — the actor may add
+//     an exclusion to avoid spurious detection from the
+//     EICAR drop.
+// ------------------------------------------------------------
+let DefenderExclusions = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+| where ProcessCommandLine has_any ("Add-MpPreference", "Set-MpPreference")
+| where ProcessCommandLine has "ExclusionPath"
+| project DeviceName, ExclTime = Timestamp,
+          ExclCmd = ProcessCommandLine;
+let FollowUp = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where (ProcessCommandLine has_any ("mklink /J", "Mount-DiskImage", "New-Item -ItemType Junction"))
+   or (FileName =~ "fsutil.exe" and ProcessCommandLine has "reparsepoint")
+| project DeviceName, FollowTime = Timestamp,
+          FollowCmd = ProcessCommandLine,
+          FollowFile = FileName;
+DefenderExclusions
+| join kind=inner FollowUp on DeviceName
+| where FollowTime between (ExclTime .. (ExclTime + 30m))
+| project ExclTime, FollowTime, DeviceName,
+          ExclCmd, FollowFile, FollowCmd
+| order by ExclTime desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     ISO mount → EICAR drop in mount path → junction to
+//     System32 → SYSTEM-integrity child from a Medium/Low
+//     parent on the same device within a 10-minute window.
+// ------------------------------------------------------------
+let Stage1_Mount = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any ("Mount-DiskImage", ".iso", ".vhdx", "Mount-VHD")
+| project DeviceName, MountTime = Timestamp,
+          MountCmd = ProcessCommandLine;
+let Stage2_Eicar = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName has_any ("eicar", "EICAR")
+   or FileName endswith ".eicar.com"
+| project DeviceName, EicarTime = Timestamp,
+          EicarFile = FileName, EicarPath = FolderPath;
+let Stage3_Junction = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where (FileName =~ "cmd.exe" and ProcessCommandLine has "mklink /J")
+   or (FileName in~ ("powershell.exe", "pwsh.exe")
+       and ProcessCommandLine has_any ("New-Item -ItemType Junction", "ItemType Junction"))
+| where ProcessCommandLine has "System32" or ProcessCommandLine has "system32"
+| project DeviceName, JunctionTime = Timestamp,
+          JunctionCmd = ProcessCommandLine;
+let Stage4_SystemChild = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessIntegrityLevel =~ "System"
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+| where InitiatingProcessFileName !in~ (
+    "consent.exe", "msiexec.exe", "TiWorker.exe",
+    "TrustedInstaller.exe", "WerFault.exe",
+    "OneDrive.exe", "MsMpEng.exe", "MpDefenderCoreService.exe"
+)
+| project DeviceName, ElevTime = Timestamp,
+          ElevName = FileName, ElevCmd = ProcessCommandLine;
+Stage1_Mount
+| join kind=inner Stage2_Eicar on DeviceName
+| where EicarTime between (MountTime .. (MountTime + 10m))
+| join kind=inner Stage3_Junction on DeviceName
+| where JunctionTime between (EicarTime .. (EicarTime + 10m))
+| join kind=leftouter Stage4_SystemChild on DeviceName
+| where ElevTime between (JunctionTime .. (JunctionTime + 10m))
+| project MountTime, EicarTime, JunctionTime, ElevTime,
+          DeviceName,
+          MountCmd, EicarFile, EicarPath,
+          JunctionCmd, ElevName, ElevCmd
+| order by MountTime desc
