@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **June 2026**
+- [ShinyHunters Oracle PeopleSoft Zero-Day (CVE-2026-35273) - MeshCentral C2 & Education](<ShinyHunters Oracle PeopleSoft Zero-Day (CVE-2026-35273) - MeshCentral C2 & Education (June 2026)>)
 - [ServiceNow Vulnerability Hunting - ACL Bypass & Table API Abuse Posture](<ServiceNow Vulnerability Hunting - ACL Bypass & Table API Abuse Posture (June 2026)>)
 - [Weaponized ChatGPT Download - Electron Trojan & openew.An Typosquat](<Weaponized ChatGPT Download - Electron Trojan & openew.An Typosquat (June 2026)>)
 - [RoguePlanet - Windows Defender TOCTOU Race LPE via ISO & Junction](<RoguePlanet - Windows Defender TOCTOU Race LPE via ISO & Junction (June 2026)>)
