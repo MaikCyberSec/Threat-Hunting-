@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **June 2026**
+- [Ransomware Ecosystem Consolidation - Hyflock RaaS & Silent-Mode Encryption & GPO Spread](<Ransomware Ecosystem Consolidation - Hyflock RaaS & Silent-Mode Encryption & GPO Spread (June 2026)>)
 - [M365 Copilot SearchLeak (CVE-2026-42824) - One-Click P2P Injection & Bing SSRF](<M365 Copilot SearchLeak (CVE-2026-42824) - One-Click P2P Injection & Bing SSRF (June 2026)>)
 - [ShinyHunters Oracle PeopleSoft Zero-Day (CVE-2026-35273) - MeshCentral C2 & Education](<ShinyHunters Oracle PeopleSoft Zero-Day (CVE-2026-35273) - MeshCentral C2 & Education (June 2026)>)
 - [ServiceNow Vulnerability Hunting - ACL Bypass & Table API Abuse Posture](<ServiceNow Vulnerability Hunting - ACL Bypass & Table API Abuse Posture (June 2026)>)

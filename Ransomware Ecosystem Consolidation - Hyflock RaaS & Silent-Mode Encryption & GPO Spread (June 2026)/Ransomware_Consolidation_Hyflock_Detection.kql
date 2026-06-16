@@ -1,0 +1,509 @@
+// ============================================================
+// RANSOMWARE ECOSYSTEM CONSOLIDATION — Q1 2026
+// Hyflock RaaS launch · The Gentlemen 315% QoQ growth ·
+// GPO-based spreading · Silent-mode encryption · Cloud-backup
+// destruction · Cross-platform (Win / Lin / NAS / BSD / ESXi)
+// Source:   CyberSecurity News / Flare Threat Intelligence
+//           (June 16 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1486, T1490, T1485, T1078, T1021.004,
+//               T1547.012 (Print Processors / GPO abuse),
+//               T1562.001, T1078.002, T1110, T1496
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Flare's Q1 2026 report charts a sharp consolidation of the
+// ransomware ecosystem. Three numbers tell the story:
+//
+//   - Qilin            : 338 victims (#1)
+//   - The Gentlemen    : 166 victims (+315% QoQ from 40)
+//   - LockBit 5.0      : 163 victims (#4)
+//   - Top 10 families  : 71% of all 2,122 Q1 victims
+//
+// Two new RaaS programs launched in May 2026, both of which
+// market features specifically built to defeat the defences
+// most enterprises have actually deployed:
+//
+//   HYFLOCK
+//     Operator handle:  hyflock123
+//     QTox contact:     37BC1EC8D8EEE7ECEA44A953855DAC628DF09
+//                       20CE41EE4164006BDC95ADEBA5738C870A23686
+//     Claim:            ~2x encryption speed of LockBit 3.0
+//     Targets:          Windows, Linux, NAS, BSD, ESXi
+//     Differentiator:   AI-based victim-data triage, automated
+//                       negotiation rooms, INITIAL-ACCESS
+//                       PURCHASING built into the panel, and
+//                       cloud-backup destruction.
+//
+//   THE GENTLEMEN RaaS  (separate from the existing UNC track)
+//     Founder:          "hastalamuerte" (claimed ex-Qilin)
+//     Affiliate share:  90% (10 points above LockBit norm)
+//     Targets:          Windows, Linux, NAS, BSD, ESXi
+//     Differentiator:   "SILENT MODE" — encryption WITHOUT a
+//                       file rename or extension change. The
+//                       classic "watch for *.locked" SOC rule
+//                       does not fire.
+//                       Runs without admin rights.
+//                       Auto-generates per-affiliate ransom
+//                       notes.
+//     Forum:            Official BreachForums partnership for
+//                       affiliate / access-broker recruitment.
+//
+// CRITICAL DEFENDER POINT FROM DBIR 2025
+//   54% of ransomware victims had domain credentials surface
+//   in stealer marketplaces BEFORE the attack. Detection of
+//   the *credential leak* and the *post-leak first sign-in*
+//   is the first line, not the encryption event.
+//
+// THIS PACK
+// ---------------------------------------------------------------
+// Targets the SHARED TTP class across the consolidated top
+// families, plus the named Hyflock IOCs. It does NOT duplicate
+// the existing per-family packs in this repo (The Gentlemen
+// Fortinet, Interlock, Vect 2.0, EDR Killers BYOVD); it
+// complements them with the cross-family signals Q1 2026
+// surfaced as the new normal.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/ransomware-ecosystem-consolidates/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. HYFLOCK BRAND + QTOX HANDLE STRING SWEEP
+//    Direct catch on the Hyflock operator handle, the QTox
+//    public key, and the RaaS brand wherever it appears on
+//    disk or in command lines.
+// ------------------------------------------------------------
+let Hyflock_Markers = dynamic([
+    "Hyflock", "HYFLOCK", "hyflock123",
+    "37BC1EC8D8EEE7ECEA44A953855DAC628DF0920CE41EE4164006BDC95ADEBA5738C870A23686",
+    "hastalamuerte"
+]);
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (Hyflock_Markers)
+       or ProcessCommandLine has_any (Hyflock_Markers)
+       or InitiatingProcessCommandLine has_any (Hyflock_Markers)
+       or ProcessVersionInfoOriginalFileName has_any (Hyflock_Markers)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (Hyflock_Markers)
+       or FolderPath has_any (Hyflock_Markers)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. GPO-BASED RANSOMWARE SPREADING
+//    Both Hyflock and The Gentlemen advertise GPO-driven
+//    propagation. Surfaces GPO modifications + scripted
+//    pushes from a workstation context (NOT from a domain
+//    controller's normal admin lineage).
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+    | where ProcessCommandLine has_any (
+        "Set-GPRegistryValue", "Set-GPPrefRegistryValue",
+        "New-GPO", "Backup-GPO", "Import-GPO",
+        "Get-ADComputer", "Get-ADObject",
+        "gpupdate /force",
+        "Invoke-GPUpdate",
+        @"\SYSVOL\", @"\NETLOGON\",
+        "MachineRegistry.pol", "MACHINE.REGISTRY.POL"
+    )
+    | extend EventKind = "GPOActivity"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FolderPath has_any (@"\SYSVOL\", @"\NETLOGON\")
+    | where FileName has_any ("ScheduledTasks.xml", "GroupPolicy.xml",
+                               "MachineRegistry.pol", "Registry.pol",
+                               "psscripts.ini", "scripts.ini")
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where InitiatingProcessFileName !in~ (
+        "MMC.exe", "GPMC.exe", "gpscript.exe",
+        "TrustedInstaller.exe", "TiWorker.exe",
+        "msiexec.exe", "wsmprovhost.exe"
+    )
+    | extend EventKind = "SysvolWrite"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = "",
+              FileName, ProcessCommandLine = FolderPath,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. SILENT-MODE ENCRYPTION DETECTION
+//    The Gentlemen RaaS encrypts WITHOUT renaming. Classic
+//    "watch for *.locked / *.encrypted" SOC rules do not fire.
+//    Surfaces a single process modifying very many files
+//    (FileModified, not FileRenamed) across many directories
+//    in a short window — the in-place overwrite signature.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType == "FileModified"
+| where FileName endswith ".doc" or FileName endswith ".docx"
+   or FileName endswith ".xls" or FileName endswith ".xlsx"
+   or FileName endswith ".ppt" or FileName endswith ".pptx"
+   or FileName endswith ".pdf" or FileName endswith ".rtf"
+   or FileName endswith ".jpg" or FileName endswith ".jpeg"
+   or FileName endswith ".png" or FileName endswith ".bmp"
+   or FileName endswith ".zip" or FileName endswith ".rar"
+   or FileName endswith ".sql" or FileName endswith ".mdb"
+   or FileName endswith ".bak" or FileName endswith ".vhdx"
+| summarize
+    Modifications = count(),
+    Folders       = dcount(FolderPath),
+    DistinctExts  = dcount(tolower(extract(@"\.([^.]+)$", 1, tostring(FileName)))),
+    FirstSeen     = min(Timestamp),
+    LastSeen      = max(Timestamp)
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessId,
+       bin(Timestamp, 5m)
+| where Modifications >= 200 and Folders >= 10 and DistinctExts >= 3
+| extend WindowSec = datetime_diff('second', LastSeen, FirstSeen)
+| where WindowSec <= 600
+| where InitiatingProcessFileName !in~ (
+    "msiexec.exe", "TrustedInstaller.exe", "TiWorker.exe",
+    "OneDrive.exe", "Backup.exe", "wbengine.exe", "vssvc.exe"
+)
+| order by Modifications desc
+
+
+// ------------------------------------------------------------
+// 4. CLOUD-BACKUP TARGETING — VEEAM / AZURE BACKUP / WBADMIN
+//    Hyflock specifically markets "destruction of active
+//    cloud backups". Surfaces touches to Veeam configs,
+//    azcopy with destructive flags, wbadmin delete catalog,
+//    and Azure Backup vault operations.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where (FileName =~ "wbadmin.exe"
+             and ProcessCommandLine has_any ("delete catalog", "delete backup", "delete systemstatebackup"))
+       or (FileName =~ "vssadmin.exe"
+           and ProcessCommandLine has_any ("delete shadows", "delete catalog"))
+       or (FileName =~ "azcopy.exe"
+           and ProcessCommandLine has_any (" remove ", " rm ", "--recursive", "--delete"))
+       or (FileName in~ ("powershell.exe", "pwsh.exe")
+           and ProcessCommandLine has_any (
+                "Remove-AzRecoveryServicesBackupItem",
+                "Disable-AzRecoveryServicesBackupProtection",
+                "Remove-AzRecoveryServicesVault",
+                "Remove-AzStorageBlob"
+           ))
+    | extend EventKind = "BackupDestroy"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FolderPath has_any (
+        @"\Veeam\", @"\Veeam Backup", @"\VeeamVB\",
+        @"\Acronis\", @"\Commvault\",
+        @"\Veritas\NetBackup", @"\NetBackup\",
+        @"\Cohesity\", @"\Rubrik\"
+    )
+    | where ActionType in ("FileModified", "FileDeleted", "FileRenamed")
+    | where InitiatingProcessFileName !in~ (
+        "Veeam.Backup.Manager.exe", "Veeam.Backup.Service.exe",
+        "vbm.exe", "AcronisAgent.exe", "CVODS.exe",
+        "msiexec.exe", "TrustedInstaller.exe"
+    )
+    | extend EventKind = "BackupConfigEdit"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = "",
+              FileName, ProcessCommandLine = FolderPath,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. ESXi / HYPERVISOR ENUMERATION FROM A WINDOWS HOST
+//    Both new RaaS programs target ESXi. A Windows endpoint
+//    invoking esxcli / govc / VMware Tools admin commands is
+//    a strong pre-encryption recon tell.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any (
+    "esxcli ", "vim-cmd ", "vmware-cmd",
+    "govc.exe", "govc ", "PowerCLI",
+    "Connect-VIServer", "Get-VM ", "Stop-VM",
+    "Suspend-VM", "Remove-VM",
+    "Get-VMHost", "Get-Datastore",
+    "vmkfstools"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. RANSOMWARE-NEGOTIATION TOOLS / AI-PANEL HEURISTICS
+//    Hyflock includes AI-based negotiation rooms in the
+//    panel. Surfaces outbound traffic from corporate
+//    endpoints to QTox bootstrap nodes and dark-web
+//    negotiation-portal patterns that may indicate operator
+//    activity from inside the breach.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where (RemotePort == 33445   // QTox default
+         and RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved"))
+   or RemoteUrl has_any (
+        "qtox.github.io", ".onion",
+        "negotiation", "negotiationroom",
+        "ransom-portal", "decrypt-portal"
+   )
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "Tor.exe", "tor.exe",
+    "browser.exe", "qtox.exe", "Tox.exe", "TOX.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. STEALER-TO-RANSOMWARE BRIDGE
+//    DBIR 2025: 54% of ransomware victims had domain creds
+//    surface in stealer marketplaces BEFORE the attack.
+//    Surfaces interactive sign-ins immediately following
+//    stealer-like browser-cred-store reads on the same
+//    device — the "credential just leaked → attacker just
+//    signed in" tell.
+// ------------------------------------------------------------
+let StealerReads = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("Login Data", "Cookies", "Local State", "Web Data",
+                       "logins.json", "key4.db", "cookies.sqlite")
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "OneDrive.exe", "explorer.exe",
+    "SearchIndexer.exe", "MsMpEng.exe",
+    "MpDefenderCoreService.exe", "Bitwarden.exe"
+)
+| project DeviceName, StealerTime = Timestamp,
+          StealerFile = FileName, StealerBy = InitiatingProcessFileName;
+let NewSignins = DeviceLogonEvents
+| where Timestamp > ago(14d)
+| where ActionType == "LogonSuccess"
+| where LogonType =~ "RemoteInteractive" or LogonType =~ "Interactive"
+| project DeviceName, LogonTime = Timestamp,
+          LogonUser = AccountName, LogonType, LogonIP = RemoteIP;
+StealerReads
+| join kind=inner NewSignins on DeviceName
+| where LogonTime between (StealerTime .. (StealerTime + 24h))
+| project StealerTime, LogonTime, DeviceName,
+          StealerFile, StealerBy,
+          LogonType, LogonUser, LogonIP
+| order by StealerTime desc
+
+
+// ------------------------------------------------------------
+// 8. RAPID PARTIAL-WRITE FILE I/O FROM A NON-ELEVATED PROCESS
+//    The Gentlemen runs WITHOUT admin rights. Surfaces
+//    Medium / Low-integrity processes producing very high
+//    write throughput against user document directories.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(24h)
+| where ActionType in ("FileModified", "FileRenamed", "FileCreated")
+| where FolderPath has_any (
+    @":\Users\", @"\Documents\", @"\Desktop\",
+    @"\OneDrive\", @"\SharePoint\",
+    "/home/", "/mnt/", "/srv/"
+)
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+| summarize
+    Writes           = count(),
+    DistinctFolders  = dcount(FolderPath),
+    DistinctExts     = dcount(tolower(extract(@"\.([^.]+)$", 1, tostring(FileName)))),
+    FirstSeen        = min(Timestamp),
+    LastSeen         = max(Timestamp)
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessId,
+       bin(Timestamp, 5m)
+| where Writes >= 300 and DistinctFolders >= 10 and DistinctExts >= 5
+| extend WindowSec = datetime_diff('second', LastSeen, FirstSeen)
+| where WindowSec <= 600
+| order by Writes desc
+
+
+// ------------------------------------------------------------
+// 9. POST-EXPLOIT TOOLING COMMON TO Q1 2026 TOP FAMILIES
+//    Catches the shared toolkit (AdFind, BloodHound,
+//    Mimikatz, SystemBC, Atera, Velociraptor) across Qilin /
+//    The Gentlemen / LockBit 5.0 / Hyflock affiliates.
+// ------------------------------------------------------------
+let ToolMarkers = dynamic([
+    "adfind.exe", "AdFind", "SharpHound", "BloodHound",
+    "mimikatz.exe", "mimikatz", "Invoke-Mimikatz",
+    "systembc", "SystemBC",
+    "AteraAgent", "atera.exe",
+    "ScreenConnect", "ConnectWise",
+    "anydesk_setup", "TightVNC",
+    "winscp.com", "WinSCP",
+    "rclone.exe", "rclone",
+    "MEGAcmd", "MEGAclient",
+    "velociraptor", "Velociraptor",
+    "restic.exe", "restic"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName has_any (ToolMarkers)
+   or ProcessCommandLine has_any (ToolMarkers)
+   or ProcessVersionInfoOriginalFileName has_any (ToolMarkers)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. INITIAL-ACCESS-BROKER ARTEFACTS — FIRST INTERACTIVE
+//     LOGIN FROM A NEW IP ON A USER WHOSE PASSWORD WAS RECENTLY
+//     RESET
+//     Surfaces the "broker hand-off" pattern: the IAB sells
+//     access, the ransomware affiliate logs in from a fresh
+//     IP shortly after a recent credential reset / change.
+// ------------------------------------------------------------
+let RecentResets = AADSignInEventsBeta
+| where Timestamp > ago(30d)
+| where RawEventData has_any ("passwordReset", "ChangePassword", "passwordChange")
+| summarize ResetTime = max(Timestamp) by AccountObjectId, AccountUpn;
+let FirstNewIP = AADSignInEventsBeta
+| where Timestamp > ago(30d)
+| where ErrorCode == 0
+| where IsInteractive == true
+| project SiTime = Timestamp, AccountObjectId, AccountUpn,
+          SiIP = IPAddress, SiCountry = Country,
+          SiUA = UserAgent, SiApp = Application;
+RecentResets
+| join kind=inner FirstNewIP on AccountObjectId
+| where SiTime between (ResetTime .. (ResetTime + 7d))
+| summarize DistinctIPs = dcount(SiIP),
+            SampleIPs = make_set(SiIP, 5),
+            SampleCountries = make_set(SiCountry, 3),
+            FirstLogin = min(SiTime), LastLogin = max(SiTime)
+    by AccountUpn, ResetTime
+| where DistinctIPs >= 2
+| order by ResetTime desc
+
+
+// ------------------------------------------------------------
+// 11. AFFILIATE-SUPPLIED RANSOM-NOTE NAMING HEURISTIC
+//     The Gentlemen auto-generates ransom notes that carry
+//     affiliate contact details. Catches bulk drops of *.txt
+//     / *.html notes referencing decryption portals,
+//     contact handles or wallet addresses across many folders.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".txt" or FileName endswith ".html"
+   or FileName endswith ".hta" or FileName endswith ".htm"
+   or FileName endswith ".onion"
+| where FileName has_any (
+    "READ_ME", "README", "HOW_TO", "DECRYPT", "RECOVER",
+    "RESTORE", "YOUR_FILES", "ransom", "RANSOM",
+    "Hyflock", "HYFLOCK", "GENTLEMEN", "qilin", "QILIN",
+    "LockBit", "LOCKBIT", "decryptor"
+)
+| summarize DropCount = count(),
+            DistinctFolders = dcount(FolderPath),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            SampleNames = make_set(FileName, 8)
+    by DeviceName, InitiatingProcessFileName, bin(Timestamp, 30m)
+| where DropCount >= 5 and DistinctFolders >= 3
+| order by DropCount desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Stealer-style credential read → interactive sign-in from
+//     a new IP within 24h → GPO / Sysvol write OR widespread
+//     low-integrity file modification, all on / by the same
+//     identity / device. Use for cross-family Q1-2026
+//     ransomware triage.
+// ------------------------------------------------------------
+let Stage1_Stealer = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("Login Data", "Cookies", "Local State")
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "OneDrive.exe", "explorer.exe", "MsMpEng.exe", "Bitwarden.exe"
+)
+| project DeviceName, StealerTime = Timestamp,
+          StealerBy = InitiatingProcessFileName;
+let Stage2_NewLogon = DeviceLogonEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LogonSuccess"
+| where LogonType =~ "RemoteInteractive"
+| project DeviceName, LogonTime = Timestamp,
+          LogonUser = AccountName, LogonIP = RemoteIP;
+let Stage3_GPO = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any (
+    "Set-GPRegistryValue", "Set-GPPrefRegistryValue",
+    "Invoke-GPUpdate", "gpupdate /force",
+    @"\SYSVOL\", @"\NETLOGON\"
+)
+| project DeviceName, GPOTime = Timestamp,
+          GPOCmd = ProcessCommandLine;
+let Stage4_MassEncrypt = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileModified", "FileRenamed")
+| summarize EncryptCount = count(), DistinctFolders = dcount(FolderPath),
+            FirstWrite = min(Timestamp), LastWrite = max(Timestamp)
+    by DeviceName, InitiatingProcessFileName, bin(Timestamp, 5m)
+| where EncryptCount >= 200 and DistinctFolders >= 10;
+Stage1_Stealer
+| join kind=inner Stage2_NewLogon on DeviceName
+| where LogonTime between (StealerTime .. (StealerTime + 24h))
+| join kind=leftouter Stage3_GPO on DeviceName
+| where GPOTime between (LogonTime .. (LogonTime + 4h))
+| join kind=leftouter Stage4_MassEncrypt on DeviceName
+| where FirstWrite between (LogonTime .. (LogonTime + 24h))
+| project StealerTime, LogonTime, GPOTime, FirstWrite, LastWrite,
+          DeviceName,
+          StealerBy, LogonUser, LogonIP,
+          GPOCmd,
+          EncryptCount, DistinctFolders,
+          InitiatingProcessFileName
+| order by StealerTime desc
