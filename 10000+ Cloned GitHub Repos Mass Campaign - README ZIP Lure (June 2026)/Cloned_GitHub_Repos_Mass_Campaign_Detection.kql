@@ -1,0 +1,498 @@
+// ============================================================
+// 10,000+ CLONED GITHUB REPOS — Mass-Distributed Malware via
+// README-Linked External ZIPs (SmartLoader / StealC class)
+// Source:   CyberSecurity News / Orchid research (June 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1195.002, T1204.002, T1059.001, T1140,
+//               T1547.001, T1053.005, T1562.001, T1027,
+//               T1567.002
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Orchid documented a mass-cloning campaign: 10,000+ GitHub
+// repositories cloned from legitimate open-source projects,
+// then edited so their README files point at an EXTERNAL ZIP
+// archive hosted off-platform. The payload is split across
+// command scripts, executable loaders and DLLs to defeat
+// per-file VirusTotal scans — only the assembled archive
+// shows detections.
+//
+// Tradecraft fingerprints
+// ---------------------------------------------------------------
+//   - Repositories preserve the original commit history,
+//     contributor profiles and stars to maximise trust.
+//   - "Update README.md" commits are overwritten and re-pushed
+//     every few hours to evade detection.
+//   - Empty-change commits with identical names point at
+//     automated deployment infrastructure.
+//   - Many repos sat undetected for months or years before
+//     Orchid's GH-Archive sweep flagged them.
+//
+// Related families
+// ---------------------------------------------------------------
+//   SmartLoader, StealC (same playbook since early 2025; see
+//   the existing "109 Fake GitHub Repositories" pack in this
+//   repo for the SmartLoader-specific IOC set).
+//
+// Detection focus
+// ---------------------------------------------------------------
+// The article gives no hard IOCs (no hashes, no exact repo
+// names, no C2). This pack therefore hunts the BEHAVIOURAL
+// CLASS — what the chain looks like on a Windows endpoint
+// when a user clones one of the 10,000 affected repos and
+// runs the linked ZIP.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/hackers-github-malicious-script/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. ZIP DOWNLOADED FROM A NON-GITHUB HOST WHILE A USER HAS
+//    GITHUB OPEN — the README-link pattern
+//    The campaign's signature: README on github.com links to
+//    a ZIP hosted on a third-party file-share. Catches the
+//    download moment.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".zip"
+   or FileName endswith ".rar"
+   or FileName endswith ".7z"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\"
+)
+| where InitiatingProcessFileName in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe"
+)
+| where InitiatingProcessCommandLine !has "github.com"
+   and InitiatingProcessCommandLine !has "githubusercontent.com"
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. GIT CLONE OF NEW / OBSCURE REPOSITORY → IMMEDIATE SCRIPT
+//    EXECUTION
+//    Catches the structural pattern: user clones a cloned-
+//    looking repo and a script inside the working directory
+//    fires within minutes.
+// ------------------------------------------------------------
+let ClonedRepos = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("git.exe", "git")
+| where ProcessCommandLine has "clone"
+| where ProcessCommandLine has_any ("github.com/", "githubusercontent.com")
+| project DeviceName, CloneTime = Timestamp,
+          CloneCmd = ProcessCommandLine;
+let RanScript = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "wscript.exe", "cscript.exe",
+    "node.exe", "python.exe", "python3", "python"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Documents\", @"\source\", @"\repos\",
+    @"\Projects\", @"\dev\", @"\Code\", @"\git\"
+)
+   or ProcessCommandLine has_any (
+        @"\Downloads\", @"\Documents\", @"\source\",
+        @"\Projects\", @"\dev\"
+   )
+| project DeviceName, ScriptTime = Timestamp,
+          ScriptFile = FileName, ScriptCmd = ProcessCommandLine,
+          ScriptParent = InitiatingProcessFileName;
+ClonedRepos
+| join kind=inner RanScript on DeviceName
+| where ScriptTime between (CloneTime .. (CloneTime + 30m))
+| project CloneTime, ScriptTime, DeviceName,
+          CloneCmd, ScriptFile, ScriptCmd, ScriptParent
+| order by CloneTime desc
+
+
+// ------------------------------------------------------------
+// 3. RAW GITHUBUSERCONTENT.COM PULLED THEN PIPED TO A SHELL
+//    The "curl raw.githubusercontent.com/... | iex / sh"
+//    pattern — catches both the explicit pipe and the
+//    Invoke-WebRequest + Invoke-Expression two-step.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ (
+    "powershell.exe", "pwsh.exe", "cmd.exe",
+    "curl.exe", "curl", "wget", "wget.exe",
+    "bitsadmin.exe", "certutil.exe"
+)
+| where ProcessCommandLine has "raw.githubusercontent.com"
+   or ProcessCommandLine has "gist.githubusercontent.com"
+| where ProcessCommandLine has_any (
+    "IEX", "Invoke-Expression", "iex ",
+    "| sh", "| bash", "|sh", "|bash",
+    "& powershell", "| powershell",
+    "/c ", "-c "
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. ZIP EXTRACTION → SHELL CHILD WITHIN MINUTES
+//    The unpack-and-run pattern. Catches a zip / 7z / rar
+//    extraction immediately followed by a cmd / powershell /
+//    node / python child running from the extracted folder.
+// ------------------------------------------------------------
+let Extractions = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType == "FileCreated"
+| where FileName endswith ".exe"
+   or FileName endswith ".bat"
+   or FileName endswith ".cmd"
+   or FileName endswith ".ps1"
+   or FileName endswith ".js"
+   or FileName endswith ".vbs"
+   or FileName endswith ".dll"
+| where InitiatingProcessFileName in~ (
+    "7zG.exe", "7zFM.exe", "WinRAR.exe", "Bandizip.exe",
+    "explorer.exe"
+)
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\"
+)
+| project DeviceName, ExtractTime = Timestamp,
+          DroppedFile = FileName, DropPath = FolderPath,
+          Extractor = InitiatingProcessFileName;
+let Children = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "wscript.exe", "cscript.exe",
+    "node.exe", "python.exe", "python3", "python",
+    "rundll32.exe", "regsvr32.exe", "mshta.exe"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\"
+)
+| project DeviceName, ChildTime = Timestamp,
+          ChildFile = FileName, ChildCmd = ProcessCommandLine,
+          ChildParent = InitiatingProcessFileName,
+          ChildParentPath = InitiatingProcessFolderPath;
+Extractions
+| join kind=inner Children on DeviceName
+| where ChildTime between (ExtractTime .. (ExtractTime + 15m))
+| project ExtractTime, ChildTime, DeviceName,
+          DroppedFile, DropPath, Extractor,
+          ChildFile, ChildCmd, ChildParent, ChildParentPath
+| order by ExtractTime desc
+
+
+// ------------------------------------------------------------
+// 5. SCHEDULED TASK CREATED BY A PROCESS RUNNING FROM A
+//    USER-WRITABLE PATH (POST-UNPACK PERSISTENCE)
+//    Catches the persistence step when the dropped binary
+//    sets up a scheduled task — common across SmartLoader /
+//    StealC family payloads.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "schtasks.exe"
+   or (FileName in~ ("powershell.exe", "pwsh.exe")
+       and ProcessCommandLine has_any (
+            "Register-ScheduledTask", "New-ScheduledTask",
+            "schtasks /create"
+       ))
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @"\OneDrive\", @"\Desktop\"
+)
+   or ProcessCommandLine has_any (
+        @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+        @"\AppData\Roaming\"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. REGISTRY RUN-KEY WRITE BY A USER-WRITABLE-PATH BINARY
+//    The other persistence path — Run keys written by a
+//    binary that itself lives in a download / temp directory.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(30d)
+| where RegistryKey has_any (
+    @"\Software\Microsoft\Windows\CurrentVersion\Run",
+    @"\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\"
+)
+| where InitiatingProcessFileName !in~ (
+    "OneDrive.exe", "Teams.exe", "ms-teams.exe",
+    "MicrosoftEdgeUpdate.exe", "GoogleUpdate.exe"
+)
+| project Timestamp, DeviceName,
+          ActionType, RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. DEFENDER EXCLUSION ADDED RIGHT BEFORE A GITHUB-SOURCED
+//    SCRIPT RUNS
+//    Catches the actor's cover-up step. Pair this with
+//    query #3 / #4 to confirm same-device same-window
+//    activity.
+// ------------------------------------------------------------
+let DefenderExclude = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe")
+| where ProcessCommandLine has_any ("Add-MpPreference", "Set-MpPreference")
+| where ProcessCommandLine has_any (
+    "ExclusionPath", "ExclusionProcess", "ExclusionExtension",
+    "DisableRealtimeMonitoring"
+)
+| project DeviceName, ExclTime = Timestamp,
+          ExclCmd = ProcessCommandLine;
+let GhFetch = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any ("github.com", "githubusercontent.com")
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe",
+                       "curl.exe", "curl", "wget", "wget.exe",
+                       "git.exe", "git")
+| project DeviceName, FetchTime = Timestamp,
+          FetchCmd = ProcessCommandLine;
+DefenderExclude
+| join kind=inner GhFetch on DeviceName
+| where FetchTime between (ExclTime - 30m .. ExclTime + 30m)
+| project ExclTime, FetchTime, DeviceName,
+          ExclCmd, FetchCmd
+| order by ExclTime desc
+
+
+// ------------------------------------------------------------
+// 8. BROWSER → CMD/POWERSHELL WITHIN 60 SECONDS OF A
+//    GITHUB.COM VISIT
+//    Catches the "I followed the README link" pattern even
+//    when the download was indirect. Browser open to github
+//    + shell launched moments later from the same user.
+// ------------------------------------------------------------
+let GhBrowse = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any ("github.com", "githubusercontent.com")
+| where InitiatingProcessFileName in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe"
+)
+| project DeviceName, BrowseTime = Timestamp,
+          BrowserProc = InitiatingProcessFileName,
+          GhUrl = RemoteUrl;
+let ShellSpawn = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe")
+| where InitiatingProcessFileName in~ (
+    "explorer.exe", "OUTLOOK.EXE",
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "msedgewebview2.exe"
+)
+| where ProcessCommandLine has_any (
+    "IEX", "Invoke-Expression",
+    "DownloadString", "Net.WebClient",
+    "Invoke-WebRequest", "iwr ",
+    "curl ", "wget ",
+    "FromBase64String", "-EncodedCommand", "-enc "
+)
+| project DeviceName, ShellTime = Timestamp,
+          ShellFile = FileName, ShellCmd = ProcessCommandLine,
+          ShellParent = InitiatingProcessFileName;
+GhBrowse
+| join kind=inner ShellSpawn on DeviceName
+| where ShellTime between (BrowseTime .. (BrowseTime + 60s))
+| project BrowseTime, ShellTime, DeviceName,
+          BrowserProc, GhUrl,
+          ShellParent, ShellFile, ShellCmd
+| order by BrowseTime desc
+
+
+// ------------------------------------------------------------
+// 9. EXECUTABLE / SCRIPT IN A FRESHLY-CLONED GIT WORKING
+//    DIRECTORY
+//    Surfaces .exe / .bat / .ps1 files appearing under a
+//    new GitHub-clone working directory soon after the
+//    clone — the actor's "release blob" living inside the
+//    repo or its README-linked archive.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".exe"
+   or FileName endswith ".bat"
+   or FileName endswith ".cmd"
+   or FileName endswith ".ps1"
+   or FileName endswith ".vbs"
+   or FileName endswith ".js"
+   or FileName endswith ".dll"
+| where FolderPath has_any (
+    @"\source\repos\", @"\Projects\", @"\Documents\GitHub\",
+    @"\dev\", @"\Code\", @"\Repositories\", @"\git\"
+)
+| where InitiatingProcessFileName in~ ("git.exe", "git",
+                                        "GitHubDesktop.exe", "Code.exe",
+                                        "cursor.exe")
+| project Timestamp, DeviceName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. STEALER ARTEFACT FILE ACCESS BY A SHELL FROM A
+//     USER-WRITABLE PATH
+//     The payload tail. Catches reads of browser credential
+//     stores, GitHub PATs, .npmrc and AWS creds by a
+//     PowerShell / cmd / node child whose parent lives in a
+//     download / temp folder.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (
+    "Login Data", "Cookies", "Local State", "Web Data",
+    ".npmrc", "hosts.yml", "credentials"
+)
+   or FolderPath has_any (
+        @"\Google\Chrome\User Data",
+        @"\Microsoft\Edge\User Data",
+        @"\.aws\", @"\.config\gh", @"\.ssh\"
+   )
+| where InitiatingProcessFileName in~ (
+    "powershell.exe", "pwsh.exe", "cmd.exe",
+    "node.exe", "python.exe", "python3", "python"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @"\Desktop\", @"\OneDrive\"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. OUTBOUND EGRESS TO PASTE / FILE-SHARE / DISCORD WEBHOOK
+//     FROM A NON-BROWSER PROCESS
+//     The exfil step. Stealers in this family routinely
+//     POST harvested data to Discord webhooks, paste services
+//     or anonymous file-shares.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "discord.com/api/webhooks",
+    "discordapp.com/api/webhooks",
+    "gist.githubusercontent.com",
+    "pastebin.com", "paste.ee", "rentry.co",
+    "hastebin.com", "0bin.net",
+    "anonfiles.com", "transfer.sh", "file.io",
+    "webhook.site"
+)
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe",
+    "Code.exe", "cursor.exe",
+    "Teams.exe", "ms-teams.exe", "Discord.exe",
+    "OUTLOOK.EXE", "Slack.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     GitHub browse / clone → external ZIP / EXE drop in
+//     user path → shell child running from that path →
+//     paste / webhook / file-share egress. Same device,
+//     30-minute window.
+// ------------------------------------------------------------
+let Stage1_Gh = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any ("github.com", "githubusercontent.com")
+| where InitiatingProcessFileName in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "git.exe", "GitHubDesktop.exe"
+)
+| project DeviceName, GhTime = Timestamp,
+          GhProc = InitiatingProcessFileName,
+          GhUrl = RemoteUrl;
+let Stage2_Drop = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType == "FileCreated"
+| where FileName endswith ".exe"
+   or FileName endswith ".bat"
+   or FileName endswith ".ps1"
+   or FileName endswith ".zip"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\"
+)
+| project DeviceName, DropTime = Timestamp,
+          DropFile = FileName, DropPath = FolderPath, DropSha = SHA256;
+let Stage3_Shell = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\"
+)
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe",
+                       "node.exe", "python.exe", "wscript.exe", "cscript.exe")
+| project DeviceName, ShellTime = Timestamp,
+          ShellFile = FileName, ShellCmd = ProcessCommandLine,
+          ShellParent = InitiatingProcessFileName;
+let Stage4_Exfil = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "discord.com/api/webhooks", "discordapp.com/api/webhooks",
+    "pastebin.com", "anonfiles.com", "transfer.sh", "webhook.site"
+)
+| project DeviceName, ExfilTime = Timestamp,
+          ExfilProc = InitiatingProcessFileName,
+          ExfilUrl = RemoteUrl;
+Stage1_Gh
+| join kind=inner Stage2_Drop on DeviceName
+| where DropTime between (GhTime .. (GhTime + 30m))
+| join kind=inner Stage3_Shell on DeviceName
+| where ShellTime between (DropTime .. (DropTime + 30m))
+| join kind=leftouter Stage4_Exfil on DeviceName
+| where ExfilTime between (ShellTime .. (ShellTime + 1h))
+| project GhTime, DropTime, ShellTime, ExfilTime,
+          DeviceName,
+          GhProc, GhUrl,
+          DropFile, DropPath, DropSha,
+          ShellParent, ShellFile, ShellCmd,
+          ExfilProc, ExfilUrl
+| order by GhTime desc
