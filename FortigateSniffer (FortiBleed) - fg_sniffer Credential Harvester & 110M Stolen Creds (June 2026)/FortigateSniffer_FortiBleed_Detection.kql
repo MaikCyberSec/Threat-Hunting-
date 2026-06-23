@@ -1,0 +1,467 @@
+// ============================================================
+// FORTIGATESNIFFER ("fg_sniffer") — Credential Harvester
+// deployed on 430,000+ FortiGate Firewalls in the FortiBleed
+// Campaign (~110M creds harvested since Feb 2026)
+// Source:   CyberSecurity News / SOCRadar STRU (June 23 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1040, T1040.001, T1110, T1110.004,
+//               T1555, T1078, T1110.003, T1003.006,
+//               T1213.001 (Confluence Code Repositories)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// SOCRadar's Threat Research Unit disclosed FortigateSniffer
+// (alias "fg_sniffer") on June 23 2026. It is a Go-based
+// credential harvester deployed on compromised FortiGate
+// firewalls; once installed it abuses FortiOS's built-in
+// CLI diagnostic command:
+//
+//   diagnose sniffer packet
+//
+// to passively intercept authentication traffic across 24
+// protocols (RADIUS, NTLM, Kerberos, LDAP, RDP, SMB, MSSQL,
+// FTP, Telnet, WinRM, …). The captured PCAPs flow through the
+// "SNIFTRAN" engine, then a "PCAP Deep Analysis Toolkit v5.0"
+// extracts cleartext credentials, NTLMv2 hashes, Kerberos
+// TGS/ASREP tickets, and session cookies.
+//
+// Headline numbers:
+//   - 430,000+ FortiGate firewalls observed in scope.
+//   - 110M+ credentials harvested since February 2026.
+//   - 23,406 unique victim domains; 80,553 appliances.
+//   - 6,127 devices confirmed sniffer-deployed.
+//   - 237,330 working FortiGate credentials in the actor's
+//     "ssh.txt".
+//   - Confirmed victim: a NATO-aligned defence contractor
+//     (DFS exfiltration after 172 cracked Kerberos RC4
+//     hashes).
+//
+// Operator pipeline (5 phases):
+//   1) Recon — Masscan + Shodan + FortiProbe + revenue-rank
+//   2) Initial Access — gen_rotator + mpbrute2.bin (SSH
+//      brute) + forticheck (25,000-thread SSL-VPN stuffing)
+//   3) Deployment — fg_sniffer dropped via valid SSH creds
+//   4) Cracking & Lateral — Hashtopolis-managed Hashcat
+//      cluster + vast.ai GPUs, Telegram-orchestrated;
+//      lateral scripts spray_da.py / smb_test.py / spider.py
+//      / ad_full_audit.py
+//   5) Exfil — backup_dfs.py recursively reads DFS shares
+//      and streams directly to attacker SSH servers
+//
+// Operator tradecraft:
+//   - Cyrillic comments in source (suspected Russian origin).
+//   - GeoIP-restricted C2 (binary-search-optimised ipgeo.csv).
+//   - Active only 07:00–18:00 Moscow Time.
+//
+// CRITICAL DEFENDER POINT
+// ---------------------------------------------------------------
+// The sniffer itself runs on FortiOS — MDE on Windows / Linux
+// endpoints WILL NOT see fg_sniffer executing on the FortiGate
+// appliance. What MDE DOES see is:
+//
+//   - The Windows / Linux variants of the actor's CRACKING /
+//     LATERAL tools if any landed on hosts you own.
+//   - The DOWNSTREAM AD identity activity from the captured
+//     credentials (NTLM relay, Kerberos RC4 abuse, anomalous
+//     RDP / SMB / LDAP after a VPN session).
+//   - Egress from corporate endpoints to the documented C2
+//     infrastructure.
+//
+// IOCs — SHA256
+// ---------------------------------------------------------------
+//   4d0b62d3162d4be391e3ba1e191dad28e5e5d5b161cfdef60eeb4361a92d8413  fg_sniffer_linux_amd64
+//   80d83eb01f28c87a61b51f1f83805e63a791905f019bd3b87f10a10f66efab1e  fg_sniffer_windows_amd64.exe
+//   2c98c86e6bd6f46cbd6c89d855541b9da91515b1bb986641a77e31c5c6aa2abb  mpbrute2.bin
+//   a8b09fd4f7ff2f298b45ca602992f44b3c2ac3746bcdb182c59ab2a20c690954  forticheck
+//
+// IOCs — NETWORK
+// ---------------------------------------------------------------
+//   85.11.187.8        (aggregator / C2)
+//   193.8.187.2        (pentest lab)
+//   193.8.187.42       (credential validation)
+//   193.8.187.26       (sniffer node)
+//   194.113.39.71      (sniffer node)
+//   77.91.122.13       (sniffer node)
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/fortigatesniffer-tool-fortibleed/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN SHA256 HASHES — fg_sniffer / mpbrute2 / forticheck
+//    Direct hit on the four documented binaries across file,
+//    process and image-load telemetry.
+// ------------------------------------------------------------
+let FB_SHA256 = dynamic([
+    "4d0b62d3162d4be391e3ba1e191dad28e5e5d5b161cfdef60eeb4361a92d8413",
+    "80d83eb01f28c87a61b51f1f83805e63a791905f019bd3b87f10a10f66efab1e",
+    "2c98c86e6bd6f46cbd6c89d855541b9da91515b1bb986641a77e31c5c6aa2abb",
+    "a8b09fd4f7ff2f298b45ca602992f44b3c2ac3746bcdb182c59ab2a20c690954"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (FB_SHA256)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine = ""
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (FB_SHA256)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (FB_SHA256)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DOCUMENTED C2 / OPERATOR INFRASTRUCTURE
+//    Direct match on the six documented C2 IPs.
+// ------------------------------------------------------------
+let FB_IPs = dynamic([
+    "85.11.187.8",
+    "193.8.187.2",
+    "193.8.187.42",
+    "193.8.187.26",
+    "194.113.39.71",
+    "77.91.122.13"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteIP in (FB_IPs)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. TOOL FILENAMES BY NAME — fg_sniffer / mpbrute2 /
+//    forticheck / gen_rotator
+//    Surfaces filename or cmdline references regardless of
+//    hash, so renamed builds still light up.
+// ------------------------------------------------------------
+let FB_Names = dynamic([
+    "fg_sniffer", "fg_sniffer_linux_amd64",
+    "fg_sniffer_windows_amd64", "fg_sniffer_windows_amd64.exe",
+    "FortigateSniffer", "fortigatesniffer",
+    "mpbrute2", "mpbrute2.bin",
+    "forticheck", "FortiCheck",
+    "gen_rotator", "SNIFTRAN",
+    "PCAP Deep Analysis Toolkit"
+]);
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (FB_Names)
+       or ProcessCommandLine has_any (FB_Names)
+       or InitiatingProcessCommandLine has_any (FB_Names)
+       or ProcessVersionInfoOriginalFileName has_any (FB_Names)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (FB_Names)
+       or FolderPath has_any (FB_Names)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. ACTOR-NAMED LATERAL / EXFIL PYTHON SCRIPTS
+//    spray_da.py / smb_test.py / spider.py / ad_full_audit.py /
+//    backup_dfs.py — distinctive script names from Phase 4-5.
+// ------------------------------------------------------------
+let FB_Scripts = dynamic([
+    "spray_da.py", "smb_test.py", "spider.py",
+    "ad_full_audit.py", "backup_dfs.py"
+]);
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has_any (FB_Scripts)
+       or InitiatingProcessCommandLine has_any (FB_Scripts)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (FB_Scripts)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = "", FileName, FolderPath,
+              ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. OPERATOR STAGING ARTEFACTS — harvestresults / ssh.txt /
+//    ipgeo.csv / *.pcapng IN UNEXPECTED LOCATIONS
+//    The actor's local data-staging filenames. Catches any
+//    accidental landing of the cracking-host file set on a
+//    monitored endpoint.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("ssh.txt", "ipgeo.csv")
+   or FolderPath has_any ("harvestresults", "harvest_results")
+   or (FileName endswith ".pcapng" and FolderPath has_any (@"\Downloads\", @"\Temp\", "/tmp/"))
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. HASHTOPOLIS / HASHCAT / GPU-CRACKING ARTEFACTS
+//    The operator runs a Hashtopolis-managed Hashcat cluster
+//    with vast.ai GPU rentals, orchestrated via Telegram.
+//    If a cracking host lives in your monitored estate this
+//    will surface it.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any ("hashcat", "hashtopolis", "hashcat.exe")
+   or ProcessCommandLine has_any (
+        "hashtopolis", "Hashtopolis",
+        "hashcat ", "-m 1000", "-m 5500", "-m 5600", "-m 13100",
+        "rcrack", "vast.ai", "vast.ai api"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. KERBEROS RC4 / NTLM RELAY ABUSE — POST-CRACK SIGNALS
+//    Catches the AD-side outcome of stolen FortigateSniffer
+//    credentials: Kerberos sign-ins downgrading to RC4 / etype
+//    23 / encryption that should not be in active use, and
+//    NTLM relay markers.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    AADSignInEventsBeta
+    | where Timestamp > ago(30d)
+    | where ErrorCode == 0
+    | extend Raw = tostring(AuthenticationDetails)
+    | where Raw has_any ("etype 23", "RC4-HMAC", "rc4_hmac", "Kerberos RC4")
+       or Raw has "NTLMv1"
+    | extend EventKind = "AAD"
+    | project Timestamp, EventKind, AccountUpn,
+              IPAddress, Country, UserAgent,
+              ResourceDisplayName, ConditionalAccessStatus
+),
+(
+    IdentityLogonEvents
+    | where Timestamp > ago(30d)
+    | where LogonType =~ "Network"
+    | where Protocol has_any ("Kerberos", "NTLM")
+    | where AdditionalFields has_any ("etype 23", "RC4-HMAC", "rc4_hmac")
+       or RawEventData has_any ("etype 23", "RC4-HMAC")
+    | extend EventKind = "Identity"
+    | project Timestamp, EventKind,
+              AccountUpn = AccountName,
+              IPAddress, Country = "",
+              UserAgent = Protocol,
+              ResourceDisplayName = TargetDeviceName,
+              ConditionalAccessStatus = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. DFS / SMB BULK ENUMERATION ("backup_dfs.py" PATTERN)
+//    Recursive SMB / DFS reads against many shares from one
+//    source — the exfil step. Threshold tuned conservatively;
+//    drop lower for quieter environments.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileModified", "FileRenamed", "FileCreated")
+   or ActionType =~ "FileAccessed"
+| where FolderPath has_any (@"\\\\", "/dfs/", @"\dfs\")
+   or FolderPath matches regex @"^\\\\[^\\]+\\[^\\]+\\"
+| summarize
+    SmbHits         = count(),
+    DistinctShares  = dcount(extract(@"^(\\\\[^\\]+\\[^\\]+)", 1, tostring(FolderPath))),
+    DistinctFiles   = dcount(FileName),
+    FirstSeen       = min(Timestamp),
+    LastSeen        = max(Timestamp)
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessId, bin(Timestamp, 15m)
+| where DistinctShares >= 5 and SmbHits >= 200
+| extend WindowSec = datetime_diff('second', LastSeen, FirstSeen)
+| where WindowSec <= 1800
+| order by SmbHits desc
+
+
+// ------------------------------------------------------------
+// 9. SSL-VPN SUCCESS → AD LATERAL ACTIVITY WITHIN MINUTES
+//    Catches the canonical FortiBleed outcome: an SSL-VPN
+//    sign-in (Entra ID / on-prem FortiAuthenticator side)
+//    followed by NTLM / Kerberos / RDP / SMB use from the
+//    same identity inside 10 minutes.
+// ------------------------------------------------------------
+let SslVpnSuccess = AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| where Application has_any ("FortiClient", "FortiGate", "FortiAuthenticator", "Forti SSL VPN")
+   or ResourceDisplayName has_any ("FortiClient", "FortiGate", "Forti")
+| project VpnTime = Timestamp, User = tolower(AccountUpn),
+          VpnIP = IPAddress, VpnCountry = Country;
+let LateralUse = IdentityLogonEvents
+| where Timestamp > ago(7d)
+| where LogonType in~ ("Network", "RemoteInteractive", "Interactive")
+| where Protocol has_any ("Kerberos", "NTLM", "RDP", "SMB")
+| project LatTime = Timestamp,
+          User = tolower(AccountName),
+          LatProto = Protocol, LatTarget = TargetDeviceName;
+SslVpnSuccess
+| join kind=inner LateralUse on User
+| where LatTime between (VpnTime .. (VpnTime + 10m))
+| project VpnTime, LatTime, User,
+          VpnIP, VpnCountry,
+          LatProto, LatTarget
+| order by VpnTime desc
+
+
+// ------------------------------------------------------------
+// 10. CYRILLIC / RUSSIAN-LOCALE FINGERPRINTS IN PYTHON
+//     SCRIPTS LANDED ON ENDPOINTS
+//     The operator's source carries Cyrillic comments. Surface
+//     .py files dropped in user paths whose content references
+//     Russian-locale or business-hour Moscow-time markers.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".py"
+   or FileName endswith ".go"
+   or FileName endswith ".ps1"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @":\Users\Public\", @"\OneDrive\",
+    "/tmp/", "/var/tmp/"
+)
+| where InitiatingProcessFileName !in~ (
+    "msiexec.exe", "TrustedInstaller.exe",
+    "Code.exe", "cursor.exe", "devenv.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. AD-RECON TOOLING COMMONLY CHAINED POST-FORTIBLEED
+//     SOCRadar maps the lateral phase to SharpHound /
+//     adfind / dsquery / ldapsearch. Generic catch worth
+//     keeping permanently enabled.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName has_any ("SharpHound", "Sharphound", "adfind.exe",
+                           "AdFind", "BloodHound", "dsquery.exe",
+                           "ldapsearch", "ldapdomaindump",
+                           "responder", "Inveigh", "PsExec")
+   or ProcessVersionInfoOriginalFileName has_any (
+        "SharpHound", "AdFind", "BloodHound", "responder", "Inveigh"
+   )
+   or ProcessCommandLine has_any (
+        "Invoke-BloodHound", "Get-DomainTrust",
+        "Get-DomainComputer", "Get-DomainUser -SPN",
+        "dcsync"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Outbound to documented FortiBleed C2 → AD-recon tool
+//     execution → DFS bulk SMB reads, on the same device
+//     inside a 4-hour window.
+// ------------------------------------------------------------
+let Stage1_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteIP in ("85.11.187.8", "193.8.187.2", "193.8.187.42",
+                      "193.8.187.26", "194.113.39.71", "77.91.122.13")
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2_IP = RemoteIP;
+let Stage2_Recon = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName has_any ("SharpHound", "adfind.exe", "BloodHound",
+                           "responder", "Inveigh", "PsExec")
+   or ProcessCommandLine has_any (
+        "Invoke-BloodHound", "Get-DomainComputer", "dcsync"
+   )
+| project DeviceName, ReconTime = Timestamp,
+          ReconTool = FileName, ReconCmd = ProcessCommandLine;
+let Stage3_DFS = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where FolderPath matches regex @"^\\\\[^\\]+\\[^\\]+\\"
+| summarize SmbHits = count(),
+            DistinctShares = dcount(extract(@"^(\\\\[^\\]+\\[^\\]+)", 1, tostring(FolderPath))),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by DeviceName, InitiatingProcessFileName
+| where SmbHits >= 200 and DistinctShares >= 5;
+Stage1_C2
+| join kind=inner Stage2_Recon on DeviceName
+| where ReconTime between (C2Time - 1h .. C2Time + 4h)
+| join kind=leftouter Stage3_DFS on DeviceName
+| where FirstSeen between (ReconTime .. (ReconTime + 4h))
+| project C2Time, ReconTime, FirstSeen, LastSeen,
+          DeviceName,
+          C2Proc, C2_IP,
+          ReconTool, ReconCmd,
+          SmbHits, DistinctShares
+| order by C2Time desc

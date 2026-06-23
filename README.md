@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **June 2026**
+- [FortigateSniffer (FortiBleed) - fg_sniffer Credential Harvester & 110M Stolen Creds](<FortigateSniffer (FortiBleed) - fg_sniffer Credential Harvester & 110M Stolen Creds (June 2026)>)
 - [10,000+ Cloned GitHub Repos Mass Campaign - README ZIP Lure](<10000+ Cloned GitHub Repos Mass Campaign - README ZIP Lure (June 2026)>)
 - [Ransomware Ecosystem Consolidation - Hyflock RaaS & Silent-Mode Encryption & GPO Spread](<Ransomware Ecosystem Consolidation - Hyflock RaaS & Silent-Mode Encryption & GPO Spread (June 2026)>)
 - [M365 Copilot SearchLeak (CVE-2026-42824) - One-Click P2P Injection & Bing SSRF](<M365 Copilot SearchLeak (CVE-2026-42824) - One-Click P2P Injection & Bing SSRF (June 2026)>)
