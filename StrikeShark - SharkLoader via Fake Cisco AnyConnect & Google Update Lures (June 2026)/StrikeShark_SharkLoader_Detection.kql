@@ -1,0 +1,452 @@
+// ============================================================
+// STRIKESHARK — SharkLoader Delivered via Fake Cisco AnyConnect
+// and Fake Google Update Lures; SystemSettings.exe DLL Sideload
+// → Cobalt Strike Beacon (Blowfish-encrypted DscCoreR.mui)
+// Source:   CyberSecurity News / Securelist (Kaspersky)
+//           (June 25 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1218.011, T1574.002, T1547.001, T1053.005,
+//               T1059.003, T1555, T1003.001, T1003.003,
+//               T1036.005, T1140, T1562.008, T1134.005
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Kaspersky Securelist disclosed StrikeShark on June 25 2026.
+// The actor breaks into internet-facing enterprise apps
+// (Exchange / SharePoint / FortiOS / Cisco IOS XE), then drops
+// a trojanised installer disguised as either Cisco AnyConnect
+// VPN or a Google updater. The dropper contains a genuine
+// installer running alongside the malicious chain to keep the
+// user happy.
+//
+// Once on disk, StrikeShark's loader ("SharkLoader") uses
+// classic DLL sideloading: the legitimate signed Microsoft
+// binary "SystemSettings.exe" is copied OUT of its normal
+// path (`%WINDIR%\ImmersiveControlPanel\`) and run from a
+// new location, where it loads a malicious "SystemSettings.dll"
+// in the same folder. From there:
+//
+//   - "DscCoreR.mui"  — Blowfish-encrypted Cobalt Strike
+//                       Beacon payload, decrypted in memory.
+//   - "SyncRes.dat"   — AES-128-encrypted API-hook DLL that
+//                       patches EtwEventWrite / EventWrite to
+//                       suppress ETW telemetry.
+//   - Parent-PID spoofing via svchost.exe.
+//   - Two scheduled tasks: one fires every 5 minutes (long
+//     persistence), one fires every second post-deploy and
+//     self-deletes ~1.5 seconds later (one-shot launcher).
+//   - Post-exploit: LSASS dump + ntdsutil for AD password
+//     hashes; lateral tooling FScan / Searchall / Pillager
+//     (Chinese-speaker-developed open-source).
+//
+// Confirmed victims include government and diplomatic targets
+// in Indonesia, Taiwan, Hong Kong, Lebanon, Syria, Colombia,
+// North Macedonia, Nepal, and Serbia.
+//
+// IOCs — NETWORK
+// ---------------------------------------------------------------
+//   connect-microsoft[.]com
+//   ms-record[.]com
+//   ms-record[.]top
+//   ms-tray[.]top
+//
+// IOCs — MD5
+// ---------------------------------------------------------------
+//   Installer:        C559CC68986933200FD5D9E4388E2F58
+//   Dropper:          B3352B42432DEDC4A519F011DC8B5D5A
+//   Dropper:          24FCEBDEECBA65004FDB0923763D74FD
+//   SharkLoader DLL:  9C872A0D5D5A38950E8B9AC9B488BE3F
+//   SharkLoader DLL:  AA3086BE652C8B20B0B29B2730D57119
+//   DscCoreR.mui:     A514D1BB62D7916475946FE7C07AC0AA
+//   SyncRes.dat:      9CBD560F820C95D7C38342CD558CB5C6
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/hackers-use-cisco-anyconnect-and-google-update-lures/
+//   https://securelist.com/strikeshark-campaign/120326/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN MD5 HASHES (FILE + PROCESS + IMAGE LOAD)
+//    Direct hit on all 7 documented MD5s across the three
+//    Defender file-/process-/image-load tables.
+// ------------------------------------------------------------
+let StrikeShark_MD5 = dynamic([
+    "c559cc68986933200fd5d9e4388e2f58",
+    "b3352b42432dedc4a519f011dc8b5d5a",
+    "24fcebdeecba65004fdb0923763d74fd",
+    "9c872a0d5d5a38950e8b9ac9b488be3f",
+    "aa3086be652c8b20b0b29b2730d57119",
+    "a514d1bb62d7916475946fe7c07ac0aa",
+    "9cbd560f820c95d7c38342cd558cb5c6"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (StrikeShark_MD5)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine = ""
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (StrikeShark_MD5)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (StrikeShark_MD5)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DOCUMENTED C2 DOMAINS
+//    Direct catch on the four documented StrikeShark C2 hosts.
+// ------------------------------------------------------------
+let StrikeShark_Domains = dynamic([
+    "connect-microsoft.com",
+    "ms-record.com",
+    "ms-record.top",
+    "ms-tray.top"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteUrl has_any (StrikeShark_Domains)
+   or tostring(parse_url(RemoteUrl).Host) in (StrikeShark_Domains)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. LURE-INSTALLER FILENAMES (CISCO ANYCONNECT / GOOGLE UPDATE)
+//    Catches the exact dropper filenames Securelist documented.
+// ------------------------------------------------------------
+let StrikeShark_Lures = dynamic([
+    "AnyConnect-win-4.10.04071-predeploy-k9exe",
+    "AnyConnect-win-4.10.04071-predeploy-k9.exe",
+    "GoogleUpdateStepup.exe",
+    "AutoUpdate.exe"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FileName in~ (StrikeShark_Lures)
+       or FileName has "AnyConnect-win-4.10.04071-predeploy"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, MD5,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (StrikeShark_Lures)
+       or FileName has "AnyConnect-win-4.10.04071-predeploy"
+       or ProcessVersionInfoOriginalFileName in~ (StrikeShark_Lures)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, MD5,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. SYSTEMSETTINGS.EXE OUTSIDE ITS LEGITIMATE PATH
+//    The sideload carrier. SystemSettings.exe normally lives
+//    under C:\Windows\ImmersiveControlPanel\. Anywhere else
+//    is anomalous and almost certainly malicious.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "SystemSettings.exe"
+    | where FolderPath !startswith @"C:\Windows\ImmersiveControlPanel"
+       and FolderPath !startswith @"C:\Windows\System32"
+       and FolderPath !startswith @"C:\Windows\SystemApps"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, MD5,
+              ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "SystemSettings.exe"
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FolderPath !startswith @"C:\Windows\ImmersiveControlPanel"
+       and FolderPath !startswith @"C:\Windows\System32"
+    | extend EventKind = "FileCopy"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, MD5,
+              ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. SYSTEMSETTINGS.DLL SIDELOAD FROM A NON-WINDOWS PATH
+//    The exploit primitive: SystemSettings.exe loading
+//    SystemSettings.dll from a directory that is NOT inside
+//    C:\Windows\.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(60d)
+| where FileName =~ "SystemSettings.dll"
+| where InitiatingProcessFileName =~ "SystemSettings.exe"
+| where FolderPath !startswith @"C:\Windows"
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, SHA256, MD5
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. NAMED ENCRYPTED MODULES — DscCoreR.mui / SyncRes.dat
+//    The Blowfish / AES-128 modules SharkLoader decrypts in
+//    memory. Filenames are distinctive.
+// ------------------------------------------------------------
+let StrikeShark_Modules = dynamic([
+    "DscCoreR.mui", "SyncRes.dat"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (StrikeShark_Modules)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, MD5,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (StrikeShark_Modules)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, MD5,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. SCHEDULED TASK CREATED THEN REMOVED WITHIN SECONDS
+//    StrikeShark's one-shot "launch then self-delete" task
+//    fires every second and is removed ~1.5 s later. Catches
+//    rapid create-then-delete cycles on schtasks.
+// ------------------------------------------------------------
+let TaskCreates = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "schtasks.exe"
+| where ProcessCommandLine has_any ("/create", "/Create", "create /")
+| project DeviceName, CreateTime = Timestamp,
+          CreateCmd = ProcessCommandLine,
+          CreateParent = InitiatingProcessFileName,
+          CreateName = extract(@"/TN\s+""?([^""\s]+)", 1, tostring(ProcessCommandLine));
+let TaskDeletes = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "schtasks.exe"
+| where ProcessCommandLine has_any ("/delete", "/Delete", "/F")
+| project DeviceName, DeleteTime = Timestamp,
+          DeleteCmd = ProcessCommandLine,
+          DeleteName = extract(@"/TN\s+""?([^""\s]+)", 1, tostring(ProcessCommandLine));
+TaskCreates
+| join kind=inner TaskDeletes on DeviceName
+| where DeleteTime between (CreateTime .. (CreateTime + 10s))
+| where CreateName != "" and CreateName == DeleteName
+| project CreateTime, DeleteTime, DeviceName,
+          CreateName, CreateParent, CreateCmd, DeleteCmd
+| order by CreateTime desc
+
+
+// ------------------------------------------------------------
+// 8. SCHEDULED TASK FIRING EVERY ~5 MINUTES (PERSISTENCE)
+//    StrikeShark's long-term persistence is a task with a
+//    5-minute interval. Catches the explicit "/SC MINUTE /MO 5"
+//    pattern and any task whose name lines up with the
+//    SystemSettings sideload binary.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName =~ "schtasks.exe"
+| where ProcessCommandLine has_any ("/create", "/Create")
+| where ProcessCommandLine has_any (
+    "/SC MINUTE /MO 5", "/sc MINUTE /mo 5",
+    "/SC MINUTE /MO 1", "/SC ONLOGON",
+    "/SC ONSTART"
+)
+   or ProcessCommandLine has_any (
+        "SystemSettings", "DscCoreR", "SyncRes"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. POST-EXPLOIT TOOLING — FSCAN / SEARCHALL / PILLAGER
+//    The Chinese-speaker-developed open-source toolkit
+//    chained after SharkLoader. Direct name match.
+// ------------------------------------------------------------
+let StrikeShark_Tools = dynamic([
+    "fscan.exe", "fscan",
+    "searchall.exe", "searchall",
+    "pillager.exe", "pillager",
+    "Searchall64.exe", "Pillager64.exe"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ (StrikeShark_Tools)
+   or ProcessVersionInfoOriginalFileName in~ (StrikeShark_Tools)
+   or ProcessCommandLine has_any ("fscan ", "searchall ", "pillager ",
+                                   "-h 192.", "-h 10.", "-h 172.")
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. NTDSUTIL / LSASS DUMPING — POST-COMPROMISE CRED THEFT
+//     StrikeShark's documented credential-theft tail.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where (FileName =~ "ntdsutil.exe"
+         and ProcessCommandLine has_any ("ifm", "create full", "snapshot"))
+   or (FileName =~ "vssadmin.exe"
+       and ProcessCommandLine has "create shadow")
+   or (FileName in~ ("powershell.exe", "pwsh.exe")
+       and ProcessCommandLine has_any (
+            "Out-MiniDump", "Invoke-Mimikatz",
+            "lsadump::dcsync", "sekurlsa::logonpasswords",
+            "Get-ADReplAccount"
+       ))
+   or (FileName =~ "rundll32.exe"
+       and ProcessCommandLine has "comsvcs.dll"
+       and ProcessCommandLine has_any ("MiniDump", "#24"))
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. ETW HOOK / EVENTWRITE TAMPER MARKERS
+//     SyncRes.dat patches EtwEventWrite / EventWrite to
+//     suppress telemetry. Catches PowerShell / .NET cmdline
+//     references to those APIs.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has_any (
+        "EtwEventWrite", "EventWrite",
+        "EtwNotificationRegister",
+        "EtwEventEnabled", "Patch ETW",
+        "DisableETW"
+    )
+    | extend Body = ProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(60d)
+    | where ActionType in ("PowerShellCommand", "ScriptContent")
+    | extend Body = tostring(parse_json(AdditionalFields).Command)
+    | where isnotempty(Body)
+    | where Body has_any (
+        "EtwEventWrite", "EventWrite",
+        "Patch ETW", "DisableETW",
+        "PatchEtwEventWrite"
+    )
+)
+| project Timestamp, DeviceName, FileName,
+          InitiatingProcessFileName, Body
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Lure-named installer dropped → SystemSettings.exe runs
+//     from a non-Windows path → outbound to a documented
+//     StrikeShark C2 domain, on the same device inside a
+//     2-hour window.
+// ------------------------------------------------------------
+let Stage1_Lure = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ (
+    "AnyConnect-win-4.10.04071-predeploy-k9exe",
+    "GoogleUpdateStepup.exe",
+    "AutoUpdate.exe"
+)
+   or FileName has "AnyConnect-win-4.10.04071-predeploy"
+   or tolower(MD5) in (
+        "c559cc68986933200fd5d9e4388e2f58",
+        "b3352b42432dedc4a519f011dc8b5d5a",
+        "24fcebdeecba65004fdb0923763d74fd"
+   )
+| project DeviceName, LureTime = Timestamp,
+          LureFile = FileName, LurePath = FolderPath, LureMD5 = MD5;
+let Stage2_Sideload = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "SystemSettings.exe"
+| where FolderPath !startswith @"C:\Windows"
+| project DeviceName, SideloadTime = Timestamp,
+          SideloadPath = FolderPath, SideloadCmd = ProcessCommandLine;
+let Stage3_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "connect-microsoft.com",
+    "ms-record.com", "ms-record.top",
+    "ms-tray.top"
+)
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_Lure
+| join kind=inner Stage2_Sideload on DeviceName
+| where SideloadTime between (LureTime .. (LureTime + 2h))
+| join kind=leftouter Stage3_C2 on DeviceName
+| where C2Time between (SideloadTime .. (SideloadTime + 2h))
+| project LureTime, SideloadTime, C2Time,
+          DeviceName,
+          LureFile, LurePath, LureMD5,
+          SideloadPath, SideloadCmd,
+          C2Proc, C2_IP, C2_Url
+| order by LureTime desc
