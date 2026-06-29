@@ -1,0 +1,469 @@
+// ============================================================
+// MILLENIUM RAT v4 — Native C++ Rewrite, Telegram-Bot C2,
+// "Microsoft Antivirus.exe" Masquerade, Y2K Operators MaaS
+// Source:   CyberSecurity News / Group-IB (June 2026)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1566, T1204.002, T1547.001, T1059.001,
+//               T1140, T1027, T1056.004, T1113, T1115,
+//               T1555.003, T1539, T1071.001, T1041,
+//               T1548.002 (UAC bypass)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Group-IB attributes Millenium RAT v4 to a MaaS crew tracked
+// as "Y2K Operators". The author handle "shinyenigma" sells
+// it at $50 / first month, $10 renewal, $90 lifetime. The big
+// change in v4 is the language rewrite: the .NET v2.4 baseline
+// (first seen Nov 2023) has been rebuilt in native C++ — no
+// .NET dependency, smaller surface for signature engines, and
+// trivial polymorphism (random bytes appended to the embedded
+// config to mutate the hash per build).
+//
+// Operational reach: 62,000+ infected devices across 160
+// countries; 39,000 in Q1 2026 alone.
+//
+// Trade-craft on the endpoint:
+//
+//   - Lures: credit-card generators, crypto checkers, hacking
+//     toolkits, cracked software, gaming utilities. PowerShell-
+//     triggered shortcuts (.lnk) open a decoy PDF while the
+//     RAT runs.
+//   - Install path: %APPDATA%\<install_foldername>\
+//   - Masquerade filenames: svchost.exe, MsEdgeUpdate.exe AND
+//     the more distinctive "Microsoft Antivirus.exe" (no real
+//     Microsoft product with that name exists; it is a clean
+//     IOC by itself).
+//   - Persistence: HKCU\Software\Microsoft\Windows\
+//     CurrentVersion\Run autorun entry.
+//   - C2: Telegram Bot API. No dedicated server required, so
+//     egress blends with normal web traffic to api.telegram.org.
+//   - Config blob: Base64 + custom XOR, embedded as a resource.
+//   - Capabilities: keystroke logging, screenshots, webcam,
+//     audio capture, clipboard, browser credential + cookie
+//     theft, Telegram/Discord session theft, file management,
+//     UAC-prompt-based privilege escalation.
+//
+// IOCs — NETWORK
+// ---------------------------------------------------------------
+//   75877.mcdir.me              (Telegram Bot API proxy)
+//   blackhatusa.com             (distribution)
+//   milleniumrat.online         (promotional)
+//   158.94.208.168              (delivery)
+//   hxxp://158.94.208.168/files/8514679081/DRTjyu7.exe
+//   hxxps://blackhatusa.com/{setup,clip,mr,update}.exe
+//   hxxps://75877.mcdir.me/files/doc1.exe
+//
+// IOCs — SHA256 (DOCUMENTED SAMPLES)
+// ---------------------------------------------------------------
+//   1d699a46339626db299548e32ed3a77eec267840c3de39b49caf38b88aeb150d
+//   2267d05dbd5e30c6dfcdde25731280dd755e689faa684bd21cfbef5281fd3e86
+//   12b41c07299d2535f7cdc194d97496acd944a9eb5d94b8d24b19291ed9d0830c
+//   (+ 35 additional hashes per Group-IB; add to the dynamic
+//    array in query #1 as you receive them)
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/millenium-rat-rewritten-in-c/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN SHA256 HASHES (FILE + PROCESS + IMAGE LOAD)
+//    Direct hit on the documented sample hashes.
+// ------------------------------------------------------------
+let Millenium_SHA256 = dynamic([
+    "1d699a46339626db299548e32ed3a77eec267840c3de39b49caf38b88aeb150d",
+    "2267d05dbd5e30c6dfcdde25731280dd755e689faa684bd21cfbef5281fd3e86",
+    "12b41c07299d2535f7cdc194d97496acd944a9eb5d94b8d24b19291ed9d0830c"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (Millenium_SHA256)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine = ""
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (Millenium_SHA256)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (Millenium_SHA256)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DOCUMENTED DOMAINS + DELIVERY IP
+//    Direct match on the four documented network IOCs.
+// ------------------------------------------------------------
+let Millenium_Domains = dynamic([
+    "75877.mcdir.me",
+    "blackhatusa.com",
+    "milleniumrat.online"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteIP == "158.94.208.168"
+   or RemoteUrl has_any (Millenium_Domains)
+   or tostring(parse_url(RemoteUrl).Host) in (Millenium_Domains)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. "Microsoft Antivirus.exe" MASQUERADE — ANY OCCURRENCE
+//    Microsoft has no product called "Microsoft Antivirus".
+//    The file name alone is a clean IOC anywhere on the disk
+//    or in any command line.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "Microsoft Antivirus.exe"
+       or FileName =~ "Microsoft_Antivirus.exe"
+       or FileName has "Microsoft Antivirus.exe"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "Microsoft Antivirus.exe"
+       or ProcessVersionInfoOriginalFileName =~ "Microsoft Antivirus.exe"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. SVCHOST.EXE / MSEDGEUPDATE.EXE OUTSIDE THEIR LEGITIMATE
+//    PATHS
+//    The other two masquerade choices. Real svchost.exe lives
+//    in System32 / SysWOW64; real MsEdgeUpdate.exe lives under
+//    `\Microsoft\EdgeUpdate\`. Anything else is a strong
+//    suspect.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "svchost.exe"
+    | where FolderPath !startswith @"C:\Windows\System32"
+       and FolderPath !startswith @"C:\Windows\SysWOW64"
+       and FolderPath !startswith @"C:\Windows\WinSxS"
+       and FolderPath !startswith @"C:\$WINDOWS.~BT"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "MsEdgeUpdate.exe"
+       or FileName =~ "MicrosoftEdgeUpdate.exe"
+    | where FolderPath !startswith @"C:\Program Files\Microsoft"
+       and FolderPath !startswith @"C:\Program Files (x86)\Microsoft"
+       and FolderPath !startswith @"C:\Windows"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. TELEGRAM BOT API EGRESS FROM A NON-BROWSER / NON-TELEGRAM
+//    PROCESS
+//    Millenium RAT v4 uses api.telegram.org as its sole C2.
+//    Any non-browser, non-Telegram-client process calling it
+//    is essentially diagnostic.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (
+    "api.telegram.org",
+    "core.telegram.org",
+    "/bot",                       // bot tokens are usually /bot<TOKEN>/
+    "/sendMessage", "/sendDocument", "/sendPhoto"
+)
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe",
+    "Telegram.exe", "tdesktop.exe", "TelegramDesktop.exe",
+    "OUTLOOK.EXE", "Teams.exe", "ms-teams.exe",
+    "Code.exe", "cursor.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. HKCU\...\RUN AUTORUN WRITTEN BY A %APPDATA% BINARY
+//    Persistence — Millenium RAT writes its Run-key entry
+//    pointing at the install folder under %APPDATA%. Surfaces
+//    Run-key changes whose writer lives in a user-writable
+//    path.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryKey has_any (
+    @"\Software\Microsoft\Windows\CurrentVersion\Run",
+    @"\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\AppData\Roaming\", @"\AppData\Local\",
+    @"\Downloads\", @"\Temp\", @"\Desktop\",
+    @"\OneDrive\", @":\Users\Public\"
+)
+| where InitiatingProcessFileName !in~ (
+    "OneDrive.exe", "Teams.exe", "ms-teams.exe",
+    "MicrosoftEdgeUpdate.exe", "GoogleUpdate.exe",
+    "Code.exe", "cursor.exe", "Slack.exe", "Discord.exe"
+)
+| project Timestamp, DeviceName,
+          ActionType, RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. LURE LNK SHORTCUT POWERSHELL TRIGGER → DECOY PDF + RAT
+//    Catches the .lnk-to-PowerShell chain that opens a decoy
+//    PDF while running the RAT.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where InitiatingProcessFileName in~ ("explorer.exe", "winrar.exe", "7zG.exe", "7zFM.exe")
+| where ProcessCommandLine has_any (
+    ".lnk", "Start-Process", "Invoke-WebRequest", "iwr ",
+    "IEX", "Invoke-Expression",
+    "DownloadString", "Net.WebClient",
+    "FromBase64String", "-EncodedCommand", "-enc ",
+    ".pdf", "AcroRd32"
+)
+   and ProcessCommandLine has_any (
+        "AppData\\Roaming", "AppData\\Local\\Temp",
+        "\\Downloads\\", "\\Desktop\\"
+   )
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. BLACKHATUSA / MCDIR DELIVERY URLs ON COMMAND LINE
+//    Catches scripted / curl-style downloads from the
+//    documented distribution sites. Survives infrastructure
+//    rotation beyond a single subdomain.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where ProcessCommandLine has_any (
+    "blackhatusa.com", "milleniumrat.online",
+    "mcdir.me", "75877.mcdir.me",
+    "158.94.208.168", "DRTjyu7.exe",
+    "/files/8514679081/", "/files/doc1.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. UAC-PROMPT ABUSE — CONSENT.EXE LAUNCHED BY A
+//    %APPDATA% / DOWNLOAD-PATH BINARY
+//    Millenium RAT v4 escalates by triggering UAC and relying
+//    on user click-through. Surfaces consent.exe prompts
+//    whose parent process lives in a user-writable path.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "consent.exe"
+| where InitiatingProcessFolderPath has_any (
+    @"\AppData\Roaming\", @"\AppData\Local\Temp",
+    @"\Downloads\", @"\Desktop\",
+    @"\OneDrive\", @":\Users\Public\"
+)
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "Code.exe", "cursor.exe", "Teams.exe", "ms-teams.exe",
+    "OUTLOOK.EXE", "Discord.exe", "Slack.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. BROWSER CRED / DISCORD / TELEGRAM SESSION READ BY A
+//     NON-BROWSER PROCESS
+//     The Millenium RAT v4 capability set in action. Catches
+//     reads against Chrome / Edge / Firefox credential stores,
+//     Discord LocalStorage, and the Telegram Desktop tdata
+//     folder.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("Login Data", "Cookies", "Local State", "Web Data",
+                       "logins.json", "key4.db", "cookies.sqlite")
+   or FolderPath has_any (
+        @"\Google\Chrome\User Data",
+        @"\Microsoft\Edge\User Data",
+        @"\Mozilla\Firefox\Profiles",
+        @"\Discord\Local Storage",
+        @"\discordcanary\Local Storage",
+        @"\discordptb\Local Storage",
+        @"\Telegram Desktop\tdata"
+   )
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "OneDrive.exe", "explorer.exe",
+    "SearchIndexer.exe", "MsMpEng.exe",
+    "MpDefenderCoreService.exe", "Bitwarden.exe",
+    "Telegram.exe", "tdesktop.exe", "Discord.exe", "DiscordCanary.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. SCREENSHOT / WEBCAM / AUDIO CAPTURE BY UNUSUAL PROCESS
+//     Millenium RAT v4 captures screen, webcam and audio.
+//     Surfaces low-integrity processes calling the Win32
+//     APIs that drive those captures.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has_any (
+        "CopyFromScreen", "BitBlt", "PrintWindow",
+        "MFCaptureEngine", "MediaCapture",
+        "DirectShow", "Win32_PnPEntity",
+        "waveInOpen", "waveInStart",
+        "MFEnumDeviceSources", "ICreateDevEnum"
+    )
+    | extend Body = ProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("PowerShellCommand", "ScriptContent")
+    | extend Body = tostring(parse_json(AdditionalFields).Command)
+    | where isnotempty(Body)
+    | where Body has_any (
+        "CopyFromScreen", "MFCaptureEngine",
+        "waveInOpen", "MediaCapture"
+    )
+)
+| project Timestamp, DeviceName, FileName,
+          InitiatingProcessFileName, Body
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Lure URL hit / installer drop → "Microsoft Antivirus.exe"
+//     (or svchost / MsEdgeUpdate masquerade) executes from
+//     %APPDATA% → HKCU\Run autorun → Telegram Bot API egress,
+//     all on the same device inside a 2-hour window.
+// ------------------------------------------------------------
+let Stage1_Drop = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where (FileName =~ "Microsoft Antivirus.exe"
+         or FileName has "Microsoft Antivirus")
+   or tolower(SHA256) in (
+        "1d699a46339626db299548e32ed3a77eec267840c3de39b49caf38b88aeb150d",
+        "2267d05dbd5e30c6dfcdde25731280dd755e689faa684bd21cfbef5281fd3e86",
+        "12b41c07299d2535f7cdc194d97496acd944a9eb5d94b8d24b19291ed9d0830c"
+   )
+| where FolderPath has_any (
+    @"\AppData\Roaming\", @"\AppData\Local\",
+    @"\Downloads\", @"\Desktop\"
+)
+| project DeviceName, DropTime = Timestamp,
+          DropFile = FileName, DropPath = FolderPath, DropSha = SHA256;
+let Stage2_Persist = DeviceRegistryEvents
+| where Timestamp > ago(7d)
+| where RegistryKey has @"\Software\Microsoft\Windows\CurrentVersion\Run"
+| where InitiatingProcessFolderPath has_any (
+    @"\AppData\Roaming\", @"\AppData\Local\"
+)
+| project DeviceName, PersistTime = Timestamp,
+          RunValue = RegistryValueData,
+          PersistBy = InitiatingProcessFileName;
+let Stage3_C2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any ("api.telegram.org", "75877.mcdir.me",
+                            "blackhatusa.com", "milleniumrat.online")
+   or RemoteIP == "158.94.208.168"
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "Telegram.exe", "tdesktop.exe"
+)
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_Drop
+| join kind=inner Stage2_Persist on DeviceName
+| where PersistTime between (DropTime .. (DropTime + 1h))
+| join kind=leftouter Stage3_C2 on DeviceName
+| where C2Time between (PersistTime .. (PersistTime + 2h))
+| project DropTime, PersistTime, C2Time,
+          DeviceName,
+          DropFile, DropPath, DropSha,
+          RunValue, PersistBy,
+          C2Proc, C2_IP, C2_Url
+| order by DropTime desc

@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **June 2026**
+- [Millenium RAT v4 - C++ Rewrite Y2K Operators Telegram C2](<Millenium RAT v4 - C++ Rewrite Y2K Operators Telegram C2 (June 2026)>)
 - [StrikeShark - SharkLoader via Fake Cisco AnyConnect & Google Update Lures](<StrikeShark - SharkLoader via Fake Cisco AnyConnect & Google Update Lures (June 2026)>)
 - [FortigateSniffer (FortiBleed) - fg_sniffer Credential Harvester & 110M Stolen Creds](<FortigateSniffer (FortiBleed) - fg_sniffer Credential Harvester & 110M Stolen Creds (June 2026)>)
 - [10,000+ Cloned GitHub Repos Mass Campaign - README ZIP Lure](<10000+ Cloned GitHub Repos Mass Campaign - README ZIP Lure (June 2026)>)
