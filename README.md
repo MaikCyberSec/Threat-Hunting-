@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **June 2026**
+- [Oracle E-Business Suite CVE-2026-46817 - Payments File Transmission Unauth RCE](<Oracle E-Business Suite CVE-2026-46817 - Payments File Transmission Unauth RCE (June 2026)>)
 - [Millenium RAT v4 - C++ Rewrite Y2K Operators Telegram C2](<Millenium RAT v4 - C++ Rewrite Y2K Operators Telegram C2 (June 2026)>)
 - [StrikeShark - SharkLoader via Fake Cisco AnyConnect & Google Update Lures](<StrikeShark - SharkLoader via Fake Cisco AnyConnect & Google Update Lures (June 2026)>)
 - [FortigateSniffer (FortiBleed) - fg_sniffer Credential Harvester & 110M Stolen Creds](<FortigateSniffer (FortiBleed) - fg_sniffer Credential Harvester & 110M Stolen Creds (June 2026)>)
