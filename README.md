@@ -35,6 +35,9 @@ All queries are built for:
 
 ### Recent Additions
 
+**July 2026**
+- [ChocoPoC RAT - Trojanized PoC Exploits & PyPI Dependency Poison Targeting Researchers](<ChocoPoC RAT - Trojanized PoC Exploits & PyPI Dependency Poison Targeting Researchers (July 2026)>)
+
 **June 2026**
 - [Oracle E-Business Suite CVE-2026-46817 - Payments File Transmission Unauth RCE](<Oracle E-Business Suite CVE-2026-46817 - Payments File Transmission Unauth RCE (June 2026)>)
 - [Millenium RAT v4 - C++ Rewrite Y2K Operators Telegram C2](<Millenium RAT v4 - C++ Rewrite Y2K Operators Telegram C2 (June 2026)>)
