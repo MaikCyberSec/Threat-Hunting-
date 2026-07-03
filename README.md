@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **July 2026**
+- [Ransomware Convergence - Citrix Bleed 2 (CVE-2025-5777) & BYOVD & Supply-Chain Creds](<Ransomware Convergence - Citrix Bleed 2 (CVE-2025-5777) & BYOVD & Supply-Chain Creds (July 2026)>)
 - [ChocoPoC RAT - Trojanized PoC Exploits & PyPI Dependency Poison Targeting Researchers](<ChocoPoC RAT - Trojanized PoC Exploits & PyPI Dependency Poison Targeting Researchers (July 2026)>)
 
 **June 2026**
