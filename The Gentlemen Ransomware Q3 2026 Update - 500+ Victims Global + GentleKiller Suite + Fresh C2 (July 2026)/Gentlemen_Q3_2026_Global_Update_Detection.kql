@@ -1,0 +1,459 @@
+// ============================================================
+// THE GENTLEMEN — Q3 2026 GLOBAL UPDATE
+// 500+ Victims / 70+ Countries · GentleKiller BYOVD Suite ·
+// Fresh Encryptor Extensions · New C2 · Post-Breach Upgrades
+// Source:   CyberSecurity News / Trend Micro / Huntress /
+//           PRODAFT / ESET / Microsoft TI / Check Point
+//           (July 7-8 2026 — synthesis published after the
+//           May 2026 Rocket.Chat backend leak of 16.22 GB)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1190, T1078, T1562.001, T1574.011,
+//               T1070.001, T1484.001, T1486, T1561,
+//               T1055, T1090.003, T1219
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// COMPLEMENT to the existing "The Gentlemen Ransomware -
+// Fortinet CVE-2024-55591 & G-BOT C2 (May 2026)" pack in this
+// repo. Do NOT retire that one — its IOCs remain live. This
+// update layers the new IOCs and TTPs that appeared AFTER
+// PRODAFT tracked The Gentlemen from 40 victims in Q4 2025 to
+// 500+ across 70+ countries by mid-2026 (~10 % of global
+// ransomware activity in April).
+//
+// The Q3 2026 view is that of a tier-1 organised operation:
+// nine named operators, 90 % affiliate revenue share, official
+// BreachForums recruitment partnership, and — since the May
+// 2026 Rocket.Chat backend breach that exposed 3,366 internal
+// chat messages, 1,570+ victims and the full toolchain — the
+// group has publicly announced technical upgrades that this
+// pack targets specifically.
+//
+// WHAT'S NEW SINCE THE MAY 2026 PACK
+// ---------------------------------------------------------------
+//
+//   Broader CVE toolkit:
+//     CVE-2024-55591  Fortinet mgmt-interface auth bypass
+//                      (still the primary entry; 14,700+
+//                       unpatched devices tracked)
+//     CVE-2025-32433  Erlang/OTP SSH pre-auth RCE (Cisco stack)
+//     CVE-2025-33073  Windows NTLM relay / EoP
+//     CVE-2025-7771   TechPowerUp ThrottleStop.sys BYOVD
+//                     → ThrottleBlood.sys variant
+//     CVE-2023-27532  Veeam Backup & Replication (backup kill)
+//     CVE-2024-37085  VMware ESXi auth bypass (ESXi locker)
+//
+//   New encryptor extensions (replace .i8p14s over time):
+//     .umc16h  .7mtzhh  .fjn1jw
+//
+//   Persistent masquerade:
+//     svchost32.exe   (SOCKS proxy beacon; not the real
+//                      svchost.exe — note the trailing "32")
+//
+//   Persistence artefacts:
+//     Scheduled tasks: gentlemen_system, UpdateSystem,
+//                       UpdateUser, WindowsConnSvc
+//     Registry Run:     HKLM\Run\GupdateS, HKCU\Run\GupdateU
+//     Staging:          GentlemenCollection\
+//     Wallpaper:        %TEMP%\gentlemen.bmp
+//
+//   GentleKiller BYOVD suite (in-house EDR-killers; 8 variants
+//   targeting 400+ security processes across 48 vendors):
+//     Kasps.exe, FaceIT1.exe, Valorant2.exe (dropper names)
+//     eb.sys, nseckrnl.sys, vgk.sys, stpm_old.sys,
+//     stpm_new.sys, dmx.sys, 360netmon_wfp.sys, G11.sys,
+//     googleApiUtil64.sys, ThrottleBlood.sys, havoc.sys
+//
+//   Third-party EDR killers now integrated:
+//     HexKiller (Baidu BdApi), HavocKiller (Huawei Audio)
+//
+//   Data-theft / lateral tooling:
+//     OxideHarvest / buildx641.exe (Rust NTDS+LSASS stealer)
+//     MANSPIDER, NetExec (NXC), RelayKing-Depth
+//     PrivHound, TaskHound, CertiHound (ADCS ESC1-17)
+//     Velociraptor (offensive C2 with LSASS collection)
+//     ZeroPulse, SystemBC, Cobalt Strike, gogo.exe
+//     Titanis (ETW patching framework), zerosalarium
+//     anti-forensics techniques
+//
+//   Fresh C2:
+//     193.233.202.17  : 44729   (SOCKS proxy for svchost32.exe)
+//     77.110.122.137  : 37182   (alt SOCKS proxy)
+//     45.86.230.112            (pre-ransomware staging)
+//     Cloudflare WARP tunnels from non-IT endpoints
+//
+//   Named operators (Rocket.Chat leak):
+//     hastalamuerte (a.k.a. zeta88, PRODAFT LARVA-368)
+//     qbit, quant, Wick, mAst3r, Protagor,
+//     Bl0ck, JeLLy, Kunder, Mamba, and n7778 (the
+//     insider who sold the 16.22 GB backup)
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/gentlemen-ransomware-global-attacks/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN HASHES — Q3 2026 UPDATE
+//    New SHA256 / SHA1 samples layered on top of the May pack.
+// ------------------------------------------------------------
+let Gentlemen_SHA256 = dynamic([
+    "22b38dad7da097ea03aa28d0614164cd25fafeb1383dbc15047e34c8050f6f67",
+    "f918535f974591ef031bd0f30a8171e3da27a6754e6426a8ba095f83195661c8"
+]);
+let Gentlemen_SHA1 = dynamic([
+    "8ae6bd18b129061f63642531f1b684cf0383c75d",  // Kasps.exe
+    "d605994fc72a2bb59b5cfb1624a1b9170eca73a2",  // FaceIT1.exe
+    "5aa3124e5c4921e5edfc60133b5d71da21b07da3",  // Valorant2.exe
+    "a5cf917ec4a7dfbdfa43621398604805d860c718",  // buildx641.exe
+    "d4b19141102015d436321e6f26976e98183cfd27",  // buildx64.exe
+    "c12c4d58541cc4f75ae19b65295a52c559570054"   // Mackay Sugar sample
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (Gentlemen_SHA256)
+       or tolower(SHA1) in (Gentlemen_SHA1)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA1, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where tolower(SHA256) in (Gentlemen_SHA256)
+       or tolower(SHA1) in (Gentlemen_SHA1)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA1, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. NEW C2 INFRASTRUCTURE — 193.233.202.17 / 77.110.122.137 /
+//    45.86.230.112
+//    Direct match on the three fresh IPs. Any hit is the
+//    campaign with high confidence.
+// ------------------------------------------------------------
+let Gentlemen_IPs = dynamic([
+    "193.233.202.17",
+    "77.110.122.137",
+    "45.86.230.112"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteIP in (Gentlemen_IPs)
+   or RemotePort in (44729, 37182)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. "svchost32.exe" MASQUERADE — ANY OCCURRENCE
+//    The real Windows process is svchost.exe. "svchost32.exe"
+//    is the SOCKS proxy beacon. File or process by that exact
+//    name anywhere on disk is essentially diagnostic.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "svchost32.exe"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, SHA1,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "svchost32.exe"
+       or ProcessVersionInfoOriginalFileName =~ "svchost32.exe"
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, SHA1,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. Q3-2026 ENCRYPTED FILE EXTENSIONS
+//    .umc16h / .7mtzhh / .fjn1jw are the newly-observed
+//    variations layered on top of the earlier .i8p14s. Note
+//    the actor rotates the extension per build; treat any
+//    non-standard 6-character-random extension on many files
+//    at once as a candidate.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileRenamed", "FileCreated", "FileModified")
+| where FileName endswith ".umc16h"
+   or FileName endswith ".7mtzhh"
+   or FileName endswith ".fjn1jw"
+   or FileName endswith ".i8p14s"
+| summarize
+    EncryptCount    = count(),
+    DistinctFolders = dcount(FolderPath),
+    DistinctExts    = dcount(tolower(extract(@"\.([^.]+)$", 1, tostring(FileName)))),
+    FirstSeen       = min(Timestamp),
+    LastSeen        = max(Timestamp),
+    SampleNames     = make_set(FileName, 8)
+    by DeviceName, InitiatingProcessFileName, InitiatingProcessId, bin(Timestamp, 5m)
+| where EncryptCount >= 10
+| order by EncryptCount desc
+
+
+// ------------------------------------------------------------
+// 5. Q3-2026 PERSISTENCE ARTEFACTS
+//    Scheduled task and Run-key names disclosed post-Rocket-
+//    Chat leak. Direct match anywhere in cmdline / registry.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ ("schtasks.exe", "powershell.exe", "pwsh.exe", "sc.exe")
+    | where ProcessCommandLine has_any (
+        "gentlemen_system", "UpdateSystem", "UpdateUser",
+        "WindowsConnSvc",
+        "GupdateS", "GupdateU"
+    )
+    | extend EventKind = "ProcessCmd"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceRegistryEvents
+    | where Timestamp > ago(60d)
+    | where (RegistryKey has_any (
+        @"\Software\Microsoft\Windows\CurrentVersion\Run",
+        @"\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+    ))
+    | where RegistryValueName in~ ("GupdateS", "GupdateU")
+       or RegistryValueData has_any ("gentlemen", "GupdateS", "GupdateU",
+                                      "GentlemenCollection", "svchost32")
+    | extend EventKind = "Registry"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = InitiatingProcessAccountName,
+              FileName = "",
+              ProcessCommandLine = RegistryValueData,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. STAGING DIRECTORY + WALLPAPER ARTEFACTS
+//    GentlemenCollection\ staging path and %TEMP%\gentlemen.bmp
+//    wallpaper — both direct-match diagnostic.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where FolderPath has "GentlemenCollection"
+   or (FileName =~ "gentlemen.bmp" and FolderPath has_any (@"\Temp\", @"\AppData\Local\Temp"))
+   or FileName has "gentlemen.bmp"
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. GENTLEKILLER BYOVD DRIVERS — 12 KNOWN NAMES
+//    Direct name match across image-load and file events.
+// ------------------------------------------------------------
+let GentleKiller_Drivers = dynamic([
+    "eb.sys", "nseckrnl.sys", "vgk.sys",
+    "stpm_old.sys", "stpm_new.sys", "dmx.sys",
+    "360netmon_wfp.sys", "G11.sys", "googleApiUtil64.sys",
+    "ThrottleBlood.sys", "havoc.sys",
+    "BdApi.sys",           // HexKiller
+    "HuaweiAudio.sys"      // HavocKiller
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (GentleKiller_Drivers)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (GentleKiller_Drivers)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. GENTLEKILLER DROPPER FILENAMES (KASPS / FACEIT / VALORANT)
+//    Distinctive impersonation names for the in-house EDR-
+//    killer suite.
+// ------------------------------------------------------------
+let GentleKiller_Droppers = dynamic([
+    "Kasps.exe", "kasps.exe", "kaspersky_updater.exe",
+    "FaceIT1.exe", "FaceIT.exe", "faceit.exe",
+    "Valorant2.exe", "valorant2.exe", "vgc.exe",
+    "Javelin.exe", "javelin.exe",
+    "WatchDog.exe", "Cleaner.exe",
+    "G11.exe", "HexKiller.exe", "HavocKiller.exe"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (GentleKiller_Droppers)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, SHA1,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (GentleKiller_Droppers)
+       or ProcessVersionInfoOriginalFileName in~ (GentleKiller_Droppers)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256, SHA1,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. OXIDEHARVEST / BUILDX641 + ADCS ENUMERATION TOOLS
+//    Named credential harvester + the -Hound trio for
+//    ADCS ESC1-17 abuse.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName has_any (
+    "OxideHarvest", "buildx641", "buildx64",
+    "PrivHound", "TaskHound", "CertiHound",
+    "MANSPIDER", "NetExec", "nxc.exe", "RelayKing",
+    "Titanis", "ZeroPulse", "gogo.exe"
+)
+   or ProcessCommandLine has_any (
+        "OxideHarvest", "buildx641", "PrivHound",
+        "TaskHound", "CertiHound", "MANSPIDER",
+        "netexec ", "nxc smb ", "RelayKing-Depth",
+        "Titanis", "ZeroPulse", "gogo -p"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. VEEAM / ESXi / ERLANG CVE PATTERNS
+//     Catches PoC / weaponised scripts referencing the newly-
+//     integrated CVEs.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where ProcessCommandLine has_any (
+    "CVE-2025-32433", "Erlang/OTP", "erlang otp ssh",
+    "CVE-2025-33073", "RelayKing", "NTLM relay",
+    "CVE-2025-7771", "ThrottleStop.sys", "ThrottleBlood",
+    "CVE-2023-27532", "Veeam.Backup.Manager",
+    "veeam backup", "veeambackup",
+    "CVE-2024-37085", "esxi bypass", "ESXi auth"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. WEVTUTIL LOG-CLEARING (100% OF INCIDENTS)
+//     Trend Micro reports wevtutil clearing in 100% of
+//     Gentlemen incidents. Wide-net catch worth keeping
+//     permanently enabled.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "wevtutil.exe"
+| where ProcessCommandLine has_any (
+    "cl System", "cl Application", "cl Security",
+    "clear-log System", "clear-log Application", "clear-log Security"
+)
+   or (FileName in~ ("powershell.exe", "pwsh.exe")
+       and ProcessCommandLine has_any (
+            "Clear-EventLog", "Clear-EventLog -LogName",
+            "Remove-EventLog", "wevtutil cl"
+       ))
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     GentleKiller driver load or Q3-encrypter extension
+//     rename → svchost32.exe outbound to the new C2 IPs on
+//     ports 44729 / 37182 → wevtutil log clear, same device
+//     inside a 4-hour window.
+// ------------------------------------------------------------
+let Stage1_Killer = DeviceImageLoadEvents
+| where Timestamp > ago(7d)
+| where FileName in~ (
+    "eb.sys", "nseckrnl.sys", "vgk.sys",
+    "stpm_old.sys", "stpm_new.sys", "dmx.sys",
+    "360netmon_wfp.sys", "G11.sys", "googleApiUtil64.sys",
+    "ThrottleBlood.sys", "havoc.sys"
+)
+| project DeviceName, KillerTime = Timestamp,
+          KillerFile = FileName, KillerPath = FolderPath;
+let Stage2_Beacon = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where (RemoteIP in ("193.233.202.17", "77.110.122.137", "45.86.230.112")
+         or RemotePort in (44729, 37182))
+   or InitiatingProcessFileName =~ "svchost32.exe"
+| project DeviceName, BeaconTime = Timestamp,
+          BeaconProc = InitiatingProcessFileName,
+          BeaconIP = RemoteIP, BeaconPort = RemotePort;
+let Stage3_LogClear = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "wevtutil.exe"
+| where ProcessCommandLine has_any ("cl System", "cl Application", "cl Security")
+| project DeviceName, ClearTime = Timestamp,
+          ClearCmd = ProcessCommandLine;
+Stage1_Killer
+| join kind=inner Stage2_Beacon on DeviceName
+| where BeaconTime between (KillerTime - 1h .. KillerTime + 4h)
+| join kind=leftouter Stage3_LogClear on DeviceName
+| where ClearTime between (KillerTime .. (KillerTime + 4h))
+| project KillerTime, BeaconTime, ClearTime,
+          DeviceName,
+          KillerFile, KillerPath,
+          BeaconProc, BeaconIP, BeaconPort,
+          ClearCmd
+| order by KillerTime desc
