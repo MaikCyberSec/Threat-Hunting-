@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **July 2026**
+- [APT-C-20 PNG Steganography Backdoor - Fileless docm + COM Hijack + Filen.io C2](<APT-C-20 PNG Steganography Backdoor - Fileless docm + COM Hijack + Filen.io C2 (July 2026)>)
 - [The Gentlemen Ransomware Q3 2026 Update - 500+ Victims Global + GentleKiller Suite + Fresh C2](<The Gentlemen Ransomware Q3 2026 Update - 500+ Victims Global + GentleKiller Suite + Fresh C2 (July 2026)>)
 - [BeyondTrust RS + PRA Vulnerabilities (CVE-2026-40138 to 40141) - Advisory BT26-03](<BeyondTrust RS + PRA Vulnerabilities (CVE-2026-40138 to 40141) - Advisory BT26-03 (July 2026)>)
 - [Ransomware Convergence - Citrix Bleed 2 (CVE-2025-5777) & BYOVD & Supply-Chain Creds](<Ransomware Convergence - Citrix Bleed 2 (CVE-2025-5777) & BYOVD & Supply-Chain Creds (July 2026)>)

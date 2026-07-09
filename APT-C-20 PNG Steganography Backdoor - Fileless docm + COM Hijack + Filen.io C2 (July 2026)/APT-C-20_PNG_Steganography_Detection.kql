@@ -1,0 +1,462 @@
+// ============================================================
+// APT-C-20 (APT28 / Fancy Bear) — PNG-Steganography Backdoor
+// via Fileless docm → dnxstore.dll → EdgeLogo.png → Publish.exe
+// with COM Hijack Persistence and Filen.io Cloud C2
+// Source:   CyberSecurity News / 360 Threat Intelligence
+//           (July 2026); espionage targeting Eastern European
+//           government + defence.
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1204.002, T1566.001, T1547.009 (COM Hijack),
+//               T1140, T1027 (Steganography), T1112,
+//               T1055 (Process Injection), T1041, T1071.002,
+//               T1102 (Web Service C2)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// 360 Threat Intelligence disclosed a Russian-aligned APT-C-20
+// operation (aliases include APT28 / Fancy Bear) targeting
+// Eastern European government and defence entities with an
+// almost-entirely fileless chain that hides its shellcode
+// inside a PNG image.
+//
+// The kill chain:
+//
+//   1) Spearphishing — a tiny (~469 bytes) macro-enabled Word
+//      document arrives as "readme.docm", styled as defence-
+//      ministry correspondence. The user enables macros; a
+//      decoy body renders while the encrypted VBA runs.
+//   2) The macro drops two files to %PROGRAMDATA%:
+//         dnxstore.dll   — shellcode loader
+//         EdgeLogo.png   — steganography container
+//      then reaches out to dropbox.com as a benign network
+//      connectivity check.
+//   3) Persistence is COM HIJACKING — a specific COM CLSID is
+//      redirected under HKCU\Software\Classes\CLSID\...\
+//      InprocServer32 to dnxstore.dll; when Explorer initialises
+//      the object at logon, the loader executes in the
+//      explorer.exe process.
+//   4) dnxstore.dll reads EdgeLogo.png, extracts shellcode
+//      hidden in the LEAST-SIGNIFICANT BITS of the pixel data
+//      (LSB steganography), derives the decryption key /
+//      salt / IV from other pixels, decrypts entirely in
+//      memory, and reflective-DLL-injects the final stage.
+//   5) Final payload — Publish.exe — is an obfuscated C#
+//      backdoor. It packages username + domain + system
+//      metadata into JSON and beacons to the Filen.io cloud
+//      storage gateway (gateway.filen.io / gateway.filen.net)
+//      for C2.
+//
+// The article makes the defender problem explicit:
+//   "Since the final payload never touches disk as a
+//    standalone executable, defenders must rely on
+//    BEHAVIOUR-based detection rather than file scanning."
+//
+// IOC HASHES (MD5)
+// ---------------------------------------------------------------
+//   readme.docm     77014b3e77529079f041b5b9e73a013b
+//   dnxstore.dll    b077401fe3d9642345d4c3deafa60aa5
+//   Publish.exe     8d416eca59188474efa3408827578588b
+//
+// IOC NETWORK
+// ---------------------------------------------------------------
+//   gateway.filen.io       (primary C2)
+//   gateway.filen.net      (backup C2)
+//   dropbox.com            (reconnaissance / connectivity check)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate Filen.io end-user backups. Pair the Filen
+//     network hit with a non-browser initiator for fidelity.
+//   - Legitimate COM Class registry entries under HKCU when
+//     signed installers register genuine components. Pin
+//     known signers.
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN MD5 HASHES (FILE + PROCESS + IMAGE LOAD)
+//    Direct hit on the three documented artefacts across
+//    Defender's file / process / image-load tables.
+// ------------------------------------------------------------
+let APTC20_MD5 = dynamic([
+    "77014b3e77529079f041b5b9e73a013b",
+    "b077401fe3d9642345d4c3deafa60aa5",
+    "8d416eca59188474efa3408827578588b"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (APTC20_MD5)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (APTC20_MD5)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where tolower(MD5) in (APTC20_MD5)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. FILEN.IO C2 GATEWAY EGRESS FROM A NON-BROWSER PROCESS
+//    The final Publish.exe stage beacons to Filen.io. Any
+//    non-browser process contacting gateway.filen.io /
+//    gateway.filen.net is essentially diagnostic.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("ConnectionSuccess", "DnsConnectionInspected")
+| where RemoteUrl has_any (
+    "gateway.filen.io",
+    "gateway.filen.net",
+    ".filen.io", ".filen.net"
+)
+   or tostring(parse_url(RemoteUrl).Host) has_any (
+        "gateway.filen.io", "gateway.filen.net"
+   )
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe", "Filen.exe", "filen-desktop.exe"
+)
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. NAMED IOC FILES — readme.docm / dnxstore.dll /
+//    EdgeLogo.png / Publish.exe
+//    Direct filename catch regardless of hash. Survives
+//    variant rebuilds if only the payload rotates.
+// ------------------------------------------------------------
+let APTC20_Names = dynamic([
+    "readme.docm", "dnxstore.dll",
+    "EdgeLogo.png", "Publish.exe"
+]);
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (APTC20_Names)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (APTC20_Names)
+       or ProcessVersionInfoOriginalFileName in~ (APTC20_Names)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(60d)
+    | where FileName in~ (APTC20_Names)
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, MD5, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. WORD DOCM MACRO SPAWNING SUSPICIOUS CHILDREN
+//    The delivery-side signature. WINWORD.EXE spawning
+//    powershell / cmd / wscript / rundll32 / regsvr32 / mshta
+//    is essentially always malicious.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("WINWORD.EXE", "winword.exe")
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "wscript.exe", "cscript.exe",
+    "rundll32.exe", "regsvr32.exe", "mshta.exe",
+    "certutil.exe", "bitsadmin.exe",
+    "curl.exe", "wget.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. FILES DROPPED TO %PROGRAMDATA%\ FROM WORD / EXPLORER
+//    APT-C-20 stages dnxstore.dll + EdgeLogo.png into
+//    C:\ProgramData\. Surfaces PNG / DLL / EXE writes to
+//    the ProgramData root by Word or interactive Explorer
+//    child processes.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath startswith @"C:\ProgramData"
+| where (FileName endswith ".dll"
+         or FileName endswith ".png"
+         or FileName endswith ".exe"
+         or FileName endswith ".jpg"
+         or FileName endswith ".bmp")
+| where InitiatingProcessFileName in~ (
+    "WINWORD.EXE", "winword.exe",
+    "EXCEL.EXE", "POWERPNT.EXE",
+    "wscript.exe", "cscript.exe",
+    "powershell.exe", "pwsh.exe",
+    "cmd.exe", "mshta.exe",
+    "OUTLOOK.EXE"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256, MD5,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. COM HIJACK — HKCU CLSID InprocServer32 POINTING AT A
+//    USER-WRITABLE PATH
+//    The persistence primitive. Legitimate InprocServer32
+//    values point at Program Files or system32. Pointing at
+//    ProgramData, AppData, Downloads or Temp is essentially
+//    diagnostic of a COM-hijack persistence write.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryKey has @"\Software\Classes\CLSID\"
+   and RegistryKey has @"\InprocServer32"
+| where RegistryValueData has_any (
+    @"C:\ProgramData\", @"\AppData\Roaming\",
+    @"\AppData\Local\", @"\Downloads\",
+    @"\Temp\", @"\AppData\Local\Temp"
+)
+| where RegistryValueData endswith ".dll"
+| where InitiatingProcessFileName !in~ (
+    "msiexec.exe", "TrustedInstaller.exe", "TiWorker.exe",
+    "OneDrive.exe", "OneDriveSetup.exe"
+)
+| project Timestamp, DeviceName,
+          ActionType, RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. DLL LOADED BY EXPLORER.EXE FROM %PROGRAMDATA% OR
+//    %APPDATA%
+//    The runtime side of the COM hijack — explorer.exe
+//    loads a DLL out of ProgramData / AppData. Legitimate
+//    Windows DLLs never live there.
+// ------------------------------------------------------------
+DeviceImageLoadEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where FileName endswith ".dll"
+| where FolderPath startswith @"C:\ProgramData"
+   or FolderPath has @"\AppData\Roaming\"
+   or FolderPath has @"\AppData\Local\"
+   or FolderPath has @":\Users\Public\"
+| where FolderPath !startswith @"C:\ProgramData\Microsoft"
+   and FolderPath !startswith @"C:\ProgramData\Adobe"
+   and FolderPath !startswith @"C:\ProgramData\Google"
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, SHA256, MD5
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. PNG FILE ACCESS BY A NON-IMAGE PROCESS
+//    Catches the LSB-steganography read step. Any PNG read
+//    by a DLL loader / shellcode extractor rather than a
+//    browser / image viewer is worth surfacing when tied to
+//    ProgramData or AppData.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName endswith ".png"
+| where FolderPath startswith @"C:\ProgramData"
+   or FolderPath has @"\AppData\Roaming\"
+   or FolderPath has @"\AppData\Local\"
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe", "brave.exe",
+    "msedgewebview2.exe",
+    "explorer.exe", "OneDrive.exe",
+    "Photos.exe", "PhotosApp.exe",
+    "mspaint.exe", "WINWORD.EXE", "EXCEL.EXE",
+    "POWERPNT.EXE", "OUTLOOK.EXE",
+    "Teams.exe", "ms-teams.exe",
+    "SearchIndexer.exe"
+)
+| where InitiatingProcessFileName endswith ".exe"
+   or InitiatingProcessFileName endswith ".dll"
+| project Timestamp, DeviceName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. SUSPICIOUS DOCM DROPS — TINY WORD MACRO FILES (~500 B)
+//    readme.docm is only 469 bytes. Anomalously tiny .docm
+//    files landing from email / browser is a lure fingerprint.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".docm"
+   or FileName endswith ".dotm"
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Content.Outlook\", @"\INetCache\",
+    @"\Desktop\", @"\OneDrive\"
+)
+| where InitiatingProcessFileName in~ (
+    "OUTLOOK.EXE", "olk.exe",
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "Teams.exe", "ms-teams.exe",
+    "explorer.exe",
+    "7zG.exe", "7zFM.exe", "WinRAR.exe", "Bandizip.exe"
+)
+| where FileName =~ "readme.docm"
+   or FileName has_any ("defense", "defence", "ministry",
+                         "ministerie", "diplomatic")
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256, MD5,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. WORD → DROPBOX.COM CONNECTIVITY CHECK
+//     The macro pings dropbox.com to verify internet access
+//     before staging. Word (or any Office app) reaching out
+//     to dropbox.com in the middle of a macro run is a
+//     strong tell — pair with query #4 for confidence.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has "dropbox.com"
+| where InitiatingProcessFileName in~ (
+    "WINWORD.EXE", "winword.exe",
+    "EXCEL.EXE", "POWERPNT.EXE",
+    "OUTLOOK.EXE", "MSACCESS.EXE",
+    "wscript.exe", "cscript.exe",
+    "mshta.exe", "rundll32.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. IN-MEMORY SHELLCODE / REFLECTIVE INJECTION HALLMARKS
+//     The dnxstore.dll → Publish.exe stage is reflective;
+//     nothing lands as a standalone EXE. Catches PowerShell /
+//     .NET cmdline patterns commonly seen when reflective
+//     loading is wrapped by a script.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ (
+    "powershell.exe", "pwsh.exe",
+    "rundll32.exe", "regsvr32.exe",
+    "InstallUtil.exe", "RegAsm.exe", "RegSvcs.exe",
+    "MSBuild.exe", "csc.exe"
+)
+| where ProcessCommandLine has_any (
+    "ReflectivePEInjection", "Invoke-ReflectivePEInjection",
+    "ReflectiveLoader", "LoadReflectivePE",
+    "VirtualAllocEx", "WriteProcessMemory",
+    "CreateRemoteThread", "NtCreateThreadEx",
+    "Marshal.GetDelegateForFunctionPointer",
+    "System.Reflection.Assembly.Load"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Word docm executes macro → drops .dll and .png into
+//     %PROGRAMDATA% → HKCU\Software\Classes\CLSID\...\
+//     InprocServer32 is written pointing at %PROGRAMDATA%
+//     → outbound to gateway.filen.io, all on the same
+//     device inside a 30-minute window.
+// ------------------------------------------------------------
+let Stage1_WordDrop = DeviceFileEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where InitiatingProcessFileName in~ ("WINWORD.EXE", "winword.exe")
+| where FolderPath startswith @"C:\ProgramData"
+| where FileName endswith ".dll" or FileName endswith ".png"
+| project DeviceName, DropTime = Timestamp,
+          DropFile = FileName, DropPath = FolderPath;
+let Stage2_ComHijack = DeviceRegistryEvents
+| where Timestamp > ago(7d)
+| where RegistryKey has @"\Software\Classes\CLSID\"
+   and RegistryKey has @"\InprocServer32"
+| where RegistryValueData has @"C:\ProgramData"
+   and RegistryValueData endswith ".dll"
+| project DeviceName, RegTime = Timestamp,
+          RegKey = RegistryKey, RegValue = RegistryValueData,
+          RegBy = InitiatingProcessFileName;
+let Stage3_FilenC2 = DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any ("gateway.filen.io", "gateway.filen.net",
+                            ".filen.io", ".filen.net")
+| where InitiatingProcessFileName !in~ (
+    "msedge.exe", "chrome.exe", "firefox.exe",
+    "Filen.exe", "filen-desktop.exe"
+)
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2_IP = RemoteIP, C2_Url = RemoteUrl;
+Stage1_WordDrop
+| join kind=inner Stage2_ComHijack on DeviceName
+| where RegTime between (DropTime .. (DropTime + 30m))
+| join kind=leftouter Stage3_FilenC2 on DeviceName
+| where C2Time between (RegTime .. (RegTime + 24h))
+| project DropTime, RegTime, C2Time,
+          DeviceName,
+          DropFile, DropPath,
+          RegKey, RegValue, RegBy,
+          C2Proc, C2_IP, C2_Url
+| order by DropTime desc
