@@ -1,0 +1,470 @@
+// ============================================================
+// CRASHSTEALER — Native-C++ macOS Infostealer Masquerading
+// as Apple CrashReporter (com.apple.crashreporter bundle ID)
+// Source:   CyberSecurity News / Jamf Threat Labs (July 2026)
+// Platform: Microsoft Defender for Endpoint on macOS
+//           (Advanced Hunting)
+// MITRE ATT&CK: T1204.002, T1547.013 (LaunchAgent),
+//               T1555, T1555.001, T1187, T1005,
+//               T1027, T1041, T1071.001
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Jamf disclosed CrashStealer — a NATIVE C++ macOS infostealer
+// distinct from AMOS / MacSync / Phexia despite overlapping
+// objectives. First sample surfaced May 2026; active in-the-
+// wild deployment observed in July 2026.
+//
+// Distribution
+// ---------------------------------------------------------------
+//   Disk image:   "Werkbit Setup" (DMG)
+//   App bundle:   CrashReporter.app
+//   Bundle ID:    com.apple.crashreporter  (Apple's identifier
+//                                            — impersonated)
+//   Signing:      Legitimate Developer ID + stapled notarization
+//                 (abused — the certificate is real, the app is
+//                 not Apple's)
+//   Stager:       Obfuscated shell script from GitHub-hosted
+//                 infrastructure, decoded via multiple Base64
+//                 layers
+//
+// Persistence
+// ---------------------------------------------------------------
+//   LaunchAgent label: com.apple.crashreporter.helper
+//   Plist path:        ~/Library/LaunchAgents/
+//                        com.apple.crashreporter.helper.plist
+//   Technique:         self-copy + ad-hoc re-sign for reboot
+//                      survival
+//
+// Credential targeting
+// ---------------------------------------------------------------
+//   Browsers:            Chrome, Brave, Edge, Opera, Vivaldi,
+//                        Firefox
+//   Password managers:   14 named — 1Password, Bitwarden,
+//                        LastPass and 11 others
+//   Wallets:             80+ crypto wallet extensions across
+//                        Ethereum, Solana, Cosmos, TON
+//   Keychain:            dscl for local-password validation,
+//                        then Keychain unlock post-auth
+//   Filesystem:          ~/Documents, ~/Downloads sweep
+//
+// Data handling
+// ---------------------------------------------------------------
+//   Encryption:  AES-256-GCM (Apple CommonCrypto), client-side
+//   Packaging:   ZIP archive
+//   Exfil:       libcurl over HTTP(S)
+//
+// Why this pack matters
+// ---------------------------------------------------------------
+// Two things elevate CrashStealer above the AppleScript-based
+// commodity macOS stealer crowd:
+//
+//   1) Native C++ + control-flow flattening + anti-debugging
+//      makes static file scanning much less useful. The
+//      defender signal has to be behavioural.
+//   2) The masquerade LABEL "com.apple.crashreporter.helper"
+//      is a clean IOC on its own — Apple doesn't ship a
+//      LaunchAgent by that name, so a plist bearing that
+//      label anywhere in the fleet is diagnostic.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate developer builds that read from ~/Documents
+//     and Application Support during backup / sync.
+//   - Real Apple CrashReporter processes live at
+//     /System/Library/CoreServices/CrashReporter.app —
+//     never in ~/Applications or /Volumes/*.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/macos-stealer-mimics-apples-crash-report/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. LAUNCHAGENT PLIST — com.apple.crashreporter.helper
+//    Highest-fidelity single IOC. Apple does not ship a
+//    LaunchAgent with this label. Any file event under
+//    ~/Library/LaunchAgents/ with this name is diagnostic.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(60d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FolderPath has "/Library/LaunchAgents"
+| where FileName =~ "com.apple.crashreporter.helper.plist"
+   or FileName has "com.apple.crashreporter.helper"
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. "CrashReporter.app" RUNNING FROM OUTSIDE
+//    /System/Library/CoreServices/
+//    The real Apple CrashReporter lives in
+//    /System/Library/CoreServices/CrashReporter.app.
+//    Anywhere else is fake by definition — including
+//    /Volumes/Werkbit Setup/, ~/Downloads, ~/Applications
+//    and /tmp.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName =~ "CrashReporter"
+       or FolderPath has "CrashReporter.app"
+    | where not (FolderPath startswith "/System/Library/CoreServices"
+                 or FolderPath startswith "/System/Library/PrivateFrameworks")
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessFolderPath,
+              InitiatingProcessCommandLine = ProcessCommandLine
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+    | where FolderPath has "CrashReporter.app"
+    | where not (FolderPath startswith "/System/Library/CoreServices")
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = "",
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessFolderPath,
+              InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. "Werkbit Setup" DMG / VOLUME MOUNTS
+//    Direct file / mount-path catch on the documented
+//    disk-image name.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has "Werkbit Setup"
+       or FolderPath has "/Volumes/Werkbit Setup"
+       or FileName endswith ".dmg" and FileName has "Werkbit"
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has_any (
+        "Werkbit Setup", "/Volumes/Werkbit",
+        "hdiutil attach.*Werkbit", "hdiutil mount.*Werkbit"
+    )
+    | extend EventKind = "ProcessCmd"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, FolderPath, SHA256,
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. DSCL LOCAL-PASSWORD VALIDATION FROM AN UNPRIVILEGED
+//    USER-PATH PROCESS
+//    CrashStealer uses `dscl` to check the local password
+//    the user just typed into its spoofed prompt. `dscl`
+//    invoked from a Downloads / Volumes / ~/Applications
+//    context is essentially diagnostic.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "dscl"
+   or ProcessCommandLine has "/usr/bin/dscl"
+| where ProcessCommandLine has_any (
+    " . -authonly ", "authonly ",
+    "-authonly", "/Users/"
+)
+| where InitiatingProcessFolderPath has_any (
+    "/Volumes/", "/Users/Shared/",
+    "/Users/", "/tmp/", "/var/tmp/",
+    "/Applications/"
+)
+| where InitiatingProcessFileName !in~ (
+    "loginwindow", "SecurityAgent",
+    "systempreferences", "SharingUIServer",
+    "sudo", "sshd", "System Preferences"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. `security` KEYCHAIN DUMP / CRED READ FROM UNPRIVILEGED
+//    CONTEXT
+//    Once CrashStealer has the user's password, it drives the
+//    macOS `security` CLI to unlock and dump the Keychain.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "security"
+   or ProcessCommandLine has "/usr/bin/security"
+| where ProcessCommandLine has_any (
+    "unlock-keychain", "find-generic-password",
+    "find-internet-password", "dump-keychain",
+    "export-keychain", "keychain-info -d",
+    "security -h"
+)
+| where InitiatingProcessFolderPath has_any (
+    "/Volumes/", "/Users/Shared/",
+    "/tmp/", "/var/tmp/",
+    "/Users/[^/]+/Applications/",
+    "/Users/[^/]+/Downloads/"
+)
+   or InitiatingProcessFileName !in~ (
+        "loginwindow", "SecurityAgent",
+        "SecurityAgentPlugin"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. PASSWORD MANAGER APPLICATION-SUPPORT PATHS READ BY
+//    A NON-PASSWORD-MANAGER PROCESS
+//    1Password / Bitwarden / LastPass / DashLane / KeePassXC
+//    data touched by anything other than the vendor client.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any (
+    "/Library/Group Containers/2BUA8C4S2C.com.1password",
+    "/Library/Application Support/1Password",
+    "/Library/Application Support/Bitwarden",
+    "/Library/Application Support/LastPass",
+    "/Library/Application Support/Dashlane",
+    "/Library/Application Support/KeePassXC",
+    "/Library/Application Support/Keeper",
+    "/Library/Application Support/Enpass",
+    "/Library/Application Support/RoboForm",
+    "/Library/Application Support/NordPass",
+    "/Library/Application Support/StickyPassword"
+)
+| where InitiatingProcessFileName !in~ (
+    "1Password", "1Password 7", "1Password 8",
+    "op", "Bitwarden", "LastPass", "Dashlane",
+    "KeePassXC", "Keeper", "Enpass",
+    "RoboForm", "NordPass", "StickyPassword",
+    "Time Machine", "backupd", "mds", "mds_stores"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. CRYPTO WALLET EXTENSION STORES READ BY A NON-BROWSER
+//    Reads against the Chrome/Edge/Brave/Firefox extension
+//    directories for common wallet extension IDs, by any
+//    process other than the browser itself.
+// ------------------------------------------------------------
+let WalletExtIDs = dynamic([
+    "nkbihfbeogaeaoehlefnkodbefgpgknn",  // MetaMask
+    "bfnaelmomeimhlpmgjnjophhpkkoljpa",  // Phantom
+    "hnfanknocfeofbddgcijnmhnfnkdnaad",  // Coinbase Wallet
+    "egjidjbpglichdcondbcbdnbeeppgdph",  // Trust Wallet
+    "hifafgmccdpekplomjjkcfgodnhcellj",  // Crypto.com Wallet
+    "ejbalbakoplchlghecdalmeeeajnimhm",  // MetaMask Edge
+    "aiifbnbfobpmeekipheeijimdpnlpgpp"   // Terra Station
+]);
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FolderPath has_any (
+    "/Library/Application Support/Google/Chrome",
+    "/Library/Application Support/BraveSoftware/Brave-Browser",
+    "/Library/Application Support/Microsoft Edge",
+    "/Library/Application Support/Firefox",
+    "/Library/Application Support/com.operasoftware.Opera",
+    "/Library/Application Support/Vivaldi"
+)
+| where FolderPath has_any (WalletExtIDs)
+   or FileName in~ ("Login Data", "Cookies", "Local State", "Web Data",
+                     "logins.json", "key4.db", "cookies.sqlite")
+| where InitiatingProcessFileName !in~ (
+    "Google Chrome", "Google Chrome Helper",
+    "Brave Browser", "Brave Browser Helper",
+    "Microsoft Edge", "Microsoft Edge Helper",
+    "firefox", "Firefox",
+    "Opera", "Vivaldi",
+    "Time Machine", "backupd", "mds", "mds_stores",
+    "Safari", "com.apple.WebKit.WebContent"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. LOGIN.KEYCHAIN-DB READ BY A NON-SECURITY PROCESS
+//    Direct read of the login keychain database file
+//    (~/Library/Keychains/login.keychain-db) by anything
+//    other than `securityd` / `security` / legitimate apps.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName in~ ("login.keychain-db", "login.keychain",
+                       "System.keychain", "System.keychain-db")
+   or FolderPath endswith "/Library/Keychains"
+| where InitiatingProcessFileName !in~ (
+    "securityd", "trustd", "security",
+    "loginwindow", "SecurityAgent",
+    "Keychain Access", "cloudkeychainproxy3",
+    "iCloudKeychainProxy", "mds", "mds_stores",
+    "SystemUIServer", "cfprefsd"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. MULTI-LAYER BASE64 DECODE IN A SHELL PIPELINE
+//    CrashStealer's shell stager is obfuscated with multiple
+//    Base64 layers, decoded in one pipeline. Catches the
+//    tell-tale `... | base64 --decode | base64 --decode ...`
+//    or `openssl base64 -d` chains.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ ("sh", "bash", "zsh", "dash")
+| where ProcessCommandLine matches regex @"(base64\s+(-d|--decode|-D)\s*\|\s*.*){2,}"
+   or ProcessCommandLine has_any (
+        "| base64 -d | base64 -d",
+        "| openssl base64 -d",
+        "base64 --decode | base64",
+        "| bash <(base64"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. GITHUB RAW-CONTENT FETCH BY CURL FROM A NON-DEVELOPER
+//     CONTEXT
+//     The CrashStealer stager pulls from GitHub-hosted
+//     infrastructure. Surfaces macOS `curl` fetches of raw
+//     GitHub content initiated by a shell parent from a user-
+//     writable path.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("curl", "wget")
+| where ProcessCommandLine has_any (
+    "raw.githubusercontent.com",
+    "github.com", "gist.githubusercontent.com"
+)
+| where InitiatingProcessFileName in~ ("sh", "bash", "zsh", "dash")
+| where InitiatingProcessFolderPath has_any (
+    "/Volumes/", "/Users/Shared/", "/tmp/", "/var/tmp/"
+)
+   or ProcessCommandLine has_any (
+        "/Volumes/", "/Users/Shared/", "/tmp/", "/var/tmp/"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. AD-HOC RE-SIGN OF A BINARY IN A USER-WRITABLE PATH
+//     CrashStealer self-copies and re-signs with an ad-hoc
+//     signature for reboot survival. Catches `codesign -s -`
+//     against a binary in Downloads / Volumes / /tmp.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "codesign"
+| where ProcessCommandLine has_any (
+    "codesign -s -", "codesign --sign -",
+    "codesign -fs -", "codesign -f -s -"
+)
+| where ProcessCommandLine has_any (
+    "/Volumes/", "/Users/Shared/",
+    "/tmp/", "/var/tmp/",
+    "/Users/[^/]+/Applications/",
+    "/Users/[^/]+/Library/",
+    "/Users/[^/]+/Downloads/"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Werkbit Setup DMG mount or CrashReporter.app run
+//     outside /System/Library/CoreServices → dscl or
+//     `security unlock-keychain` invocation → keychain /
+//     wallet / password-manager reads → curl outbound to
+//     GitHub raw or a public IP, all on the same device
+//     within a 30-minute window.
+// ------------------------------------------------------------
+let Stage1_Lure = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where (FileName =~ "CrashReporter" and FolderPath !startswith "/System/Library/CoreServices")
+   or ProcessCommandLine has_any ("Werkbit Setup", "/Volumes/Werkbit")
+| project DeviceName, LureTime = Timestamp,
+          LureFile = FileName, LurePath = FolderPath,
+          LureCmd = ProcessCommandLine;
+let Stage2_Creds = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("dscl", "security")
+| where ProcessCommandLine has_any (
+    " authonly", "unlock-keychain",
+    "find-generic-password", "dump-keychain"
+)
+| project DeviceName, CredTime = Timestamp,
+          CredFile = FileName, CredCmd = ProcessCommandLine;
+let Stage3_Egress = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("curl", "wget")
+| where ProcessCommandLine has_any (
+    "-X POST", " -T ", " -F ", " --data-binary ", "--upload-file"
+)
+   or ProcessCommandLine has_any (
+        "raw.githubusercontent.com", "gist.githubusercontent.com"
+   )
+| project DeviceName, EgressTime = Timestamp,
+          EgressCmd = ProcessCommandLine;
+Stage1_Lure
+| join kind=inner Stage2_Creds on DeviceName
+| where CredTime between (LureTime .. (LureTime + 30m))
+| join kind=leftouter Stage3_Egress on DeviceName
+| where EgressTime between (CredTime .. (CredTime + 30m))
+| project LureTime, CredTime, EgressTime,
+          DeviceName,
+          LureFile, LurePath, LureCmd,
+          CredFile, CredCmd,
+          EgressCmd
+| order by LureTime desc
