@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **July 2026**
+- [Microsoft Patch Tuesday July 2026 - 570 CVEs and 3 Zero-Days (SharePoint / AD FS / BitLocker)](<Microsoft Patch Tuesday July 2026 - 570 CVEs and 3 Zero-Days (SharePoint AD FS BitLocker) (July 2026)>)
 - [LegacyHive - Windows User Profile Service Arbitrary Hive LPE (Nightmare-Eclipse)](<LegacyHive - Windows User Profile Service Arbitrary Hive LPE (Nightmare-Eclipse July 2026)>)
 - [CrashStealer macOS - CrashReporter.app Masquerade + com.apple.crashreporter.helper LaunchAgent](<CrashStealer macOS - CrashReporter.app Masquerade + com.apple.crashreporter.helper LaunchAgent (July 2026)>)
 - [iCagenda + Balbooa Forms Joomla Zero-Days (CVE-2026-48939 & CVE-2026-56291) - CISA KEV](<iCagenda + Balbooa Forms Joomla Zero-Days (CVE-2026-48939 & CVE-2026-56291) - CISA KEV (July 2026)>)

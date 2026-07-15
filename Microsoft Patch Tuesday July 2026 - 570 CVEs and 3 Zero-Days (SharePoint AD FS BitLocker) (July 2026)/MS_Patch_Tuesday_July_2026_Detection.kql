@@ -1,0 +1,470 @@
+// ============================================================
+// MICROSOFT PATCH TUESDAY — JULY 2026
+// 570 CVEs · 2 exploited zero-days (SharePoint + AD FS) ·
+// 1 publicly disclosed BitLocker bypass · 2 Critical RCE
+// (SharePoint + Print Spooler) plus RDS / Admin Center /
+// DHCP Server infrastructure fixes
+// Source:   CyberSecurity News (July 2026 Patch Tuesday)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1548, T1190, T1547.012, T1556, T1542,
+//               T1199, T1078, T1210
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Microsoft's July 2026 Patch Tuesday closes 570 CVEs — one
+// of the largest single rollups on record. Three of them are
+// zero-days worth prioritising above the rest:
+//
+//   CVE-2026-56164  SharePoint Server EoP
+//                    Exploited in the wild. Typically chained
+//                    with RCE for full server compromise.
+//
+//   CVE-2026-56155  AD FS EoP
+//                    Exploited in the wild. Enables pivot into
+//                    the wider identity plane; historical
+//                    pattern is Golden-SAML-class abuse of
+//                    trust relationships.
+//
+//   CVE-2026-50661  Windows BitLocker Security Feature Bypass
+//                    Publicly disclosed, no confirmed exploit
+//                    yet. Mirrors the earlier YellowKey
+//                    (CVE-2026-45585) pattern. Physical-access.
+//
+// Two Critical RCE bugs also warrant top-of-queue attention:
+//
+//   CVE-2026-58644  SharePoint RCE (on-prem)
+//   CVE-2026-58608  Windows Print Spooler RCE
+//
+// And three infrastructure bugs commonly abused for lateral
+// movement:
+//
+//   CVE-2026-58626  Remote Desktop Services RCE
+//   CVE-2026-58631  Windows Admin Center RCE
+//   CVE-2026-58627  DHCP Server DoS
+//
+// Impact-type split of the full rollup:
+//   249 Elevation of Privilege
+//   143 Remote Code Execution
+//   102 Information Disclosure
+//    35 Denial of Service
+//    17 Security Feature Bypass
+//    16 Spoofing
+//     8 Tampering
+//
+// This pack focuses on the ZERO-DAY and CRITICAL entries plus
+// the identity-plane and lateral-movement infrastructure
+// fixes — the fastest exploited items in the batch.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate SharePoint / AD FS / RDS / Admin Center
+//     administration. Pair TVM light-up with the behavioural
+//     queries below for high fidelity.
+//   - manage-bde in enterprise laptop-refresh workflows —
+//     pin known IT accounts.
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. TVM LIGHT-UP — JULY 2026 PRIORITY CVEs
+//    Direct TVM lookup for the eight CVEs this pack targets.
+//    Every hit is your patch-priority queue.
+// ------------------------------------------------------------
+let July2026_CVEs = dynamic([
+    "CVE-2026-56164", "CVE-2026-56155", "CVE-2026-50661",
+    "CVE-2026-58644", "CVE-2026-58608",
+    "CVE-2026-58626", "CVE-2026-58631", "CVE-2026-58627"
+]);
+DeviceTvmSoftwareVulnerabilities
+| where CveId in (July2026_CVEs)
+| project DeviceId, DeviceName, OSPlatform, OSVersion,
+          SoftwareVendor, SoftwareName, SoftwareVersion,
+          CveId, VulnerabilitySeverityLevel, CvssScore,
+          IsExploitAvailable, RecommendedSecurityUpdate
+| order by CvssScore desc
+
+
+// ------------------------------------------------------------
+// 2. SHAREPOINT w3wp.exe SPAWNING A SHELL (CVE-2026-56164 /
+//    -58644 CHAIN OUTCOME)
+//    The IIS worker process hosting SharePoint should never
+//    spawn cmd / powershell / curl / wget / rundll32. This
+//    catches the EoP → RCE chain moment.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName =~ "w3wp.exe"
+| where InitiatingProcessCommandLine has_any (
+    "MSExchangeOWAAppPool", "SharePoint",
+    "SharePoint Content", "SecTokenServiceApp",
+    "STS_AppPool"
+)
+   or InitiatingProcessFolderPath has "SharePoint"
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "curl.exe", "wget.exe",
+    "rundll32.exe", "regsvr32.exe", "mshta.exe",
+    "wscript.exe", "cscript.exe",
+    "certutil.exe", "bitsadmin.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. SUSPICIOUS SHAREPOINT URI / LAYOUT ACCESS
+//    Catches probes / weaponised requests referencing the
+//    common SharePoint attack endpoints.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("InboundConnectionAccepted", "ConnectionSuccess")
+| where RemoteUrl has_any (
+    "/_layouts/15/", "/_layouts/16/",
+    "/_vti_bin/", "/_api/web/",
+    "ToolPane.aspx", "SignOut.aspx",
+    "SetupTokenIssuer.aspx",
+    "CVE-2026-56164", "CVE-2026-58644"
+)
+| where LocalPort in (80, 443, 8080, 8443)
+| project Timestamp, DeviceName, ActionType,
+          LocalIP, LocalPort, RemoteIP, RemotePort, RemoteUrl,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. AD FS — adfssrv / ADFSHelper ANOMALIES (CVE-2026-56155)
+//    Any child process from adfssrv.exe / Microsoft.
+//    IdentityServer.ServiceHost.exe is worth surfacing — the
+//    real AD FS service should not spawn cmd / powershell /
+//    curl outside a documented maintenance window.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where InitiatingProcessFileName in~ (
+    "adfssrv.exe", "Microsoft.IdentityServer.ServiceHost.exe",
+    "Microsoft.IdentityServer.Servicehost.exe"
+)
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "rundll32.exe", "regsvr32.exe", "mshta.exe",
+    "wscript.exe", "cscript.exe",
+    "curl.exe", "wget.exe", "certutil.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. AD FS TOKEN-SIGNING CERTIFICATE / DKM MASTER-KEY ACCESS
+//    The Golden-SAML pattern the CVE-2026-56155 abuse
+//    mirrors. Surfaces access to AD FS DKM registry / files
+//    by anything other than the AD FS service account.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FolderPath has_any (
+        @"\Program Files\Active Directory Federation Services",
+        @"\Microsoft\ADFS\",
+        @"\ProgramData\Microsoft\ADFS"
+    )
+    | where FileName has_any (".pfx", ".key", "AdfsFarmInformation",
+                               "AdfsConfigurationV3.xml",
+                               "AdfsProperties")
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              ActionType, FileName, FolderPath,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has_any (
+        "Get-AdfsProperties", "Get-AdfsCertificate",
+        "Set-AdfsProperties", "Get-AdfsRelyingPartyTrust",
+        "Export-AdfsCertificate", "ADFSDump", "ADFSpoof"
+    )
+    | extend EventKind = "ProcessCmd"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              ActionType = "",
+              FileName, FolderPath = "",
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = ProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. PRINT SPOOLER — spoolsv.exe SPAWNING CHILDREN
+//    CVE-2026-58608 Print Spooler RCE. The service should
+//    not spawn cmd / PowerShell / rundll32 or run print
+//    processor DLLs from user-writable paths.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName =~ "spoolsv.exe"
+    | where FileName in~ (
+        "cmd.exe", "powershell.exe", "pwsh.exe",
+        "rundll32.exe", "regsvr32.exe", "mshta.exe",
+        "wscript.exe", "cscript.exe",
+        "curl.exe", "wget.exe"
+    )
+    | extend EventKind = "ChildProcess"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              FileName, FolderPath, ProcessCommandLine
+),
+(
+    DeviceImageLoadEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName =~ "spoolsv.exe"
+    | where FolderPath !startswith @"C:\Windows"
+       and FolderPath !startswith @"C:\Program Files"
+       and FolderPath !startswith @"C:\Program Files (x86)"
+    | extend EventKind = "ImageLoad"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = "",
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              FileName, FolderPath, ProcessCommandLine = ""
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. WINDOWS ADMIN CENTER (CVE-2026-58631) ANOMALIES
+//    WAC is a common lateral-movement pivot. Surface
+//    ServerManagementGateway process children and unusual
+//    outbound + inbound patterns.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where InitiatingProcessFileName in~ (
+        "ServerManagementGateway.exe",
+        "sme.exe", "WindowsAdminCenter.exe"
+    )
+    | where FileName in~ (
+        "cmd.exe", "powershell.exe", "pwsh.exe",
+        "certutil.exe", "bitsadmin.exe",
+        "curl.exe", "wget.exe",
+        "psexec.exe", "psexesvc.exe"
+    )
+    | extend EventKind = "ChildProcess"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              FileName, FolderPath, ProcessCommandLine
+),
+(
+    DeviceNetworkEvents
+    | where Timestamp > ago(30d)
+    | where ActionType == "InboundConnectionAccepted"
+    | where LocalPort in (6516, 443)
+    | where InitiatingProcessFileName in~ (
+        "ServerManagementGateway.exe",
+        "sme.exe"
+    )
+    | where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+    | extend EventKind = "Network"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = "",
+              InitiatingProcessFileName,
+              InitiatingProcessCommandLine = "",
+              FileName = "", FolderPath = "",
+              ProcessCommandLine = strcat(RemoteIP, ":", tostring(RemotePort))
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. RDS / TermService (CVE-2026-58626) POST-EXPLOIT
+//    Terminal service RCE. Watch for TermService parent
+//    spawning shells or LOLBins.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ (
+    "TermService.exe", "svchost.exe"
+)
+| where InitiatingProcessCommandLine has "TermService"
+   or InitiatingProcessCommandLine has "rdpencdd"
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "rundll32.exe", "regsvr32.exe", "mshta.exe",
+    "curl.exe", "wget.exe", "bitsadmin.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. DHCP SERVER SERVICE ANOMALIES (CVE-2026-58627)
+//    DoS-class, so lateral-movement outcome is a service
+//    crash rather than code execution. Surfaces service-
+//    stop / repeated crashes on DHCPServer.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName in~ ("sc.exe", "powershell.exe", "pwsh.exe")
+    | where ProcessCommandLine has_any (
+        "stop DHCPServer", "Stop-Service DHCPServer",
+        "restart DHCPServer", "Restart-Service DHCPServer",
+        "DHCPServer /stop", "DHCPServer /start"
+    )
+    | extend EventKind = "ServiceOp"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(30d)
+    | where ActionType in ("ServiceInstalled", "ProcessTerminated")
+    | where AdditionalFields has "DHCPServer" or AdditionalFields has "DhcpServer"
+    | extend EventKind = "ServiceEvent"
+    | project Timestamp, DeviceName, EventKind,
+              AccountName = "",
+              FileName, ProcessCommandLine = tostring(AdditionalFields),
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. BITLOCKER RECOVERY / manage-bde ANOMALIES (CVE-2026-50661)
+//     BitLocker Security Feature Bypass mirrors YellowKey.
+//     Physical-access class, but manage-bde / bdehdcfg
+//     execution from a user-writable context is worth
+//     surfacing.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where FileName in~ (
+    "manage-bde.exe", "bdehdcfg.exe",
+    "reagentc.exe", "recimg.exe"
+)
+   or ProcessCommandLine has_any (
+        "manage-bde", "bdehdcfg", "reagentc /disable",
+        "reagentc /enable", "Suspend-BitLocker",
+        "Disable-BitLocker", "Get-BitLockerVolume"
+   )
+| where InitiatingProcessFileName !in~ (
+    "consent.exe", "msiexec.exe", "TrustedInstaller.exe",
+    "TiWorker.exe", "wuauclt.exe", "sysprep.exe"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\"
+)
+   or InitiatingProcessFileName in~ (
+        "powershell.exe", "pwsh.exe", "cmd.exe",
+        "wscript.exe", "cscript.exe", "python.exe"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. INVENTORY — SHAREPOINT / AD FS / WAC / RDS SERVERS
+//     Identifies devices in the fleet running the products
+//     covered by the top three zero-days + two critical RCEs.
+//     Your patch-priority list before the exploit lands.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName in~ (
+    "w3wp.exe", "OWSTIMER.EXE", "wsstracing.exe",   // SharePoint
+    "adfssrv.exe",
+    "Microsoft.IdentityServer.ServiceHost.exe",     // AD FS
+    "ServerManagementGateway.exe", "sme.exe",       // Windows Admin Center
+    "TermService.exe",                              // RDS
+    "spoolsv.exe",                                  // Print Spooler
+    "DHCPServer.exe"                                // DHCP Server
+)
+| summarize Hits = count(),
+            DistinctBinaries = dcount(FileName),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            SampleProcesses = make_set(FileName, 6)
+    by DeviceName
+| join kind=leftouter (
+    DeviceInfo
+    | summarize arg_max(Timestamp, OSPlatform, OSVersion) by DeviceName
+) on DeviceName
+| project DeviceName, OSPlatform, OSVersion,
+          Hits, DistinctBinaries, FirstSeen, LastSeen, SampleProcesses
+| order by Hits desc
+
+
+// ------------------------------------------------------------
+// 12. POSTURE CORRELATION (RISK-RANKED PER DEVICE)
+//     Combines: TVM light-up count on July 2026 priority CVEs,
+//     recent SharePoint w3wp shell spawns, adfssrv anomalies,
+//     spoolsv anomalies. Produces a per-device risk score
+//     suitable for weekly CISO reporting until the estate is
+//     fully patched.
+// ------------------------------------------------------------
+let TvmHits = DeviceTvmSoftwareVulnerabilities
+| where CveId in (
+    "CVE-2026-56164", "CVE-2026-56155", "CVE-2026-50661",
+    "CVE-2026-58644", "CVE-2026-58608",
+    "CVE-2026-58626", "CVE-2026-58631", "CVE-2026-58627"
+)
+| summarize TvmCVEs = dcount(CveId) by DeviceName;
+let ShellSpawns = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "w3wp.exe"
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe")
+| summarize W3wpShells = count() by DeviceName;
+let AdfsAnomalies = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ (
+    "adfssrv.exe",
+    "Microsoft.IdentityServer.ServiceHost.exe"
+)
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe",
+                       "curl.exe", "wget.exe")
+| summarize AdfsShells = count() by DeviceName;
+let SpoolerAnomalies = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "spoolsv.exe"
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe",
+                       "rundll32.exe", "regsvr32.exe")
+| summarize SpoolerShells = count() by DeviceName;
+TvmHits
+| join kind=fullouter ShellSpawns on DeviceName
+| join kind=fullouter AdfsAnomalies on DeviceName
+| join kind=fullouter SpoolerAnomalies on DeviceName
+| extend Dev = coalesce(DeviceName, DeviceName1, DeviceName2, DeviceName3)
+| extend TvmCVEs       = coalesce(TvmCVEs,       0),
+         W3wpShells    = coalesce(W3wpShells,    0),
+         AdfsShells    = coalesce(AdfsShells,    0),
+         SpoolerShells = coalesce(SpoolerShells, 0)
+| extend RiskScore =
+       iff(TvmCVEs       >= 1, 2, 0)
+     + iff(W3wpShells    >= 1, 4, 0)
+     + iff(AdfsShells    >= 1, 4, 0)
+     + iff(SpoolerShells >= 1, 3, 0)
+| where RiskScore >= 2
+| project DeviceName = Dev, TvmCVEs, W3wpShells, AdfsShells,
+          SpoolerShells, RiskScore
+| order by RiskScore desc
