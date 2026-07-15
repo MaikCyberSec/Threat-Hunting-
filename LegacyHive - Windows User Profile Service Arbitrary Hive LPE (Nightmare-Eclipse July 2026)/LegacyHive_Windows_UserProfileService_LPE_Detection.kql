@@ -1,0 +1,482 @@
+// ============================================================
+// LEGACYHIVE — Windows User Profile Service Arbitrary Hive
+// Load LPE (Nightmare-Eclipse — 5th public Windows LPE
+// family from this operator in 2026)
+// Source:   CyberSecurity News (July 15 2026)
+//           PoC: github.com/MSNightmare/LegacyHive (MIT)
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1068, T1134.005, T1112, T1547.001,
+//               T1055.012 (Process Hollowing) — indirect,
+//               T1548 (Abuse Elevation Control Mechanism)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// LegacyHive is the FIFTH public Windows LPE from the
+// Nightmare-Eclipse operator in 2026 (after BlueHammer,
+// RedSun, MiniPlasma, RoguePlanet). Published July 15 2026
+// with a working PoC on GitHub at MSNightmare/LegacyHive
+// under an MIT licence.
+//
+// The vulnerability class is "Windows User Profile Service
+// arbitrary hive load elevation of privileges" — a standard
+// user, with credentials for a second standard user, can
+// cause that second user's registry hive to be mounted
+// inside the CURRENT user's Classes registry location.
+// The target hive's UsrClass.dat / NTUSER.DAT contents
+// (file associations, shell settings, COM configuration,
+// per-user application launch data) become reachable to
+// the attacker inside their own session. From there, the
+// operator identifies additional escalation paths by
+// abusing COM class resolution and file-type handlers under
+// their control.
+//
+// Confirmed on fully patched Windows desktop AND server
+// after the July 2026 Patch Tuesday. No CVE assigned. No
+// Microsoft advisory. Detection-as-mitigation for now.
+//
+// EXPLOIT PRE-REQUISITES
+// ---------------------------------------------------------------
+//   - Standard local user account (attacker)
+//   - Credentials for a second standard user
+//   - Target account's username
+//   Original unrestricted variant required fewer credentials.
+//
+// FAMILY LINEAGE — NIGHTMARE-ECLIPSE 2026 WINDOWS LPEs
+// ---------------------------------------------------------------
+//   BlueHammer    (CVE-2026-33825, Apr 2026, patched)
+//   RedSun        (Apr 2026, unpatched at disclosure)
+//   MiniPlasma    (CVE-2020-17103 re-released, May 2026)
+//   RoguePlanet   (June 2026, no CVE at disclosure)
+//   LegacyHive    (July 15 2026, no CVE at disclosure)
+//   Other tools:  UnDefend, YellowKey, GreenPlasma
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Sysprep, `runas /profile`, MDM profile-provisioning
+//     flows that legitimately mount user hives. Pin those
+//     accounts and parents.
+//   - Legitimate Windows apps that RegLoadAppKey their own
+//     private hive (Office, VS, some enterprise LOB apps).
+//     Tune by app name / signer.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/legacyhive-windows-0-day-vulnerability/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. POC / OPERATOR-LINEAGE NAME REFERENCES
+//    Direct match on the LegacyHive PoC name plus every
+//    known Nightmare-Eclipse alias / sibling tool.
+// ------------------------------------------------------------
+let LegacyHive_Markers = dynamic([
+    "LegacyHive", "legacyhive",
+    "MSNightmare/LegacyHive",
+    "MSNightmare",
+    "Nightmare-Eclipse", "Nightmare_Eclipse",
+    "Chaotic-Eclipse", "Chaotic_Eclipse",
+    "Dead-Eclipse", "Dead_Eclipse",
+    "BlueHammer", "RedSun", "UnDefend",
+    "YellowKey", "GreenPlasma", "MiniPlasma",
+    "RoguePlanet"
+]);
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (LegacyHive_Markers)
+       or ProcessCommandLine has_any (LegacyHive_Markers)
+       or InitiatingProcessCommandLine has_any (LegacyHive_Markers)
+       or ProcessVersionInfoOriginalFileName has_any (LegacyHive_Markers)
+    | extend EventKind = "ProcessExec"
+    | project Timestamp, DeviceName, EventKind, AccountName,
+              FileName, FolderPath, ProcessCommandLine,
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(60d)
+    | where FileName has_any (LegacyHive_Markers)
+       or FolderPath has_any (LegacyHive_Markers)
+    | extend EventKind = "FileEvent"
+    | project Timestamp, DeviceName, EventKind, AccountName = "",
+              FileName, FolderPath, ProcessCommandLine = "",
+              InitiatingProcessFileName, InitiatingProcessCommandLine,
+              SHA256
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. REGLOADAPPKEY / NtLoadKey / RegLoadKey CMDLINE PATTERNS
+//    LegacyHive drives the hive-load primitive via one of a
+//    small set of registry APIs. Catches PoC / .NET wrapper
+//    references to those calls on the command line and in
+//    PowerShell script blocks.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(60d)
+    | where ProcessCommandLine has_any (
+        "RegLoadAppKey", "NtLoadKey", "NtLoadKeyEx",
+        "ZwLoadKey", "RegLoadKey",
+        "advapi32::RegLoadAppKey",
+        "advapi32::RegLoadKey"
+    )
+    | where FileName in~ (
+        "powershell.exe", "pwsh.exe", "cmd.exe",
+        "reg.exe", "rundll32.exe", "regsvr32.exe",
+        "InstallUtil.exe", "MSBuild.exe", "csc.exe",
+        "python.exe", "python"
+    )
+    | extend Body = ProcessCommandLine
+),
+(
+    DeviceEvents
+    | where Timestamp > ago(60d)
+    | where ActionType in ("PowerShellCommand", "ScriptContent")
+    | extend Body = tostring(parse_json(AdditionalFields).Command)
+    | where isnotempty(Body)
+    | where Body has_any (
+        "RegLoadAppKey", "NtLoadKeyEx", "ZwLoadKey",
+        "RegLoadKey", "UsrClass.dat", "NTUSER.DAT"
+    )
+)
+| project Timestamp, DeviceName, FileName,
+          InitiatingProcessFileName, Body
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. NTUSER.DAT / UsrClass.dat READ OR OPEN BY A NON-SYSTEM
+//    PROCESS
+//    Legitimate reads come from svchost.exe (User Profile
+//    Service), logonui.exe, winlogon.exe, msiexec.exe, and
+//    TrustedInstaller. Anything else touching those hives
+//    directly is suspicious.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("NTUSER.DAT", "UsrClass.dat",
+                       "NTUSER.DAT.LOG1", "UsrClass.dat.LOG1")
+   or FolderPath endswith @"\AppData\Local\Microsoft\Windows"
+   or FolderPath has @"\Microsoft\Windows\UsrClass.dat"
+| where InitiatingProcessFileName !in~ (
+    "svchost.exe", "System", "winlogon.exe", "wininit.exe",
+    "logonui.exe", "csrss.exe", "smss.exe",
+    "TrustedInstaller.exe", "TiWorker.exe",
+    "msiexec.exe", "explorer.exe",
+    "OneDrive.exe", "backupd", "wbengine.exe", "vssvc.exe",
+    "SearchIndexer.exe", "MsMpEng.exe",
+    "MpDefenderCoreService.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. FOREIGN USER HIVE MOUNTED INTO HKCU\Software\Classes
+//    The exploit's payoff — a second user's UsrClass.dat is
+//    mounted under the attacker's HKCU\Software\Classes.
+//    Surfaces registry-key creation events under Software\
+//    Classes that reference paths from a different user
+//    profile.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("RegistryKeyCreated", "RegistryValueSet")
+| where RegistryKey has @"\Software\Classes"
+| where RegistryValueData has_any (
+    @"\Users\", @"C:\Users\",
+    "UsrClass.dat", "NTUSER.DAT"
+)
+| where InitiatingProcessFileName !in~ (
+    "svchost.exe", "winlogon.exe", "wininit.exe",
+    "TrustedInstaller.exe", "TiWorker.exe",
+    "msiexec.exe", "explorer.exe",
+    "sihost.exe", "runtimebroker.exe"
+)
+| project Timestamp, DeviceName,
+          ActionType, RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. REG.EXE / REG-LOAD FROM A USER-WRITABLE PATH
+//    `reg load` / `reg unload` invoked from a Downloads,
+//    Temp, or Desktop parent is the classic wrapper for the
+//    LegacyHive primitive.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "reg.exe"
+| where ProcessCommandLine has_any (
+    "reg load", "reg.exe load",
+    "reg unload", "reg.exe unload"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\"
+)
+   or InitiatingProcessFileName in~ (
+        "powershell.exe", "pwsh.exe", "cmd.exe",
+        "wscript.exe", "cscript.exe",
+        "python.exe", "python", "python3",
+        "node.exe", "node"
+   )
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          InitiatingProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. SECONDARY-USER LOGON FOLLOWED BY REGISTRY-HIVE ACTIVITY
+//    LegacyHive requires the attacker to supply creds for a
+//    second standard user. Surfaces a LogonSuccess of a
+//    non-primary user on a workstation followed within
+//    5 minutes by a reg.exe / RegLoad* activity — the
+//    exploit shape in DeviceLogonEvents + DeviceProcessEvents.
+// ------------------------------------------------------------
+let SecondUserLogon = DeviceLogonEvents
+| where Timestamp > ago(14d)
+| where ActionType == "LogonSuccess"
+| where LogonType in~ ("Interactive", "NewCredentials", "RemoteInteractive")
+| project DeviceName, LogonTime = Timestamp,
+          LogonUser = AccountName, LogonDomain = AccountDomain;
+let HiveOp = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where (FileName =~ "reg.exe"
+         and ProcessCommandLine has_any ("reg load", "reg unload"))
+   or ProcessCommandLine has_any ("RegLoadAppKey", "NtLoadKeyEx",
+                                    "ZwLoadKey", "RegLoadKey")
+| project DeviceName, OpTime = Timestamp,
+          OpAccount = AccountName,
+          OpCmd = ProcessCommandLine,
+          OpParent = InitiatingProcessFileName;
+SecondUserLogon
+| join kind=inner HiveOp on DeviceName
+| where OpTime between (LogonTime .. (LogonTime + 5m))
+| where LogonUser != OpAccount
+| project LogonTime, OpTime, DeviceName,
+          LogonUser, LogonDomain,
+          OpAccount, OpParent, OpCmd
+| order by LogonTime desc
+
+
+// ------------------------------------------------------------
+// 7. STANDARD-USER → HIGH / SYSTEM CHILD WITHOUT UAC
+//    The exploitable outcome shared across every Nightmare-
+//    Eclipse LPE this year. A Medium / Low integrity parent
+//    spawning a High / SYSTEM child without a UAC consent or
+//    TrustedInstaller / msiexec lineage.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where ProcessIntegrityLevel in~ ("High", "System")
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+| where InitiatingProcessFileName !in~ (
+    "consent.exe", "RuntimeBroker.exe", "msiexec.exe",
+    "TiWorker.exe", "TrustedInstaller.exe",
+    "OneDriveSetup.exe", "OneDrive.exe",
+    "OneDriveStandaloneUpdater.exe",
+    "WerFault.exe", "WerFaultSecure.exe", "wuauclt.exe",
+    "sihost.exe", "fontdrvhost.exe", "userinit.exe",
+    "winlogon.exe", "wininit.exe",
+    "MsMpEng.exe", "MpDefenderCoreService.exe"
+)
+| where FileName !in~ (
+    "consent.exe", "WerFault.exe", "WerFaultSecure.exe",
+    "conhost.exe", "splwow64.exe", "smartscreen.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessIntegrityLevel,
+          FileName, FolderPath, ProcessCommandLine,
+          ProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. USRCLASS.DAT / NTUSER.DAT COPY OR STAGING IN A USER-
+//    WRITABLE PATH
+//    Before mounting a second user's hive the attacker
+//    typically copies UsrClass.dat / NTUSER.DAT into a
+//    writable staging directory. Surfaces file creations of
+//    those exact filenames outside the target user's own
+//    profile.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName in~ ("NTUSER.DAT", "UsrClass.dat")
+| where FolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\Desktop\", @"\OneDrive\", @":\Users\Public\",
+    @"\ProgramData\"
+)
+| where FolderPath !endswith @"\AppData\Local\Microsoft\Windows"
+| project Timestamp, DeviceName, AccountName,
+          ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 9. NIGHTMARE-ECLIPSE / MSNightmare GITHUB CLONE OR FETCH
+//    Catches git-clone / curl / wget references to the
+//    operator's public repos on any workstation.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(60d)
+| where ProcessCommandLine has_any (
+    "github.com/MSNightmare", "MSNightmare/LegacyHive",
+    "github.com/Nightmare-Eclipse",
+    "github.com/Chaotic-Eclipse",
+    "github.com/Dead-Eclipse",
+    "raw.githubusercontent.com/MSNightmare",
+    "raw.githubusercontent.com/Nightmare-Eclipse"
+)
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 10. HKCU\SOFTWARE\CLASSES SHELL / COM ENTRY WRITE FROM A
+//     LOW / MEDIUM-INTEGRITY PARENT
+//     Once a second user's hive is mounted, the attacker
+//     manipulates COM class or file-type shell handlers to
+//     escalate. Surface HKCU\Software\Classes writes that
+//     modify shell / ProgID / CLSID / InprocServer entries
+//     from a non-installer / non-admin parent.
+// ------------------------------------------------------------
+DeviceRegistryEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("RegistryValueSet", "RegistryKeyCreated")
+| where RegistryKey has @"\Software\Classes"
+| where RegistryKey has_any (
+    @"\shell\open\command",
+    @"\ProgID", @"\CLSID\",
+    @"\InprocServer32", @"\LocalServer32"
+)
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+| where InitiatingProcessFileName !in~ (
+    "msiexec.exe", "TrustedInstaller.exe", "TiWorker.exe",
+    "explorer.exe", "OneDrive.exe",
+    "setup.exe", "wusa.exe"
+)
+| project Timestamp, DeviceName,
+          ActionType, RegistryKey, RegistryValueName, RegistryValueData,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          InitiatingProcessAccountName,
+          InitiatingProcessIntegrityLevel
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 11. `runas /user` OR CREDENTIAL-PROMPTS FROM A NON-CONSOLE
+//     PARENT
+//     LegacyHive uses a second user's credentials. Catches
+//     `runas.exe` invocations or CredUIPromptForWindowsCredentials-
+//     style flows initiated from a script host rather than
+//     from an interactive Explorer / Console session.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "runas.exe"
+   or ProcessCommandLine has_any (
+        "runas /user", "runas.exe /user",
+        "CredUIPromptForWindowsCredentials",
+        "CreateProcessWithLogonW"
+   )
+| where InitiatingProcessFileName in~ (
+    "powershell.exe", "pwsh.exe", "cmd.exe",
+    "wscript.exe", "cscript.exe",
+    "node.exe", "python.exe", "python", "python3",
+    "rundll32.exe"
+)
+| where InitiatingProcessFolderPath has_any (
+    @"\Downloads\", @"\Temp\", @"\AppData\Local\Temp",
+    @"\AppData\Roaming\", @":\Users\Public\",
+    @"\Desktop\", @"\OneDrive\"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 12. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//     Second-user logon on the same device → reg load /
+//     RegLoadAppKey / NtLoadKeyEx primitive → HKCU\Software
+//     \Classes ProgID / CLSID / shell-open write → SYSTEM-
+//     integrity child from a Medium parent, all inside a
+//     30-minute window.
+// ------------------------------------------------------------
+let Stage1_SecondLogon = DeviceLogonEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LogonSuccess"
+| where LogonType in~ ("Interactive", "NewCredentials", "RemoteInteractive")
+| project DeviceName, LogonTime = Timestamp,
+          LogonUser = AccountName;
+let Stage2_HiveLoad = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where (FileName =~ "reg.exe" and ProcessCommandLine has "load")
+   or ProcessCommandLine has_any (
+        "RegLoadAppKey", "NtLoadKeyEx", "ZwLoadKey", "RegLoadKey"
+   )
+| project DeviceName, HiveTime = Timestamp,
+          HiveCmd = ProcessCommandLine,
+          HiveParent = InitiatingProcessFileName;
+let Stage3_ClassesWrite = DeviceRegistryEvents
+| where Timestamp > ago(7d)
+| where RegistryKey has @"\Software\Classes"
+| where RegistryKey has_any (
+    @"\shell\open\command", @"\ProgID", @"\CLSID\", @"\InprocServer32"
+)
+| project DeviceName, ClsTime = Timestamp,
+          ClsKey = RegistryKey, ClsData = RegistryValueData;
+let Stage4_Elevation = DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessIntegrityLevel =~ "System"
+| where InitiatingProcessIntegrityLevel in~ ("Medium", "Low")
+| where InitiatingProcessFileName !in~ (
+    "consent.exe", "msiexec.exe", "TiWorker.exe",
+    "TrustedInstaller.exe", "WerFault.exe",
+    "OneDrive.exe"
+)
+| project DeviceName, ElevTime = Timestamp,
+          ElevName = FileName, ElevCmd = ProcessCommandLine;
+Stage1_SecondLogon
+| join kind=inner Stage2_HiveLoad on DeviceName
+| where HiveTime between (LogonTime .. (LogonTime + 10m))
+| join kind=inner Stage3_ClassesWrite on DeviceName
+| where ClsTime between (HiveTime .. (HiveTime + 10m))
+| join kind=leftouter Stage4_Elevation on DeviceName
+| where ElevTime between (ClsTime .. (ClsTime + 10m))
+| project LogonTime, HiveTime, ClsTime, ElevTime,
+          DeviceName,
+          LogonUser,
+          HiveParent, HiveCmd,
+          ClsKey, ClsData,
+          ElevName, ElevCmd
+| order by LogonTime desc
