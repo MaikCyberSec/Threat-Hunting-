@@ -1,0 +1,292 @@
+// ============================================================
+// Cursor AI Code Editor 0-Day - Malicious git.exe Binary
+// Planting in Workspace Root (Untrusted Search Path, CWE-426)
+// Source:   CyberSecurity News (July 2026) - no CVE assigned,
+//           flaw UNPATCHED at time of writing
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1574.008 (Hijack Execution Flow: Path
+//                          Interception by Search Order Hijacking),
+//               T1204.002 (User Execution: Malicious File),
+//               T1036.005 (Masquerading: Match Legitimate Name),
+//               T1059 (Command and Scripting Interpreter)
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Cursor (AI-powered fork of VS Code, 7M+ developers) resolves
+// the Git binary by searching multiple locations INCLUDING the
+// workspace root of the project being opened. An attacker who
+// plants a malicious "git.exe" in the root of a repository gets
+// automatic code execution the moment a victim opens that repo
+// in Cursor - no clicks, no prompts, no trust dialog.
+//
+//   - Cursor.exe invokes the planted binary via routine queries
+//     such as "git rev-parse --show-toplevel"
+//   - Execution repeats during background operations, giving the
+//     payload persistence-like re-execution for free
+//   - Reported 15 Dec 2025, still unfixed as of v3.2.16 after
+//     197 releases - treat every untrusted repo as hostile
+//
+// The delivery vector is trivially wormable: any cloned, forked
+// or ZIP-downloaded repository (typosquats, fake PoCs, "starter
+// templates", recruitment coding tests) can carry the payload.
+//
+// LEGITIMATE git.exe LOCATIONS (tune to your estate)
+// ---------------------------------------------------------------
+//   C:\Program Files\Git\...            (Git for Windows)
+//   C:\Program Files (x86)\Git\...
+//   C:\Program Files\Microsoft Visual Studio\... (Team Explorer)
+//   ...\AppData\Local\Programs\Git\...  (per-user Git install)
+//   ...\AppData\Local\GitHubDesktop\... (GitHub Desktop bundled)
+//   ...\AppData\Local\Atlassian\SourceTree\git_local\...
+//   ...\scoop\apps\git\...              (Scoop package manager)
+//   C:\ProgramData\chocolatey\...       (Chocolatey)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Portable Git or dev toolchains vendored inside a repo
+//     (rare but real in embedded / CI tooling repos). Verify the
+//     SHA256 against the official Git for Windows release.
+//   - Per-user Git installs in unusual paths. Add them to the
+//     allowlist above after validation.
+//   - Query #2 (version-info mismatch) is the highest-fidelity
+//     single signal: real Git binaries carry OriginalFileName
+//     "git.exe" and company "The Git Development Community".
+//
+// RESPONSE
+// ---------------------------------------------------------------
+//   - Quarantine the planted git.exe, collect the repo source
+//     (URL, ZIP, clone remote) for attribution
+//   - AppLocker / WDAC path deny rule for git.exe under user
+//     workspace roots, e.g. %USERPROFILE%\source\repos\*\git.exe
+//   - Open untrusted repos only in Windows Sandbox / disposable VM
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/critical-cursor-0-day-flaw/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. CURSOR SPAWNING git.exe FROM A NON-STANDARD LOCATION
+//    The core exploit signal: Cursor.exe executing a git.exe
+//    that does NOT live in a trusted Git installation path.
+//    Any hit inside a workspace / repo folder is near-certain
+//    exploitation.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName =~ "Cursor.exe"
+| where FileName =~ "git.exe"
+| where FolderPath !startswith @"C:\Program Files\Git"
+   and FolderPath !startswith @"C:\Program Files (x86)\Git"
+   and FolderPath !startswith @"C:\Program Files\Microsoft Visual Studio"
+   and FolderPath !contains @"\AppData\Local\Programs\Git"
+   and FolderPath !contains @"\AppData\Local\GitHubDesktop"
+   and FolderPath !contains @"\AppData\Local\Atlassian\SourceTree\git_local"
+   and FolderPath !contains @"\scoop\apps\git"
+   and FolderPath !startswith @"C:\ProgramData\chocolatey"
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine, SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. FAKE git.exe - VERSION-INFO MASQUERADE CHECK
+//    A genuine Git for Windows binary carries OriginalFileName
+//    "git.exe" and company "The Git Development Community".
+//    A planted payload renamed to git.exe almost never does.
+//    Highest-fidelity single signal in this pack.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "git.exe"
+| where InitiatingProcessFileName in~ ("Cursor.exe", "Code.exe", "explorer.exe")
+| where ProcessVersionInfoOriginalFileName !~ "git.exe"
+   or ProcessVersionInfoCompanyName !has "Git Development Community"
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath,
+          ProcessVersionInfoOriginalFileName,
+          ProcessVersionInfoCompanyName,
+          ProcessVersionInfoProductName,
+          ProcessCommandLine, InitiatingProcessFileName, SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. git.exe PLANTED IN A WORKSPACE / USER-WRITABLE FOLDER
+//    Catches the staging moment - a file named git.exe written
+//    into repo roots, Downloads, Desktop or extraction folders
+//    (the attacker's delivery step, before Cursor ever opens it).
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName =~ "git.exe"
+| where FolderPath has_any (
+    @"\source\repos\", @"\repos\", @"\git\", @"\projects\",
+    @"\Downloads\", @"\Desktop\", @"\Documents\",
+    @"\OneDrive\", @"\Temp\", @":\Users\Public\"
+)
+| where FolderPath !contains @"\AppData\Local\Programs\Git"
+   and FolderPath !contains @"\AppData\Local\GitHubDesktop"
+   and FolderPath !contains @"\scoop\apps\git"
+| project Timestamp, DeviceName,
+          FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RequestAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. PLANTED git.exe TRIGGERED BY CURSOR'S ROUTINE GIT QUERIES
+//    The article-documented invocation: the fake binary is
+//    executed with "rev-parse --show-toplevel" style arguments
+//    from a path that is itself the workspace being opened.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "git.exe"
+| where ProcessCommandLine has "rev-parse"
+| where InitiatingProcessFileName =~ "Cursor.exe"
+| where FolderPath !startswith @"C:\Program Files"
+| project Timestamp, DeviceName, AccountName,
+          FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          SHA256
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. SUSPICIOUS CHILDREN OF A git.exe RUNNING OUTSIDE TRUSTED
+//    PATHS
+//    Real git spawns ssh, git-remote-https, bash, less, its own
+//    subcommands. A payload masquerading as git spawning shells,
+//    script hosts or LOLBins is post-exploitation in motion.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName =~ "git.exe"
+| where InitiatingProcessFolderPath !startswith @"C:\Program Files\Git"
+   and InitiatingProcessFolderPath !startswith @"C:\Program Files (x86)\Git"
+   and InitiatingProcessFolderPath !startswith @"C:\Program Files\Microsoft Visual Studio"
+   and InitiatingProcessFolderPath !contains @"\AppData\Local\Programs\Git"
+   and InitiatingProcessFolderPath !contains @"\AppData\Local\GitHubDesktop"
+   and InitiatingProcessFolderPath !contains @"\scoop\apps\git"
+| where FileName in~ (
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "mshta.exe", "rundll32.exe", "regsvr32.exe",
+    "wscript.exe", "cscript.exe", "bitsadmin.exe",
+    "certutil.exe", "curl.exe", "msiexec.exe", "schtasks.exe"
+)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. NETWORK CONNECTIONS FROM A git.exe OUTSIDE TRUSTED PATHS
+//    Legit git talks to your remotes over https/ssh from its
+//    install directory. A workspace-root git.exe beaconing out
+//    is C2 or second-stage download.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName =~ "git.exe"
+| where InitiatingProcessFolderPath !startswith @"C:\Program Files\Git"
+   and InitiatingProcessFolderPath !startswith @"C:\Program Files (x86)\Git"
+   and InitiatingProcessFolderPath !startswith @"C:\Program Files\Microsoft Visual Studio"
+   and InitiatingProcessFolderPath !contains @"\AppData\Local\Programs\Git"
+   and InitiatingProcessFolderPath !contains @"\AppData\Local\GitHubDesktop"
+   and InitiatingProcessFolderPath !contains @"\scoop\apps\git"
+| where ActionType in ("ConnectionSuccess", "ConnectionRequest", "ConnectionFound")
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl, Protocol
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. UNSIGNED / UNTRUSTED git.exe CERTIFICATE CHECK
+//    Git for Windows releases are Authenticode-signed by
+//    "Johannes Schindelin". Joins recently observed git.exe
+//    binaries against certificate info - unsigned or untrusted
+//    hits deserve a look.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "git.exe"
+| where ActionType == "FileCreated"
+| distinct SHA1, FolderPath, DeviceName
+| join kind=leftouter (
+    DeviceFileCertificateInfo
+    | where Timestamp > ago(30d)
+    | distinct SHA1, IsSigned, IsTrusted, Signer
+) on SHA1
+| where isempty(Signer) or IsSigned == false or IsTrusted == false
+| project DeviceName, FolderPath, SHA1, IsSigned, IsTrusted, Signer
+
+
+// ------------------------------------------------------------
+// 8. CURSOR INSTALL BASE (EXPOSURE SURFACE)
+//    Every device in the fleet running Cursor - this is your
+//    population at risk while the flaw stays unpatched.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "Cursor.exe"
+| summarize LastSeen = max(Timestamp),
+            Executions = count()
+          by DeviceName, FolderPath,
+             Version = ProcessVersionInfoProductVersion
+| order by LastSeen desc
+
+
+// ------------------------------------------------------------
+// 9. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    git.exe written to disk in a user-writable path -> Cursor
+//    executes that same git.exe -> the fake git spawns a child
+//    process, all on one device inside a 60-minute window.
+//    A completed chain here is a confirmed compromise.
+// ------------------------------------------------------------
+let Stage1_Planted = DeviceFileEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "git.exe"
+| where ActionType in ("FileCreated", "FileRenamed")
+| where FolderPath !startswith @"C:\Program Files"
+   and FolderPath !contains @"\AppData\Local\Programs\Git"
+   and FolderPath !contains @"\AppData\Local\GitHubDesktop"
+   and FolderPath !contains @"\scoop\apps\git"
+| project DeviceName, PlantTime = Timestamp,
+          PlantFolder = FolderPath, PlantSha = SHA256,
+          PlantedBy = InitiatingProcessFileName;
+let Stage2_Executed = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where FileName =~ "git.exe"
+| where InitiatingProcessFileName =~ "Cursor.exe"
+| where FolderPath !startswith @"C:\Program Files"
+| project DeviceName, ExecTime = Timestamp,
+          ExecFolder = FolderPath, ExecCmd = ProcessCommandLine,
+          ExecSha = SHA256, ExecPid = ProcessId;
+let Stage3_Child = DeviceProcessEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName =~ "git.exe"
+| where InitiatingProcessFolderPath !startswith @"C:\Program Files"
+| project DeviceName, ChildTime = Timestamp,
+          ChildName = FileName, ChildCmd = ProcessCommandLine,
+          GitParentPid = InitiatingProcessId;
+Stage1_Planted
+| join kind=inner Stage2_Executed on DeviceName
+| where ExecTime between (PlantTime .. (PlantTime + 60m))
+| join kind=leftouter Stage3_Child on DeviceName
+| where isnull(ChildTime) or ChildTime between (ExecTime .. (ExecTime + 60m))
+| project PlantTime, ExecTime, ChildTime,
+          DeviceName,
+          PlantFolder, PlantedBy, PlantSha,
+          ExecFolder, ExecCmd,
+          ChildName, ChildCmd
+| order by PlantTime desc
