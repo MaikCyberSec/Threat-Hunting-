@@ -270,6 +270,10 @@ let ZoomCVEs = dynamic([
 DeviceTvmSoftwareVulnerabilities
 | where (SoftwareVendor =~ "zoom" or SoftwareName has "Zoom")
    or CveId in (ZoomCVEs)
+| join kind=leftouter (
+    DeviceTvmSoftwareVulnerabilitiesKB
+    | project CveId, CvssScore, IsExploitAvailable
+) on CveId
 | project DeviceId, DeviceName, OSPlatform,
           SoftwareVendor, SoftwareName, SoftwareVersion,
           CveId, VulnerabilitySeverityLevel, CvssScore,

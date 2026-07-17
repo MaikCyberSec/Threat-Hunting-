@@ -78,6 +78,10 @@ let July2026_CVEs = dynamic([
 ]);
 DeviceTvmSoftwareVulnerabilities
 | where CveId in (July2026_CVEs)
+| join kind=leftouter (
+    DeviceTvmSoftwareVulnerabilitiesKB
+    | project CveId, CvssScore, IsExploitAvailable
+) on CveId
 | project DeviceId, DeviceName, OSPlatform, OSVersion,
           SoftwareVendor, SoftwareName, SoftwareVersion,
           CveId, VulnerabilitySeverityLevel, CvssScore,

@@ -94,6 +94,10 @@ let WiresharkCVEs = dynamic([
 DeviceTvmSoftwareVulnerabilities
 | where (SoftwareVendor =~ "wireshark" or SoftwareName has "wireshark")
    or CveId in (WiresharkCVEs)
+| join kind=leftouter (
+    DeviceTvmSoftwareVulnerabilitiesKB
+    | project CveId, CvssScore, IsExploitAvailable
+) on CveId
 | project DeviceId, DeviceName, OSPlatform,
           SoftwareVendor, SoftwareName, SoftwareVersion,
           CveId, VulnerabilitySeverityLevel, CvssScore,
