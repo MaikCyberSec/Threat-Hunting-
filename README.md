@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **July 2026**
+- [TELESHIM Telegram Bot C2 - MIXEDKEY & BINDCLOAK DLL Sideload vs MidEast Gov](<TELESHIM Telegram Bot C2 - MIXEDKEY & BINDCLOAK DLL Sideload vs MidEast Gov (July 2026)>)
 - [Qilin Ransomware - PAN-OS GlobalProtect Auth Bypass CVE-2026-0257](<Qilin Ransomware - PAN-OS GlobalProtect Auth Bypass CVE-2026-0257 (July 2026)>)
 - [Microsoft Patch Tuesday July 2026 - 570 CVEs and 3 Zero-Days (SharePoint / AD FS / BitLocker)](<Microsoft Patch Tuesday July 2026 - 570 CVEs and 3 Zero-Days (SharePoint AD FS BitLocker) (July 2026)>)
 - [LegacyHive - Windows User Profile Service Arbitrary Hive LPE (Nightmare-Eclipse)](<LegacyHive - Windows User Profile Service Arbitrary Hive LPE (Nightmare-Eclipse July 2026)>)
