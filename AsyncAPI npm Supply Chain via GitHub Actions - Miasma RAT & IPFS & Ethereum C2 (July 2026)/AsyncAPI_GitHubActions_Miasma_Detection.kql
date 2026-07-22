@@ -1,0 +1,289 @@
+// ============================================================
+// ASYNCAPI NPM SUPPLY CHAIN VIA GITHUB ACTIONS ABUSE
+// Miasma RAT — IPFS payload delivery + Ethereum contract C2
+// (July 2026)
+// Source:   Cybersecurity News / Cato Networks (July 2026)
+// Platform: Microsoft Defender for Endpoint + Defender XDR
+//           (Advanced Hunting)
+// MITRE ATT&CK: T1195.002, T1199,
+//               T1059.007, T1204.002,
+//               T1102, T1102.001, T1071.001,
+//               T1105, T1027, T1497.003
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Cato Networks uncovered a supply chain compromise of the
+// AsyncAPI npm ecosystem (~2.9 MILLION weekly downloads).
+// Attackers exploited a vulnerable GitHub Actions workflow
+// that processed UNTRUSTED PULL REQUEST CONTENT in a
+// privileged context (the classic "pwn request" pattern),
+// stole/abused the project's automation credentials, and
+// published backdoored releases from the OFFICIAL namespace.
+//
+// COMPROMISED PACKAGES / VERSIONS
+//   @asyncapi/generator             v3.3.1
+//   @asyncapi/generator-helpers     v1.1.1
+//   @asyncapi/generator-components  v0.7.1
+//   @asyncapi/specs                 v6.11.2-alpha.1, v6.11.2
+//
+// MIASMA RAT — WHY IT IS HARD TO CATCH
+//   - No npm lifecycle hooks (no postinstall): the payload
+//     runs ON MODULE IMPORT during builds / runtime, so
+//     install-time scanners see nothing.
+//   - First stage launches a DETACHED node.exe child, then
+//     pulls an ENCRYPTED second stage from IPFS.
+//   - C2 bootstrap via rentry.co pastebin; FALLBACK C2 config
+//     read from an Ethereum smart contract, which survives
+//     conventional infrastructure takedowns.
+//   - Capabilities: remote access, command execution, file
+//     handling, self-update.
+//
+// KEY IOCs
+//   File:     NodeJSsync.js
+//   IPFS CID: QmQtjE6NCaMGbcWvczuASpXTakZYrE6AmjnCnCdp8wHAo1
+//   ETH:      0x1969ab05d67b67fdcaa26240f738ccb077e1cd84
+//   Network:  ipfs.io (gateway), rentry.co (pastebin C2)
+//   Strings:  cidheurbittorrent1..5
+//
+// FALSE POSITIVE NOTES
+// ---------------------------------------------------------------
+//   - Query 2 (older/clean AsyncAPI versions) is INVENTORY,
+//     not detection: use it to scope exposure.
+//   - IPFS gateways and rentry.co have legitimate niche users;
+//     from node.exe on a build agent they are far rarer.
+//     Baseline web3 development teams before alerting.
+//   - Workflow-file edits (Query 7) are normal developer
+//     activity: hunt for pull_request_target additions
+//     specifically, and review who made them.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/hackers-abuse-github-actions/
+//   https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. NAMED IOC — NodeJSsync.js AND MIASMA STRING ARTEFACTS
+//    Direct catch on the documented payload filename and the
+//    BitTorrent-flavoured marker strings.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FileName =~ "NodeJSsync.js"
+    | extend Kind = "PayloadFile", Detail = strcat(FolderPath, "\\", FileName)
+    | project Timestamp, DeviceName, Kind, Detail, SHA256,
+              AccountName = InitiatingProcessAccountName,
+              InitiatingProcessFileName, InitiatingProcessCommandLine
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has_any ("NodeJSsync",
+                                         "cidheurbittorrent",
+                                         "QmQtjE6NCaMGbcWvczuASpXTakZYrE6AmjnCnCdp8wHAo1",
+                                         "0x1969ab05d67b67fdcaa26240f738ccb077e1cd84")
+    | extend Kind = "IOCinCmdline", Detail = ProcessCommandLine, SHA256 = ""
+    | project Timestamp, DeviceName, Kind, Detail, SHA256,
+              AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. EXPOSURE INVENTORY — COMPROMISED ASYNCAPI VERSIONS
+//    Where did the backdoored versions land? Catches installs
+//    on the command line and the package folders on disk.
+//    Run first to scope, then pivot the hosts into Queries 3-6.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where FileName in~ ("node.exe", "npm.cmd", "npm", "npx.cmd", "npx",
+                           "yarn.cmd", "yarn", "pnpm.cmd", "pnpm", "cmd.exe")
+    | where ProcessCommandLine has "@asyncapi/"
+    | where ProcessCommandLine has_any ("generator@3.3.1",
+                                         "generator-helpers@1.1.1",
+                                         "generator-components@0.7.1",
+                                         "specs@6.11.2")
+    | extend Kind = "InstallCmd", Detail = ProcessCommandLine
+    | project Timestamp, DeviceName, Kind, Detail,
+              AccountName, InitiatingProcessFileName
+),
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FolderPath has @"node_modules\@asyncapi"
+    | where FileName =~ "package.json"
+    | extend Kind = "PackageOnDisk", Detail = FolderPath
+    | project Timestamp, DeviceName, Kind, Detail,
+              AccountName = InitiatingProcessAccountName,
+              InitiatingProcessFileName
+)
+| summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            Signals = make_set(Kind, 4), Sample = any(Detail)
+    by DeviceName
+| order by LastSeen desc
+
+
+// ------------------------------------------------------------
+// 3. NODE.EXE PULLING FROM IPFS GATEWAYS
+//    The Miasma second-stage fetch. node.exe (or npm) talking
+//    to IPFS gateway infrastructure is rare outside web3 dev
+//    shops — on a CI/CD runner it is a red flag.
+// ------------------------------------------------------------
+let IpfsGateways = dynamic(["ipfs.io", "dweb.link", "cf-ipfs.com",
+                             "cloudflare-ipfs.com", "gateway.pinata.cloud",
+                             "ipfs.infura.io", "w3s.link", "nftstorage.link"]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (IpfsGateways)
+   or RemoteUrl has "QmQtjE6NCaMGbcWvczuASpXTakZYrE6AmjnCnCdp8wHAo1"
+| where InitiatingProcessFileName in~ ("node.exe", "npm.cmd", "npx.cmd",
+                                        "yarn.cmd", "pnpm.cmd", "node")
+| project Timestamp, DeviceName, RemoteUrl, RemoteIP, RemotePort,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessFolderPath, InitiatingProcessAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. C2 BOOTSTRAP — RENTRY.CO PASTEBIN FROM DEV TOOLING
+//    Miasma reads its C2 configuration from rentry.co. Any
+//    non-browser process fetching it deserves review; node.exe
+//    doing so on a build host is the campaign signature.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has "rentry.co"
+| where InitiatingProcessFileName !in~ ("chrome.exe", "msedge.exe",
+                                         "firefox.exe", "brave.exe", "opera.exe")
+| project Timestamp, DeviceName, RemoteUrl, RemoteIP,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          InitiatingProcessAccountName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. ETHEREUM RPC FALLBACK C2 FROM NODE / BUILD PROCESSES
+//    Miasma's takedown-resistant fallback: reading bootstrap
+//    data from a smart contract. Catches node.exe and CI
+//    tooling querying public Ethereum RPC endpoints. Baseline
+//    legitimate web3 projects before alerting.
+// ------------------------------------------------------------
+let EthRpc = dynamic(["infura.io", "alchemy.com", "alchemyapi.io",
+                       "cloudflare-eth.com", "ankr.com/eth",
+                       "publicnode.com", "llamarpc.com",
+                       "api.etherscan.io"]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (EthRpc)
+| where InitiatingProcessFileName in~ ("node.exe", "npm.cmd", "npx.cmd",
+                                        "yarn.cmd", "pnpm.cmd", "node",
+                                        "powershell.exe", "pwsh.exe")
+| summarize FirstSeen = min(Timestamp), LastSeen = max(Timestamp),
+            Endpoints = make_set(RemoteUrl, 5), Connections = count()
+    by DeviceName, InitiatingProcessFileName,
+       InitiatingProcessCommandLine, InitiatingProcessAccountName
+| order by Connections desc
+
+
+// ------------------------------------------------------------
+// 6. DETACHED NODE CHILD — IMPORT-TIME EXECUTION PATTERN
+//    The first stage spawns a detached node.exe child that
+//    outlives the build. Flags node spawning node where the
+//    child runs a script from temp / node_modules paths.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("node.exe", "node")
+| where InitiatingProcessFileName in~ ("node.exe", "node", "npm.cmd", "npx.cmd")
+| where ProcessCommandLine has_any (@"\Temp\", @"\AppData\Local\Temp",
+                                     "NodeJSsync",
+                                     @"node_modules\.bin",
+                                     "--eval", "-e ")
+| where ProcessCommandLine has_any (".js", "-e ", "--eval")
+| project Timestamp, DeviceName, AccountName,
+          FileName, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. GITHUB ACTIONS POSTURE — PWN-REQUEST SURFACE ON YOUR OWN
+//    REPOS
+//    The root cause: workflows that hand untrusted PR content
+//    a privileged context. Surfaces local edits to workflow
+//    files and any tooling referencing pull_request_target,
+//    so you can review your own exposure.
+// ------------------------------------------------------------
+union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(30d)
+    | where FolderPath has @"\.github\workflows"
+    | where FileName endswith ".yml" or FileName endswith ".yaml"
+    | where ActionType in ("FileCreated", "FileModified")
+    | extend Kind = "WorkflowEdit", Detail = strcat(FolderPath, "\\", FileName)
+    | project Timestamp, DeviceName, Kind, Detail,
+              AccountName = InitiatingProcessAccountName,
+              InitiatingProcessFileName
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(30d)
+    | where ProcessCommandLine has_any ("pull_request_target",
+                                         "workflow_run",
+                                         "GITHUB_TOKEN")
+    | extend Kind = "PrivilegedTriggerRef", Detail = ProcessCommandLine
+    | project Timestamp, DeviceName, Kind, Detail,
+              AccountName, InitiatingProcessFileName
+)
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    AsyncAPI package activity or the payload file on a device
+//    followed by IPFS / rentry.co / Ethereum-RPC traffic from
+//    node tooling within 24 hours. A hit here is a live
+//    Miasma infection, not an inventory finding.
+// ------------------------------------------------------------
+let Stage1_Package = union isfuzzy=true
+(
+    DeviceFileEvents
+    | where Timestamp > ago(14d)
+    | where FileName =~ "NodeJSsync.js"
+       or FolderPath has @"node_modules\@asyncapi"
+    | project DeviceName, Stage1Time = Timestamp,
+              Stage1Signal = iff(FileName =~ "NodeJSsync.js",
+                                  "PayloadFile", "AsyncAPIPackage")
+),
+(
+    DeviceProcessEvents
+    | where Timestamp > ago(14d)
+    | where ProcessCommandLine has "@asyncapi/"
+    | project DeviceName, Stage1Time = Timestamp,
+              Stage1Signal = "AsyncAPICmd"
+);
+let Stage2_C2 = DeviceNetworkEvents
+| where Timestamp > ago(14d)
+| where InitiatingProcessFileName in~ ("node.exe", "npm.cmd", "npx.cmd",
+                                        "yarn.cmd", "pnpm.cmd", "node")
+| where RemoteUrl has_any ("ipfs.io", "dweb.link", "cloudflare-ipfs.com",
+                            "gateway.pinata.cloud", "rentry.co",
+                            "infura.io", "alchemy.com", "cloudflare-eth.com")
+| project DeviceName, C2Time = Timestamp,
+          C2Url = RemoteUrl, C2Process = InitiatingProcessFileName;
+Stage1_Package
+| join kind=inner Stage2_C2 on DeviceName
+| where C2Time between (Stage1Time .. (Stage1Time + 24h))
+| summarize Stage1Signals = make_set(Stage1Signal, 4),
+            C2Urls = make_set(C2Url, 8),
+            FirstStage1 = min(Stage1Time), FirstC2 = min(C2Time)
+    by DeviceName, C2Process
+| order by FirstStage1 desc
