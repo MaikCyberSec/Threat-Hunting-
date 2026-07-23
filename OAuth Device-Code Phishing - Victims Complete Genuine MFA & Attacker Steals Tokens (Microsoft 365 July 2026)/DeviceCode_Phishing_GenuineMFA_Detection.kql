@@ -1,0 +1,235 @@
+// ============================================================
+// OAuth Device-Code Phishing — Victim Completes Genuine MFA,
+//                              Attacker Walks Away With the Tokens
+// Source:   CyberSecurity News (Jul 2026) — "Hackers Let Victims
+//           Complete MFA"; Trend Micro campaign analysis
+// Platform: Microsoft Defender XDR (Advanced Hunting)
+//           Requires Entra ID P2 + Defender for Cloud Apps +
+//           Defender for Office 365 for full table coverage.
+// MITRE ATT&CK: T1566.002, T1528, T1550.001, T1078.004,
+//               T1098.005, T1114.003, T1556
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// This is not adversary-in-the-middle credential theft and it is
+// not a fake login page. The attacker abuses the legitimate OAuth
+// 2.0 device-authorization (device-code) grant. Their server
+// requests a short-lived device code, then a rapport-built lure
+// (in the reported campaign, an attacker posing as a law-firm
+// partner) asks the victim to enter that code on the REAL
+// Microsoft sign-in page.
+//
+// The victim types their password and completes MFA on genuine
+// Microsoft infrastructure, so every control they see behaves
+// normally. Entra ID then issues the access AND refresh tokens to
+// the attacker's pending device request, not to the victim. The
+// refresh token grants durable access; the operator registers a
+// rogue device, creates hidden mailbox rules, and pivots.
+//
+// WHY THIS IS HARD TO SEE
+// ---------------------------------------------------------------
+// Advanced Hunting does NOT expose an "authenticationProtocol"
+// field, so device-code sign-ins cannot be filtered directly (that
+// field only exists in Entra SigninLogs / Sentinel). In Defender
+// XDR the reliable pivot is the client application used to redeem
+// the code and join the device: the "Microsoft Authentication
+// Broker" app (AppId 29d9ed98-a469-4536-ade2-f981bc1d605e) and the
+// "Device Registration Service" resource. Treat those sign-ins as
+// events that require a business explanation.
+//
+// DELIVERY CHAIN (reported campaign)
+// ---------------------------------------------------------------
+//   Spoofed sender -> Google Sites lure -> open-redirector ->
+//   fake human-check -> "enter this code at microsoft.com".
+//
+// KEY IOCs (see queries 1 and 4)
+// ---------------------------------------------------------------
+//   Attacker IPs: 104.219.238.253, 43.165.1.42, 40.124.130.50,
+//                 18.118.111.82, 83.136.210.246
+//   Domains:      rlcounsel[.]com, cholaw-kr[.]co, eusei[.]com,
+//                 cineuropa[.]org, zrdesignlabo[.]com,
+//                 hlpadditives[.]com, flosli[.]com,
+//                 stefan-dufva[.]workers[.]dev
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate device-code use exists (IoT, CLI tooling, kiosk
+//     enrolment). Baseline which users/apps ever need it, then
+//     alert on the exceptions.
+//   - Authentication Broker traffic from managed, compliant
+//     devices in expected countries is normal — keep the
+//     IsManaged / country filters in query 2.
+//   - Admin-created inbox rules and planned device enrolments.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/hackers-let-victims-complete-mfa/
+//   https://learn.microsoft.com/defender-xdr/advanced-hunting-entraidsigninevents-table
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN-IOC SIGN-INS (HIGHEST FIDELITY)
+//    Any successful Entra sign-in from a campaign IP. Near-zero
+//    false positives — treat every hit as an incident.
+// ------------------------------------------------------------
+let AttackerIPs = dynamic([
+    "104.219.238.253", "43.165.1.42", "40.124.130.50",
+    "18.118.111.82",  "83.136.210.246"
+]);
+EntraIdSignInEvents
+| where Timestamp > ago(30d)
+| where IPAddress in (AttackerIPs)
+| project Timestamp, AccountUpn, AccountObjectId,
+          Application, ApplicationId, ResourceDisplayName,
+          IPAddress, Country, City, ClientAppUsed, UserAgent,
+          ErrorCode, RiskLevelAggregated, ConditionalAccessStatus
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. DEVICE-CODE / AUTH-BROKER SIGN-INS TO EXPLAIN
+//    Device-code redemption + rogue device join surfaces as the
+//    Microsoft Authentication Broker app or the Device
+//    Registration Service resource. Focus on SUCCESSFUL sign-ins
+//    from unmanaged devices. Tune HomeCountries to your tenant.
+// ------------------------------------------------------------
+let BrokerAppId = "29d9ed98-a469-4536-ade2-f981bc1d605e";
+let HomeCountries = dynamic(["NL", "BE", "DE"]);   // <-- tune
+EntraIdSignInEvents
+| where Timestamp > ago(30d)
+| where ErrorCode == 0                              // successful only
+| where ApplicationId == BrokerAppId
+     or Application has "Authentication Broker"
+     or ResourceDisplayName has_any ("Device Registration Service",
+                                     "Microsoft Authentication Broker")
+| where IsManaged != 1 or isempty(tostring(IsManaged))
+| where Country !in (HomeCountries)
+| project Timestamp, AccountUpn, AccountObjectId,
+          Application, ResourceDisplayName, ClientAppUsed,
+          IPAddress, Country, City, UserAgent,
+          IsManaged, IsCompliant, DeviceName, EntraIdDeviceId,
+          AuthenticationRequirement, RiskLevelAggregated
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. IMPOSSIBLE TRAVEL ON THE SAME ACCOUNT
+//    The victim authenticates from home while the attacker
+//    redeems tokens from abroad. Flag accounts signing in
+//    successfully from 2+ countries in a short window.
+// ------------------------------------------------------------
+EntraIdSignInEvents
+| where Timestamp > ago(14d)
+| where ErrorCode == 0
+| where isnotempty(Country)
+| summarize Countries   = make_set(Country, 10),
+            CountryCount = dcount(Country),
+            IPs          = make_set(IPAddress, 10),
+            Apps         = make_set(Application, 10),
+            FirstSeen    = min(Timestamp),
+            LastSeen     = max(Timestamp)
+          by AccountUpn, AccountObjectId, bin(Timestamp, 6h)
+| where CountryCount >= 2
+| order by LastSeen desc
+
+
+// ------------------------------------------------------------
+// 4. PHISHING-URL CLICKS (DELIVERY SIDE, DEFENDER FOR O365)
+//    Safe Links records of users clicking the campaign lure /
+//    redirector infrastructure. UrlChain covers redirect hops.
+// ------------------------------------------------------------
+let BadDomains = dynamic([
+    "rlcounsel.com", "cholaw-kr.co", "eusei.com", "cineuropa.org",
+    "zrdesignlabo.com", "hlpadditives.com", "flosli.com",
+    "stefan-dufva.workers.dev", "businessprofileoverview",
+    "corporateprofiledetails", "profileportfoliodetailsdata"
+]);
+UrlClickEvents
+| where Timestamp > ago(30d)
+| where Url has_any (BadDomains) or UrlChain has_any (BadDomains)
+| project Timestamp, AccountUpn, Workload, Url, UrlChain,
+          ActionType, IsClickedThrough, ThreatTypes,
+          DetectionMethods, IPAddress, NetworkMessageId
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. POST-COMPROMISE — HIDDEN / FORWARDING INBOX RULE
+//    Operators create rules that auto-forward, delete or hide
+//    replies so the victim never sees the fraud. Searches the
+//    raw audit payload so it is robust to parameter ordering.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where ActionType in~ ("New-InboxRule", "Set-InboxRule",
+                        "UpdateInboxRules", "Set-Mailbox")
+| where tostring(RawEventData) has_any (
+        "ForwardTo", "ForwardAsAttachmentTo", "RedirectTo",
+        "DeleteMessage", "MoveToFolder", "MarkAsRead",
+        "StopProcessingRules")
+| project Timestamp, AccountDisplayName, AccountId, ActionType,
+          IPAddress, CountryCode, City, Isp, UserAgent,
+          IsAdminOperation, ObjectName, RawEventData
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. POST-COMPROMISE — ROGUE DEVICE REGISTRATION
+//    Device-code abuse is frequently followed by joining an
+//    attacker device to establish persistence. Audit operation
+//    names vary by source, so match broadly and review.
+// ------------------------------------------------------------
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where ActionType has_any ("Add registered device",
+                            "Add registered owner to device",
+                            "Register device", "Add device",
+                            "Update device")
+| project Timestamp, AccountDisplayName, AccountId, ActionType,
+          IPAddress, CountryCode, City, Isp, UserAgent,
+          ObjectName, ObjectType, RawEventData
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. FULL KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    Suspicious Auth-Broker / IoC sign-in, THEN the same account
+//    creates a hiding inbox rule or registers a device within
+//    24 hours. This is the triage query.
+// ------------------------------------------------------------
+let BrokerAppId = "29d9ed98-a469-4536-ade2-f981bc1d605e";
+let AttackerIPs = dynamic([
+    "104.219.238.253", "43.165.1.42", "40.124.130.50",
+    "18.118.111.82",  "83.136.210.246"
+]);
+let SuspiciousSignIn = EntraIdSignInEvents
+| where Timestamp > ago(30d)
+| where ErrorCode == 0
+| where IPAddress in (AttackerIPs)
+     or ApplicationId == BrokerAppId
+     or ResourceDisplayName has "Device Registration Service"
+| project SignInTime = Timestamp, AccountUpn,
+          AccountObjectId, SignInIP = IPAddress,
+          SignInCountry = Country, SignInApp = Application;
+let BadFollowUp = CloudAppEvents
+| where Timestamp > ago(30d)
+| where (ActionType in~ ("New-InboxRule", "Set-InboxRule",
+                         "UpdateInboxRules", "Set-Mailbox")
+         and tostring(RawEventData) has_any (
+             "ForwardTo", "RedirectTo", "DeleteMessage",
+             "MoveToFolder", "MarkAsRead"))
+     or ActionType has_any ("Add registered device",
+                            "Register device", "Add device")
+| where isnotempty(AccountObjectId)
+| project ActionTime = Timestamp, AccountObjectId, ActionType,
+          ActionIP = IPAddress, ActionCountry = CountryCode,
+          FollowUp = ObjectName;
+SuspiciousSignIn
+| join kind=inner BadFollowUp on AccountObjectId
+| where ActionTime between (SignInTime .. (SignInTime + 24h))
+| project SignInTime, ActionTime, AccountUpn,
+          SignInApp, SignInIP, SignInCountry,
+          ActionType, FollowUp, ActionIP, ActionCountry
+| order by SignInTime desc
