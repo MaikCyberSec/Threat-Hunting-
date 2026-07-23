@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **July 2026**
+- [Exploitarium Mass 0-Day Dump - 204 PoCs & libssh2 CVE-2026-55200 Pre-Auth RCE](<Exploitarium Mass 0-Day Dump - 204 PoCs & libssh2 CVE-2026-55200 Pre-Auth RCE (July 2026)>)
 - [AsyncAPI npm Supply Chain via GitHub Actions - Miasma RAT & IPFS & Ethereum C2](<AsyncAPI npm Supply Chain via GitHub Actions - Miasma RAT & IPFS & Ethereum C2 (July 2026)>)
 - [TELESHIM Telegram Bot C2 - MIXEDKEY & BINDCLOAK DLL Sideload vs MidEast Gov](<TELESHIM Telegram Bot C2 - MIXEDKEY & BINDCLOAK DLL Sideload vs MidEast Gov (July 2026)>)
 - [Qilin Ransomware - PAN-OS GlobalProtect Auth Bypass CVE-2026-0257](<Qilin Ransomware - PAN-OS GlobalProtect Auth Bypass CVE-2026-0257 (July 2026)>)
