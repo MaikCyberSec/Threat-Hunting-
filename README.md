@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **July 2026**
+- [Lampion RAT - 750MB Padded DLL & SAPO Phishing vs Portugal](<Lampion RAT - 750MB Padded DLL & SAPO Phishing vs Portugal (July 2026)>)
 - [OAuth Device-Code Phishing - Victims Complete Genuine MFA & Attacker Steals Tokens (Microsoft 365)](<OAuth Device-Code Phishing - Victims Complete Genuine MFA & Attacker Steals Tokens (Microsoft 365 July 2026)>)
 - [Exploitarium Mass 0-Day Dump - 204 PoCs & libssh2 CVE-2026-55200 Pre-Auth RCE](<Exploitarium Mass 0-Day Dump - 204 PoCs & libssh2 CVE-2026-55200 Pre-Auth RCE (July 2026)>)
 - [AsyncAPI npm Supply Chain via GitHub Actions - Miasma RAT & IPFS & Ethereum C2](<AsyncAPI npm Supply Chain via GitHub Actions - Miasma RAT & IPFS & Ethereum C2 (July 2026)>)

@@ -1,0 +1,235 @@
+// ============================================================
+// Lampion RAT — 750MB Padded DLL & SAPO-Themed Phishing
+//               (Portugal-focused, ChePro lineage)
+// Source:   CyberSecurity News (Jul 2026) — "Hackers Hide 750MB
+//           Lampion RAT"; Acronis TRU campaign analysis
+// Platform: Microsoft Defender for Endpoint / XDR (Advanced Hunting)
+// MITRE ATT&CK: T1566.001, T1204.002, T1059.005, T1105,
+//               T1218.011, T1053.005, T1027.001, T1071.001
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Lampion is a Brazilian banking RAT (ChePro lineage) that in this
+// July 2026 wave targets Portuguese speakers (94.6% of detections
+// in Portugal). Delivery is a payment-receipt ("comprovativo")
+// phishing email carrying a ZIP -> padded HTML showing a fake SAPO
+// Transfer page -> embedded JavaScript pulls a bloated VBS (~7MB of
+// which only ~22KB is real code) -> the VBS uses ADODB.Stream and
+// HTTP range requests to download a ~750MB DLL in 10MB chunks,
+// reassembles it in a timestamp-named %APPDATA% folder, and runs it
+// with rundll32 via a scheduled task. The RAT's export is
+// "jangadeiro".
+//
+// The 750MB size is deliberate JUNK PADDING (T1027.001) to defeat
+// sandboxes, size-capped scanners and manual review. Detection
+// therefore leans on network IOCs and behaviour, not file hashes.
+//
+// IOC CONFIDENCE NOTE (read before use)
+// ---------------------------------------------------------------
+//   HIGH  : C2 IPs, C2 domains, URL path, DLL export, behaviour.
+//           Consistent across multiple public reports.
+//   MEDIUM: SHA-256 hashes. Secondary sources disagree at character
+//           boundaries and the Acronis primary page was unreachable
+//           at authoring time. Reconcile Query 7 against the Acronis
+//           TRU report before using hashes as blocking IOCs. Also
+//           note DeviceFileEvents.SHA256 is often EMPTY (Microsoft
+//           populates SHA1 instead) — hashes will miss silently.
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate large DLLs exist (games, ML runtimes). Query 4
+//     pairs size with a user-writable %APPDATA% path to cut noise.
+//   - rundll32 with a named export is normal; Query 5 scopes to
+//     AppData/Temp paths and the "jangadeiro" export.
+//   - Enterprise VBS logon scripts — scope out known script paths.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/hackers-hide-750mb-lampion-rat/
+//   https://www.acronis.com/en/tru/posts/lampions-portugal-focused-phishing-campaign-delivers-multistage-malware/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// SHARED IOC SETS (redeclare per query — AH runs one block only)
+// ------------------------------------------------------------
+// C2 IPs      : 18.218.184.201, 18.222.100.142, 3.135.194.95,
+//               3.139.85.102, 3.141.199.105, 3.144.37.134,
+//               3.148.240.228, 3.150.134.118, 52.14.160.173
+// C2 domains  : auto-contabilistica.com, autoridade-contabilistica.org,
+//               autoridade-financeira.com, fat-contabislitaca.com
+
+
+// ------------------------------------------------------------
+// 1. C2 NETWORK IOCs (HIGHEST FIDELITY)
+//    Any endpoint talking to a Lampion C2 IP or domain, or to the
+//    known JavaScript-downloader path. Treat hits as incidents.
+// ------------------------------------------------------------
+let C2_IPs = dynamic([
+    "18.218.184.201", "18.222.100.142", "3.135.194.95",
+    "3.139.85.102",   "3.141.199.105",  "3.144.37.134",
+    "3.148.240.228",  "3.150.134.118",  "52.14.160.173"
+]);
+let C2_Domains = dynamic([
+    "auto-contabilistica.com", "autoridade-contabilistica.org",
+    "autoridade-financeira.com", "fat-contabislitaca.com"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteIP in (C2_IPs)
+     or RemoteUrl has_any (C2_Domains)
+     or RemoteUrl has "/js/1898.php"
+| project Timestamp, DeviceName, ActionType,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl,
+          InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. PHISHING DELIVERY — ZIP LURE & DOWNLOADER CLICK
+//    "Comprovativo" (receipt) ZIP attachments and clicks to the
+//    fake-SAPO / downloader domains. Requires Defender for Office 365.
+// ------------------------------------------------------------
+let C2_Domains = dynamic([
+    "auto-contabilistica.com", "autoridade-contabilistica.org",
+    "autoridade-financeira.com", "fat-contabislitaca.com"
+]);
+EmailAttachmentInfo
+| where Timestamp > ago(30d)
+| where FileName matches regex @"(?i)comprovativo.*\.zip"
+| project Timestamp, SenderFromAddress, SenderDisplayName,
+          RecipientEmailAddress, FileName, FileType, FileSize,
+          SHA256, ThreatTypes, ThreatNames, NetworkMessageId
+| order by Timestamp desc
+// --- companion: Safe Links clicks to the campaign infrastructure
+// UrlClickEvents
+// | where Timestamp > ago(30d)
+// | where Url has_any (C2_Domains) or Url has "/js/1898.php"
+// | project Timestamp, AccountUpn, Workload, Url, ActionType, IsClickedThrough
+
+
+// ------------------------------------------------------------
+// 3. BLOATED VBS EXECUTION FROM A USER-WRITABLE PATH
+//    Second stage: wscript/cscript running a "Comprovativo_*.vbs"
+//    from Temp/Downloads. The VBS is padded to ~7MB.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("wscript.exe", "cscript.exe", "explorer.exe")
+| where FileName in~ ("wscript.exe", "cscript.exe")
+| where ProcessCommandLine has ".vbs"
+| where ProcessCommandLine has_any ("comprovativo", @"\Temp\", @"\AppData\",
+                                    @"\Downloads\", @"\INetCache\")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, FileName,
+          ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. OVERSIZED DLL WRITTEN TO %APPDATA% (THE 750MB TELL)
+//    A DLL of hundreds of MB reassembled under AppData is the
+//    signature evasion trick. 200MB threshold = strong anomaly.
+//    FileOriginIP ties the file back to the C2 when populated.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName endswith ".dll"
+| where FileSize > 209715200                       // > ~200 MB
+| where FolderPath has_any (@"\AppData\Roaming\", @"\AppData\Local\",
+                            @"\AppData\LocalLow\")
+| extend FileSizeMB = round(FileSize / 1048576.0, 1)
+| project Timestamp, DeviceName, FileName, FileSizeMB, FolderPath,
+          FileOriginUrl, FileOriginIP,
+          InitiatingProcessFileName, InitiatingProcessCommandLine, SHA1
+| order by FileSizeMB desc
+
+
+// ------------------------------------------------------------
+// 5. rundll32 RUNNING A DLL FROM APPDATA / THE "jangadeiro" EXPORT
+//    Final execution. The named export "jangadeiro" is a very
+//    high-fidelity string; the AppData path clause catches variants.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "rundll32.exe"
+| where ProcessCommandLine has "jangadeiro"
+     or (ProcessCommandLine has ".dll"
+         and ProcessCommandLine has_any (@"\AppData\Roaming\",
+                                         @"\AppData\Local\",
+                                         @"\AppData\LocalLow\"))
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. SCHEDULED-TASK PERSISTENCE (schtasks + cmd /c move + rundll32)
+//    Lampion registers a task that moves and launches the payload.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("schtasks.exe", "cmd.exe")
+| where ProcessCommandLine has_any ("jangadeiro", "rundll32")
+     or (ProcessCommandLine has "/c move" and ProcessCommandLine has ".dll")
+     or (FileName =~ "schtasks.exe" and ProcessCommandLine has_any (@"\AppData\", "rundll32"))
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. FILE-HASH LOOKUP (MEDIUM CONFIDENCE — SEE IOC NOTE ABOVE)
+//    Reconcile these SHA-256 values with the Acronis TRU report.
+//    NOTE: DeviceFileEvents.SHA256 is frequently empty; this also
+//    checks process/image-load hashes to improve the odds.
+// ------------------------------------------------------------
+let LampionSHA256 = dynamic([
+    "87efeada5fe39a94cefc6151fd84af223d0e0e2b070daec606274481ed87b87b", // phishing email
+    "ab46f7c4d3f717bb1e61d2f236917976d2a85be6958ae099fee79ea6e9031e37", // phishing email
+    "b1c101bd1ba134ffbea61f9fac2b7c8fbd13ca113a37944abdc131ef86da92ac", // ZIP
+    "c6618bb692fb3f5d7959f8db1fedaaac5e8a36fb901397a008aa2b88874448fd", // ZIP
+    "036c8f32012abdcb9a389ae9c284da89505e830bca74eb1aa9ea3794b067aab6", // HTML
+    "d25d32478ae67403484a309591b6409224d26ca3d094c5ccd8428ebef7efcfd1", // HTML
+    "643c0093baec45952a46b0210f7a6f8fb26883b396b66f1cb609c5b55e6dae1e"  // HTML
+]);
+union
+    (DeviceFileEvents    | where Timestamp > ago(30d) | where SHA256 in (LampionSHA256) | extend Src = "FileEvents"),
+    (DeviceProcessEvents | where Timestamp > ago(30d) | where SHA256 in (LampionSHA256) | extend Src = "ProcessEvents"),
+    (DeviceImageLoadEvents | where Timestamp > ago(30d) | where SHA256 in (LampionSHA256) | extend Src = "ImageLoad")
+| project Timestamp, Src, DeviceName, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 8. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    Same device: bloated DLL lands in AppData, THEN rundll32
+//    executes a DLL from AppData within 1 hour. Near-zero benign.
+// ------------------------------------------------------------
+let BigDll = DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName endswith ".dll"
+| where FileSize > 209715200
+| where FolderPath has @"\AppData\"
+| project DeviceName, DropTime = Timestamp,
+          DroppedDll = FileName, DropPath = FolderPath,
+          DropSizeMB = round(FileSize / 1048576.0, 1);
+let RunDll = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "rundll32.exe"
+| where ProcessCommandLine has "jangadeiro"
+     or (ProcessCommandLine has ".dll" and ProcessCommandLine has @"\AppData\")
+| project DeviceName, RunTime = Timestamp,
+          RunCmd = ProcessCommandLine;
+BigDll
+| join kind=inner RunDll on DeviceName
+| where RunTime between (DropTime .. (DropTime + 1h))
+| project DropTime, RunTime, DeviceName,
+          DroppedDll, DropSizeMB, DropPath, RunCmd
+| order by DropTime desc
