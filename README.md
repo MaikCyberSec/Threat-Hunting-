@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **July 2026**
+- [Foxit PDF Reader Updater LPE - SYSTEM via FoxitData.txt & winspool.drv Sideload (CVE-2026-57239)](<Foxit PDF Reader Updater LPE - SYSTEM via FoxitData.txt & winspool.drv Sideload (CVE-2026-57239, July 2026)>)
 - [GitLab Notebook-Diff RCE - Oj Gem Memory Corruption as git User (No-CVE Chain)](<GitLab Notebook-Diff RCE - Oj Gem Memory Corruption as git User (No-CVE Chain, July 2026)>)
 - [Lampion RAT - 750MB Padded DLL & SAPO Phishing vs Portugal](<Lampion RAT - 750MB Padded DLL & SAPO Phishing vs Portugal (July 2026)>)
 - [OAuth Device-Code Phishing - Victims Complete Genuine MFA & Attacker Steals Tokens (Microsoft 365)](<OAuth Device-Code Phishing - Victims Complete Genuine MFA & Attacker Steals Tokens (Microsoft 365 July 2026)>)
