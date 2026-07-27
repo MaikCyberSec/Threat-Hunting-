@@ -1,0 +1,208 @@
+// ============================================================
+// GitLab Notebook-Diff RCE — Oj Gem Memory Corruption, code
+//                            execution as the "git" user
+// Source:   CyberSecurity News (Jul 2026) — "GitLab
+//           Vulnerabilities Enable Code Execution"; depthfirst
+//           research "Going depthfirst: GitLab RCE via Two Ruby
+//           Memory Corruption Vulnerabilities"
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+//           TARGET IS A LINUX SERVER — the GitLab host must be
+//           onboarded to MDE for Linux for the behaviour queries
+//           to return data.
+// MITRE ATT&CK: T1190, T1059.004, T1552.001, T1552.004,
+//               T1005, T1071.001, T1078
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// GitLab renders Jupyter Notebook (.ipynb) diffs with an in-tree
+// "ipynbdiff" gem that parses notebook JSON through the native-C
+// Oj parser (Oj::Parser.usual.parse). Two Oj memory-corruption
+// bugs — an unchecked nesting-stack write and an unsafe 16-bit
+// key-length narrowing that leaks a heap pointer — are chained to
+// hijack a callback pointer, defeat ASLR, and run arbitrary code
+// inside a long-lived Puma worker as the "git" system user.
+//
+// Any authenticated project member with ordinary push + diff-view
+// access can trigger it by committing a crafted .ipynb and viewing
+// the diff. No admin, no CI/CD, no victim interaction. It also
+// sidesteps GitLab's SSRF defences by attacking a memory-unsafe
+// native dependency. A public PoC exists.
+//
+// IOC / CORRECTNESS NOTE (read before use)
+// ---------------------------------------------------------------
+//   - There are NO atomic IOCs (no C2, no hashes). The reliable
+//     signals are (a) vulnerable version exposure and (b) post-
+//     exploitation behaviour on the GitLab host.
+//   - The notebook-diff chain itself has NO CVE. GitLab shipped
+//     the Oj 3.17.3 bump under BUG FIXES, not the security table,
+//     in the 10 Jun 2026 patch release.
+//   - depthfirst's broader Oj review produced 9 separate CVEs
+//     (listed in Query 2). These cover Oj, not only the GitLab
+//     chain — treat them as the patch driver for the gem.
+//
+// AFFECTED / FIXED  (GitLab CE and EE both affected)
+// ---------------------------------------------------------------
+//   Vulnerable: 15.2.0–18.10.7, 18.11.0–18.11.4, 19.0.0–19.0.1
+//   Fixed:      18.10.8, 18.11.5, 19.0.2  (Oj gem 3.13.0–3.17.1
+//               vulnerable, fixed in Oj 3.17.3)
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - GitLab legitimately shells out (hooks, gitaly, backups).
+//     Queries 3–4 scope to the "git" account + unusual children
+//     and utilities; baseline your own hook activity and tune.
+//   - Monitoring agents reading config under /etc/gitlab.
+//   - Webhooks / integrations create real outbound from workers;
+//     Query 5 focuses on shell/network tools, not the app itself.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   https://cybersecuritynews.com/gitlab-vulnerabilities-enable-code-execution/
+//   https://depthfirst.com/research/going-depthfirst-achieving-gitlab-rce-via-two-ruby-memory-corruption-vulnerabilities
+//   https://about.gitlab.com/releases/2026/06/10/patch-release-gitlab-19-0-2-released/
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. VULNERABLE GITLAB VERSION EXPOSURE (TVM)
+//    Branch-aware check across the three vulnerable ranges so
+//    that already-patched builds (e.g. 18.10.8) are excluded.
+//    Depends on TVM cataloguing your self-managed GitLab build.
+// ------------------------------------------------------------
+DeviceTvmSoftwareInventory
+| where SoftwareVendor has "gitlab" or SoftwareName has "gitlab"
+| extend v = parse_version(SoftwareVersion)
+| where (v >= parse_version("15.2.0") and v < parse_version("18.10.8"))
+     or (v >= parse_version("18.11.0") and v < parse_version("18.11.5"))
+     or (v >= parse_version("19.0.0")  and v < parse_version("19.0.2"))
+| project DeviceId, DeviceName, OSPlatform, OSVersion,
+          SoftwareVendor, SoftwareName, SoftwareVersion,
+          EndOfSupportStatus
+| order by DeviceName asc
+
+
+// ------------------------------------------------------------
+// 2. RELATED Oj GEM CVEs (TVM VULNERABILITIES)
+//    The 9 CVEs from depthfirst's Oj review that drove the gem
+//    patch. Populates as Microsoft ingests the advisories.
+// ------------------------------------------------------------
+let OjCVEs = dynamic([
+    "CVE-2026-54502","CVE-2026-54896","CVE-2026-54897",
+    "CVE-2026-54898","CVE-2026-54899","CVE-2026-54900",
+    "CVE-2026-54901","CVE-2026-54902","CVE-2026-54903"
+]);
+DeviceTvmSoftwareVulnerabilities
+| where CveId in (OjCVEs)
+     or (SoftwareName has "oj" and SoftwareVendor has "oj")
+     or SoftwareName has "gitlab"
+| join kind=leftouter (
+    DeviceTvmSoftwareVulnerabilitiesKB
+    | project CveId, CvssScore, IsExploitAvailable
+) on CveId
+| extend CvssScoreNum = toreal(CvssScore)
+| project DeviceId, DeviceName, SoftwareVendor, SoftwareName,
+          SoftwareVersion, CveId, VulnerabilitySeverityLevel,
+          CvssScoreNum, IsExploitAvailable, RecommendedSecurityUpdate
+| order by CvssScoreNum desc, DeviceName asc
+
+
+// ------------------------------------------------------------
+// 3. GITLAB WORKER SPAWNING A SHELL (PRIMARY POST-EXPLOIT HUNT)
+//    RCE lands inside a Puma worker running as "git". A Ruby /
+//    Puma / Sidekiq parent spawning bash/sh/dash is the core
+//    tell. Recon binaries as children raise confidence further.
+// ------------------------------------------------------------
+let GitLabWorkers = dynamic([
+    "puma", "ruby", "bundle", "sidekiq", "gitlab-rails",
+    "gitlab-kas", "gitlab-workhorse", "workhorse", "unicorn"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ (GitLabWorkers)
+| where FileName in~ ("bash","sh","dash","zsh","nc","ncat","socat",
+                      "python","python3","perl","ruby","curl","wget",
+                      "whoami","id","uname","hostname","cat")
+| where AccountName in~ ("git","gitlab") or isempty(AccountName)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. ACCESS TO GITLAB / RAILS SECRETS FROM THE git CONTEXT
+//    Post-exploit goal is secret theft (Rails secret_key_base,
+//    DB creds, service tokens). File-READ telemetry is sparse on
+//    Linux, so match on command lines that touch the secret files.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any (
+        "gitlab-secrets.json", "secrets.yml", "database.yml",
+        "gitlab.rb", "/etc/gitlab/", "secret_key_base",
+        "/var/opt/gitlab/", ".ssh/id_", "authorized_keys")
+| where FileName in~ ("cat","less","more","head","tail","grep","cp",
+                      "scp","base64","xxd","tar","sh","bash","python3","ruby")
+| where AccountName in~ ("git","gitlab") or isempty(AccountName)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. OUTBOUND CONNECTION FROM A SHELL / TOOL IN GIT CONTEXT
+//    Reverse shell or exfil: a shell or network utility run under
+//    the git account making an external connection. GitLab's own
+//    app traffic is excluded by focusing on these binaries.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType == "ConnectionSuccess"
+| where InitiatingProcessFileName in~ (
+        "bash","sh","dash","nc","ncat","socat","python","python3",
+        "perl","ruby","curl","wget")
+| where InitiatingProcessAccountName in~ ("git","gitlab")
+| where RemoteIPType !in ("Loopback","Private","LinkLocal","Reserved")
+| project Timestamp, DeviceName, InitiatingProcessAccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    GitLab worker (git) spawns a shell, THEN that shell makes an
+//    external connection within 10 minutes = strong RCE signal.
+// ------------------------------------------------------------
+let GitLabWorkers = dynamic([
+    "puma","ruby","bundle","sidekiq","gitlab-rails",
+    "gitlab-kas","gitlab-workhorse","workhorse","unicorn"
+]);
+let Shells = dynamic(["bash","sh","dash","zsh","nc","ncat","socat",
+                      "python","python3","perl"]);
+let ShellSpawn = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ (GitLabWorkers)
+| where FileName in~ (Shells)
+| where AccountName in~ ("git","gitlab") or isempty(AccountName)
+| project DeviceName, SpawnTime = Timestamp,
+          Parent = InitiatingProcessFileName,
+          ShellName = FileName, ShellCmd = ProcessCommandLine,
+          ShellPid = ProcessId;
+let Egress = DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType == "ConnectionSuccess"
+| where InitiatingProcessFileName in~ (Shells)
+| where RemoteIPType !in ("Loopback","Private","LinkLocal","Reserved")
+| project DeviceName, EgressTime = Timestamp,
+          EgressProc = InitiatingProcessFileName,
+          RemoteIP, RemotePort,
+          EgressPid = InitiatingProcessId;
+ShellSpawn
+| join kind=inner Egress on DeviceName
+| where EgressTime between (SpawnTime .. (SpawnTime + 10m))
+| project SpawnTime, EgressTime, DeviceName,
+          Parent, ShellName, ShellCmd, RemoteIP, RemotePort
+| order by SpawnTime desc
