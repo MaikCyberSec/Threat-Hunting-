@@ -1,0 +1,215 @@
+// ============================================================
+// CRPxO Ransomware — "free OnlyFans" lure to Python toolkit,
+//   crypto-clipper, seed-phrase theft and .crpx0 encryption
+// Model:    Affiliate RaaS (70% revenue share, XMR/BTC payout)
+//           Operator Telegram handle: @DataBreachPlus
+// Context:  Emerged ~mid-July 2026; 26 victims in ~2 weeks,
+//           24 in the US, healthcare hardest hit (many dental).
+//           Windows + macOS (Linux support reportedly planned).
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1566.001, T1204.002, T1059.001, T1059.005,
+//               T1059.006, T1105, T1115, T1657, T1041, T1486
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// CRPxO is a new affiliate ransomware operation. Because payloads
+// are delivered by different affiliates, the chain varies
+// (ClickFix, LNK, PowerShell, Python). The best-documented
+// campaign: a ZIP promising "free OnlyFans accounts" -> malicious
+// LNK -> VBScript loader installs a Python runtime -> interactive
+// control. BEFORE encryption the operator monetises: clipboard
+// hijacking of crypto addresses (clipper targeting 10 coins),
+// seed-phrase and credential theft, and data exfiltration. Only
+// then does it encrypt with the ".crpx0" extension and drop a
+// ransom note plus a modified wallpaper.
+//
+// Researchers found an open directory on a C2 host exposing the
+// full Python toolkit, a clipper, a seed-phrase stealer, a Java
+// RAT builder, a multilingual PHP panel, 10 attacker wallets and
+// three Russian backup C2 domains (REG.RU). The ransom note was
+// GPT-4 generated.
+//
+// IOC CONFIDENCE NOTE
+// ---------------------------------------------------------------
+//   Network + hash IOCs below are as published in the source
+//   report. Hashes are MD5 — matched against the DeviceFileEvents
+//   / DeviceProcessEvents MD5 columns. Lead with network IOCs and
+//   behaviour: affiliates rotate binaries, so hashes age fast.
+//
+// INDICATORS
+// ---------------------------------------------------------------
+//   Domains: crpx0[.]su, fanonlyatn[.]xyz, beboss34[.]ru,
+//            caribb[.]ru, mekhovaya-shuba[.]ru
+//   IPs    : 145.43.86.37, 43.165.176.201, 210.149.87.82
+//   MD5    : 61cc6743d628ff7f2568ac3e3e2320c2
+//            ec3f63f73068e32e64318dbd66906bc1
+//            3175d447d2ab1abf755c67b225fa4a1a
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Developer workstations legitimately run python.exe with
+//     outbound traffic — Query 5 is a hunt; scope to hosts where
+//     Python does not belong (per the source guidance).
+//   - Admins using the Run dialog. Query 6 pairs RunMRU/explorer
+//     parentage with download/encoded command lines to cut noise.
+//   - Backup/sync tools cause bulk file changes; Query 3 anchors
+//     on the ".crpx0" extension, which is unambiguous.
+//
+// REFERENCES
+// ---------------------------------------------------------------
+//   Community reporting on CRPxO affiliate ransomware (July 2026)
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. C2 NETWORK IOCs (HIGHEST FIDELITY)
+//    Any endpoint contacting a CRPxO C2 domain or IP, including
+//    the three Russian REG.RU backup domains. Treat as incident.
+// ------------------------------------------------------------
+let C2_Domains = dynamic([
+    "crpx0.su", "fanonlyatn.xyz",
+    "beboss34.ru", "caribb.ru", "mekhovaya-shuba.ru"
+]);
+let C2_IPs = dynamic([
+    "145.43.86.37", "43.165.176.201", "210.149.87.82"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteIP in (C2_IPs)
+     or RemoteUrl has_any (C2_Domains)
+| project Timestamp, DeviceName, ActionType,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl,
+          InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. KNOWN MD5 HASHES (TOOLKIT COMPONENTS)
+//    MD5 matched across file and process telemetry. Note: on
+//    Linux/macOS hashes may be sparse — behaviour queries cover
+//    the gaps and the macOS variant.
+// ------------------------------------------------------------
+let CRPxO_MD5 = dynamic([
+    "61cc6743d628ff7f2568ac3e3e2320c2",
+    "ec3f63f73068e32e64318dbd66906bc1",
+    "3175d447d2ab1abf755c67b225fa4a1a"
+]);
+union
+    (DeviceFileEvents    | where Timestamp > ago(30d) | where MD5 in (CRPxO_MD5) | extend Src = "FileEvents"),
+    (DeviceProcessEvents | where Timestamp > ago(30d) | where MD5 in (CRPxO_MD5) | extend Src = "ProcessEvents")
+| project Timestamp, Src, DeviceName, FileName, FolderPath, MD5,
+          InitiatingProcessFileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. .crpx0 ENCRYPTION EXTENSION + BULK FILE CHANGES (IMPACT)
+//    The encryption stage. The ".crpx0" extension is unique to
+//    CRPxO; the summarize surfaces mass-rename bursts per host.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName endswith ".crpx0"
+| summarize EncryptedFiles = count(),
+            SampleFiles = make_set(FileName, 5),
+            FirstSeen = min(Timestamp),
+            LastSeen  = max(Timestamp)
+          by DeviceName, InitiatingProcessFileName,
+             InitiatingProcessCommandLine, bin(Timestamp, 1h)
+| where EncryptedFiles >= 20
+| order by EncryptedFiles desc
+
+
+// ------------------------------------------------------------
+// 4. LNK -> WSCRIPT/CSCRIPT -> PYTHON INSTALL CHAIN (DELIVERY)
+//    Core initial-access behaviour: a script host launched from a
+//    LNK/ZIP context that pulls in a Python runtime on a host
+//    where Python is not expected.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("wscript.exe", "cscript.exe", "explorer.exe")
+| where FileName in~ ("python.exe", "pythonw.exe", "py.exe")
+     or ProcessCommandLine has_any ("python-3", "python3", "get-pip",
+                                    "python-installer", "nsis", "winpython")
+| where InitiatingProcessCommandLine has_any (".lnk", ".vbs", ".zip", @"\Temp\",
+                                              @"\Downloads\", "onlyfans", "fanonly")
+   or ProcessCommandLine has_any (@"\AppData\", @"\Temp\", @"\Downloads\")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. python.exe MAKING OUTBOUND CONNECTIONS (C2 / CLIPPER)
+//    Python reaching out from a user-writable path is the
+//    interactive-control / exfil tell. Excludes internal ranges;
+//    tune out dev hosts where Python is legitimate.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where ActionType == "ConnectionSuccess"
+| where InitiatingProcessFileName in~ ("python.exe", "pythonw.exe", "py.exe")
+| where RemoteIPType !in ("Loopback", "Private", "LinkLocal", "Reserved")
+| where InitiatingProcessFolderPath has_any (@"\AppData\", @"\Temp\",
+                                             @"\Downloads\", @"\ProgramData\")
+| summarize Connections = count(),
+            RemoteIPs = make_set(RemoteIP, 20),
+            Urls = make_set(RemoteUrl, 20),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+          by DeviceName, InitiatingProcessFileName,
+             InitiatingProcessFolderPath, InitiatingProcessCommandLine
+| order by LastSeen desc
+
+
+// ------------------------------------------------------------
+// 6. CLICKFIX — RUN DIALOG SPAWNING POWERSHELL / LOLBIN
+//    Affiliate variant: user pastes a command into the Run box,
+//    so explorer.exe becomes the parent. Pair with RunMRU and a
+//    download/encoded payload to keep it tight.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where FileName in~ ("powershell.exe", "pwsh.exe", "cmd.exe",
+                      "mshta.exe", "curl.exe", "wscript.exe")
+| where ProcessCommandLine has_any (
+        "-enc", "-EncodedCommand", "FromBase64String", "DownloadString",
+        "DownloadFile", "iwr", "Invoke-WebRequest", "Invoke-Expression",
+        "IEX", "http://", "https://", "-w hidden", "-nop", "curl ")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, FileName, ProcessCommandLine,
+          FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 7. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    Same host: contact with a CRPxO C2, THEN .crpx0 encryption
+//    within 24 hours. Confirms the monetise-then-encrypt flow.
+// ------------------------------------------------------------
+let C2_Domains = dynamic([
+    "crpx0.su", "fanonlyatn.xyz",
+    "beboss34.ru", "caribb.ru", "mekhovaya-shuba.ru"
+]);
+let C2_IPs = dynamic(["145.43.86.37", "43.165.176.201", "210.149.87.82"]);
+let C2Hit = DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteIP in (C2_IPs) or RemoteUrl has_any (C2_Domains)
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2Remote = iff(isempty(RemoteUrl), RemoteIP, RemoteUrl);
+let Encrypt = DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName endswith ".crpx0"
+| project DeviceName, EncTime = Timestamp,
+          EncFile = FileName, EncBy = InitiatingProcessFileName;
+C2Hit
+| join kind=inner Encrypt on DeviceName
+| where EncTime between (C2Time .. (C2Time + 24h))
+| project C2Time, EncTime, DeviceName,
+          C2Proc, C2Remote, EncBy, EncFile
+| order by C2Time desc
