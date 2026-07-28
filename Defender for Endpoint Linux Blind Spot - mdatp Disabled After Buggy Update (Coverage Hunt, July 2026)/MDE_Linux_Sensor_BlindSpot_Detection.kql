@@ -1,0 +1,148 @@
+// ============================================================
+// Defender for Endpoint on Linux — Silent Blind Spot after a
+//   Buggy mdatp Update (agent disabled post-reboot)
+// Source:   CyberSecurity News (Jul 2026) — "Microsoft Defender
+//           for Endpoint Update Disables Protection on Linux"
+// Type:     DEFENSIVE COVERAGE / ASSURANCE HUNT (not a threat;
+//           there are NO atomic IOCs to match on)
+// Platform: Microsoft Defender XDR (Advanced Hunting)
+// Risk mapped to: T1562.001 (Impair Defenses) — same end state
+//           an attacker wants, here caused by a defective build.
+// ============================================================
+//
+// SUMMARY
+// ---------------------------------------------------------------
+// A defective Defender for Endpoint update silently DISABLED the
+// mdatp antivirus service on Linux hosts after a reboot, leaving
+// business-critical servers unprotected until patched. A disabled
+// EDR agent is exactly the blind spot an adversary needs, so this
+// is worth actively hunting rather than assuming "we have EDR".
+//
+//   Affected mdatp builds: 101.26042.0000 through 101.26042.0009
+//   Fixed build:           101.26042.0011
+//   Service:               mdatp    (verify with: mdatp health)
+//
+// "IOC" NOTE (correctness)
+// ---------------------------------------------------------------
+// This is not malware. There are no domains, IPs or hashes. The
+// only reliable indicators are (a) the affected agent build and
+// (b) sensor-health / telemetry-gap signals. All of these are
+// first-class Advanced Hunting fields:
+//   DeviceInfo.ClientVersion      = the mdatp sensor build
+//   DeviceInfo.SensorHealthState  = EDR sensor health
+//   DeviceInfo.OnboardingStatus   = onboarded / not
+//   DeviceInfo.IsInternetFacing   = prioritise exposure
+// DeviceInfo is updated continuously and every row is the full
+// current device state, so arg_max(Timestamp,*) gives latest.
+//
+// FALSE POSITIVES / NOTES
+// ---------------------------------------------------------------
+//   - ClientVersion format on Linux is the mdatp build (101.x).
+//     If a tenant has not yet ingested it, rely on Queries 2/3.
+//   - Short-lived / transient hosts (IsTransient) naturally go
+//     silent; exclude them when triaging Query 3.
+//   - Always confirm on the host with `mdatp health` and the
+//     Defender portal Device health report.
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. LINUX HOSTS ON AN AFFECTED mdatp BUILD (PRIMARY)
+//    Latest state per device. Flags any Linux sensor on the
+//    101.26042 train below the fixed 101.26042.0011, prioritised
+//    by internet-facing exposure and asset value.
+// ------------------------------------------------------------
+DeviceInfo
+| where Timestamp > ago(30d)
+| summarize arg_max(Timestamp, *) by DeviceId
+| where OSPlatform =~ "Linux"
+| where OnboardingStatus =~ "Onboarded"
+| where ClientVersion startswith "101.26042."
+| extend BuildVer = parse_version(ClientVersion)
+| where BuildVer >= parse_version("101.26042.0000")
+     and BuildVer <  parse_version("101.26042.0011")     // fixed build
+| project DeviceName, DeviceId, OSDistribution, OSVersion,
+          ClientVersion, SensorHealthState,
+          IsInternetFacing, DeviceType, AssetValue, ExposureLevel,
+          MachineGroup, LastSeen = Timestamp
+| order by IsInternetFacing desc, AssetValue desc, DeviceName asc
+
+
+// ------------------------------------------------------------
+// 2. UNHEALTHY / INACTIVE LINUX EDR SENSORS (THE BLIND SPOT)
+//    Onboarded Linux devices whose EDR sensor is not Active.
+//    "Inactive" / "NoSensorData" is the direct symptom of the
+//    mdatp service being disabled after the buggy update.
+// ------------------------------------------------------------
+DeviceInfo
+| where Timestamp > ago(30d)
+| summarize arg_max(Timestamp, *) by DeviceId
+| where OSPlatform =~ "Linux"
+| where OnboardingStatus =~ "Onboarded"
+| where SensorHealthState !~ "Active"
+| project DeviceName, DeviceId, OSDistribution, OSVersion,
+          SensorHealthState, ClientVersion,
+          IsInternetFacing, DeviceType, AssetValue,
+          MachineGroup, LastSeen = Timestamp
+| order by IsInternetFacing desc, LastSeen asc
+
+
+// ------------------------------------------------------------
+// 3. LINUX HOSTS THAT WENT SILENT (TELEMETRY GAP)
+//    Onboarded Linux devices whose most recent record is stale —
+//    a proxy for an agent that stopped reporting after reboot.
+//    Tune the 3-day window and exclude transient hosts.
+// ------------------------------------------------------------
+DeviceInfo
+| summarize arg_max(Timestamp, *) by DeviceId
+| where OSPlatform =~ "Linux"
+| where OnboardingStatus =~ "Onboarded"
+| where IsTransient != true
+| where Timestamp < ago(3d)
+| extend DaysSilent = datetime_diff('day', now(), Timestamp)
+| project DeviceName, DeviceId, OSDistribution, OSVersion,
+          ClientVersion, SensorHealthState,
+          IsInternetFacing, DeviceType, AssetValue,
+          LastSeen = Timestamp, DaysSilent
+| order by IsInternetFacing desc, DaysSilent desc
+
+
+// ------------------------------------------------------------
+// 4. PRIORITISED EXPOSURE — AFFECTED BUILD *AND* AT RISK
+//    Highest-priority remediation: an affected build that is
+//    also internet-facing, high value, or already unhealthy.
+// ------------------------------------------------------------
+DeviceInfo
+| where Timestamp > ago(30d)
+| summarize arg_max(Timestamp, *) by DeviceId
+| where OSPlatform =~ "Linux" and OnboardingStatus =~ "Onboarded"
+| where ClientVersion startswith "101.26042."
+| extend BuildVer = parse_version(ClientVersion)
+| where BuildVer >= parse_version("101.26042.0000")
+     and BuildVer <  parse_version("101.26042.0011")
+| where IsInternetFacing == true
+     or AssetValue =~ "High"
+     or SensorHealthState !~ "Active"
+| project DeviceName, OSDistribution, ClientVersion,
+          SensorHealthState, IsInternetFacing, AssetValue,
+          ExposureLevel, MachineGroup, LastSeen = Timestamp
+| order by IsInternetFacing desc, AssetValue desc
+
+
+// ------------------------------------------------------------
+// 5. FLEET COVERAGE SUMMARY (SIZE THE BLIND SPOT)
+//    One-glance posture: Linux sensor health and build spread,
+//    so you can quantify how many hosts need action.
+// ------------------------------------------------------------
+DeviceInfo
+| where Timestamp > ago(30d)
+| summarize arg_max(Timestamp, *) by DeviceId
+| where OSPlatform =~ "Linux" and OnboardingStatus =~ "Onboarded"
+| extend AffectedBuild = iff(
+        ClientVersion startswith "101.26042."
+        and parse_version(ClientVersion) < parse_version("101.26042.0011"),
+        "Affected (< 101.26042.0011)", "Other/Fixed")
+| summarize Devices = dcount(DeviceId),
+            InternetFacing = countif(IsInternetFacing == true)
+          by SensorHealthState, AffectedBuild
+| order by Devices desc
