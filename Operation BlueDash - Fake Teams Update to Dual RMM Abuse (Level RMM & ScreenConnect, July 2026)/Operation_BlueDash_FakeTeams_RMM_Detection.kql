@@ -1,0 +1,196 @@
+// ============================================================
+// Operation BlueDash — Fake Microsoft Teams Update to Dual
+//   RMM Abuse (Level RMM + ScreenConnect + Tactical RMM)
+// Source:   CyberSecurity News (Jul 2026) — "A Fake Teams Update
+//           Can Give Hackers Two Separate Ways to Control Your
+//           PC"; ZeroBEC "Operation BlueDash" analysis
+// Tracked:  ZeroBEC (moderate-to-high confidence, Nigeria-based);
+//           related to UNC6692 and Oyster/Broomstick fake-installer
+//           activity. Active since at least Feb 2026.
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1566.002, T1204.002, T1059.001, T1219,
+//               T1218, T1087.001, T1518.001, T1082
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// A phishing email claims a document was "too large" for Teams and
+// links through compromised sites to a convincing fake Microsoft
+// Store page that demands a "Teams update". The download,
+// supportdev.exe (an Inno Setup loader), launches a HIDDEN
+// PowerShell window that pulls the legitimate Level RMM installer
+// and enrols the device with an attacker-controlled API key (no
+// user approval). ScreenConnect (and, in a Zoom-themed variant,
+// Tactical RMM) is installed as a second channel so the attacker
+// keeps control if one is cut. Operators then run recon: reboot
+// state, BitLocker status, firewall config, local Administrators.
+//
+// The tradecraft is "living off legitimate software" — signed RMM
+// tools instead of custom malware — so it blends into IT activity.
+// Hunt the delivery, the hidden-PowerShell install, and UNSANCTIONED
+// RMM, not a signature.
+//
+// IOC CONFIDENCE NOTE (correctness)
+// ---------------------------------------------------------------
+//   HIGH  : Level RMM API key string, campaign domains,
+//           supportdev.exe, behaviour. As published by ZeroBEC.
+//   NONE  : No file hashes were published — none are invented here.
+//   EXCLUDED: corychase[.]org is a SEPARATE (JIVS PhishKit)
+//           campaign per the source and is intentionally NOT used.
+//
+// INDICATORS
+// ---------------------------------------------------------------
+//   Domains : teamvem[.]com, support[.]berrydev[.]xyz,
+//             berry4603[.]github[.]io
+//   GitHub  : repos "Bluedashltd" and "rustovni"
+//   Payload : supportdev.exe  (Inno Setup loader)
+//   Key     : LEVEL_API_KEY = GxSCHE8EZwfyYN3iPQHPai8D
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Level RMM / ScreenConnect / Tactical RMM are LEGITIMATE. If
+//     your org uses one, scope Query 4 to your sanctioned instance
+//     and alert only on the others (or on the campaign API key).
+//   - Software installers legitimately spawn PowerShell; Query 3
+//     pairs a Downloads/Temp installer with a HIDDEN window.
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. DELIVERY / C2 NETWORK IOCs (HIGHEST FIDELITY)
+//    Contact with the fake-Teams page or the BlueDash infra.
+// ------------------------------------------------------------
+let BlueDash_Domains = dynamic([
+    "teamvem.com", "support.berrydev.xyz", "berry4603.github.io"
+]);
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (BlueDash_Domains)
+| project Timestamp, DeviceName, ActionType,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteUrl, RemoteIP, RemotePort,
+          InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. supportdev.exe OR THE HARDCODED LEVEL API KEY (GOLD)
+//    The API-key string is near-zero-FP. Also catches the loader
+//    by name across process and file telemetry.
+// ------------------------------------------------------------
+let ApiKey = "GxSCHE8EZwfyYN3iPQHPai8D";
+union
+    (DeviceProcessEvents
+        | where Timestamp > ago(30d)
+        | where FileName =~ "supportdev.exe"
+             or ProcessCommandLine has ApiKey
+             or InitiatingProcessCommandLine has ApiKey
+        | extend Src = "Process",
+                 Detail = ProcessCommandLine),
+    (DeviceFileEvents
+        | where Timestamp > ago(30d)
+        | where FileName =~ "supportdev.exe"
+        | extend Src = "File",
+                 Detail = FolderPath)
+| project Timestamp, Src, DeviceName,
+          FileName, Detail,
+          InitiatingProcessFileName, InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. INSTALLER FROM Downloads/Temp SPAWNING HIDDEN POWERSHELL
+//    The core loader behaviour: supportdev.exe (or any user-path
+//    installer) launching a hidden PowerShell window.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("-w hidden", "-windowstyle hidden",
+                                    "-WindowStyle Hidden", "-w 1", "-nop",
+                                    "-enc", "-EncodedCommand", "hidden")
+| where InitiatingProcessFolderPath has_any (@"\Downloads\", @"\Temp\",
+        @"\AppData\Local\Temp", @"\AppData\Roaming\", @"\Users\Public\")
+   or InitiatingProcessFileName =~ "supportdev.exe"
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. UNSANCTIONED RMM AGENT INSTALL / EXECUTION
+//    Level RMM, ScreenConnect and Tactical RMM (MeshAgent) as
+//    used by BlueDash. TUNE OUT your approved RMM before alerting.
+// ------------------------------------------------------------
+let RmmProcs = dynamic([
+    "ScreenConnect.ClientService.exe", "ScreenConnect.WindowsClient.exe",
+    "ConnectWiseControl.ClientService.exe",
+    "MeshAgent.exe", "tacticalagent.exe", "tacticalrmm.exe",
+    "level-windows-amd64.exe", "level.exe"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ (RmmProcs)
+     or ProcessCommandLine has_any ("level.io", "app.level.io",
+            "LEVEL_API_KEY", "screenconnect", "connectwise control",
+            "tacticalrmm", "GxSCHE8EZwfyYN3iPQHPai8D")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. POST-COMPROMISE RECON BUNDLE (BitLocker / FW / ADMINS)
+//    The BlueDash recon set. Several of these on one host in a
+//    short window, especially spawned by an RMM/remote session,
+//    is a strong hands-on-keyboard signal.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where (FileName =~ "manage-bde.exe")
+     or (FileName =~ "net.exe"    and ProcessCommandLine has "localgroup"
+                                   and ProcessCommandLine has "administrators")
+     or (FileName =~ "net1.exe"   and ProcessCommandLine has "administrators")
+     or (FileName =~ "netsh.exe"  and ProcessCommandLine has "advfirewall")
+     or (FileName =~ "whoami.exe" and ProcessCommandLine has "groups")
+     or (FileName in~ ("systeminfo.exe","reg.exe") and ProcessCommandLine has "bitlocker")
+| summarize ReconCmds = make_set(ProcessCommandLine, 20),
+            DistinctTools = dcount(FileName),
+            FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+          by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+| where DistinctTools >= 2
+| order by LastSeen desc
+
+
+// ------------------------------------------------------------
+// 6. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    BlueDash delivery/loader signal, THEN an RMM agent runs on
+//    the same host within 1 hour = fake-update to remote control.
+// ------------------------------------------------------------
+let ApiKey = "GxSCHE8EZwfyYN3iPQHPai8D";
+let RmmProcs = dynamic([
+    "ScreenConnect.ClientService.exe", "ScreenConnect.WindowsClient.exe",
+    "ConnectWiseControl.ClientService.exe", "MeshAgent.exe",
+    "tacticalagent.exe", "level-windows-amd64.exe", "level.exe"]);
+let Loader = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "supportdev.exe"
+     or ProcessCommandLine has ApiKey
+     or (FileName in~ ("powershell.exe","pwsh.exe")
+         and InitiatingProcessFileName =~ "supportdev.exe")
+| project DeviceName, LoaderTime = Timestamp,
+          LoaderProc = FileName, LoaderCmd = ProcessCommandLine;
+let RmmRun = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ (RmmProcs) or ProcessCommandLine has "LEVEL_API_KEY"
+| project DeviceName, RmmTime = Timestamp,
+          RmmProc = FileName, RmmCmd = ProcessCommandLine;
+Loader
+| join kind=inner RmmRun on DeviceName
+| where RmmTime between (LoaderTime .. (LoaderTime + 1h))
+| project LoaderTime, RmmTime, DeviceName,
+          LoaderProc, LoaderCmd, RmmProc, RmmCmd
+| order by LoaderTime desc

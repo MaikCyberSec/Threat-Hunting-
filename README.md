@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **July 2026**
+- [Operation BlueDash - Fake Teams Update to Dual RMM Abuse (Level RMM & ScreenConnect)](<Operation BlueDash - Fake Teams Update to Dual RMM Abuse (Level RMM & ScreenConnect, July 2026)>)
 - [Defender for Endpoint Linux Blind Spot - mdatp Disabled After Buggy Update (Coverage Hunt)](<Defender for Endpoint Linux Blind Spot - mdatp Disabled After Buggy Update (Coverage Hunt, July 2026)>)
 - [CRPxO Ransomware - OnlyFans Lure to Python Toolkit, Clipper & .crpx0 Encryption (Affiliate RaaS)](<CRPxO Ransomware - OnlyFans Lure to Python Toolkit, Clipper & .crpx0 Encryption (Affiliate RaaS, July 2026)>)
 - [Foxit PDF Reader Updater LPE - SYSTEM via FoxitData.txt & winspool.drv Sideload (CVE-2026-57239)](<Foxit PDF Reader Updater LPE - SYSTEM via FoxitData.txt & winspool.drv Sideload (CVE-2026-57239, July 2026)>)
