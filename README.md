@@ -35,6 +35,9 @@ All queries are built for:
 
 ### Recent Additions
 
+**August 2026**
+- [Adobe Campaign Classic & Bridge - Patch Exposure Hunt (CVE-2026-48449 CVSS 10.0)](<Adobe Campaign Classic & Bridge - Patch Exposure Hunt (CVE-2026-48449 CVSS 10.0, August 2026)>)
+
 **July 2026**
 - [Operation BlueDash - Fake Teams Update to Dual RMM Abuse (Level RMM & ScreenConnect)](<Operation BlueDash - Fake Teams Update to Dual RMM Abuse (Level RMM & ScreenConnect, July 2026)>)
 - [Defender for Endpoint Linux Blind Spot - mdatp Disabled After Buggy Update (Coverage Hunt)](<Defender for Endpoint Linux Blind Spot - mdatp Disabled After Buggy Update (Coverage Hunt, July 2026)>)
