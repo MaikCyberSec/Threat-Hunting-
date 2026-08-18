@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **August 2026**
+- [VMware vCenter Syslog Path Traversal - Active Exploitation to Babuk Ransomware (CVE-2026-59310)](<VMware vCenter Syslog Path Traversal - Active Exploitation to Babuk Ransomware (CVE-2026-59310, August 2026)>)
 - [Adobe Campaign Classic & Bridge - Patch Exposure Hunt (CVE-2026-48449 CVSS 10.0)](<Adobe Campaign Classic & Bridge - Patch Exposure Hunt (CVE-2026-48449 CVSS 10.0, August 2026)>)
 
 **July 2026**
