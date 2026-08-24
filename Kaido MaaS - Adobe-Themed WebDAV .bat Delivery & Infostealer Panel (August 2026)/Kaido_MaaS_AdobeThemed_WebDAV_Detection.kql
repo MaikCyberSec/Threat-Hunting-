@@ -1,0 +1,163 @@
+// ============================================================
+// Kaido MaaS — Adobe-Themed Domain, WebDAV .bat Delivery to
+//   Infostealer / Banking-Overlay / PIX-Boleto Fraud Modules
+// Source:   CyberSecurity News (Aug 2026) — "Malware-as-a-Service
+//           Behind Adobe-Themed Domain"; Clandestine research
+// Panel:    "SecureWorkspace WebPanel" / "Kaido Panel" behind
+//           acrobatreaderonline[.]com (fake Adobe Acrobat Reader)
+// Targets:  Windows users, financial/document processors (Brazil-
+//           themed PIX/boleto lures).
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1566.002, T1204.002, T1059.003, T1105,
+//               T1071.001, T1027, T1614.001
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// A live MaaS panel operates behind a fake Adobe Acrobat Reader
+// domain. Victims get PDF or payment (boleto) lures, are pointed
+// to a WebDAV remote folder, and open a .bat file that runs on
+// double-click, reaches C2, and pulls infostealer / banking-overlay
+// / PIX-fraud payloads. WebDAV delivery keeps the payload off local
+// disk until execution, which is the tradecraft to hunt.
+//
+// IOC CONFIDENCE NOTE (correctness — READ FIRST)
+// ---------------------------------------------------------------
+//   HIGH  : the campaign domains (Query 1). Use these.
+//   MEDIUM: IP 185.208.158.27 (verify before hard-blocking).
+//   DO NOT USE AS IP IOCs: 104.21.2.104 and 172.67.129.21 are
+//           CLOUDFLARE SHARED ranges (104.21.0.0/16, 172.67.0.0/16
+//           — the site's nameservers are Cloudflare). Blocking or
+//           hunting on them flags huge volumes of legitimate sites.
+//           They are intentionally NOT in the IP list below.
+//   No file hashes were published, so none are invented here.
+//
+// INDICATORS
+// ---------------------------------------------------------------
+//   Domains: acrobatreaderonline[.]com, kaido[.]sh, free.kaido[.]sh,
+//            x4m1k[.]com
+//   IP     : 185.208.158.27 (non-Cloudflare; verify)
+//   Panel  : /hub (SignalR), /api/loot/, /api/auth/refresh
+//   Deliv. : WebDAV -> .bat ; WebClient service ; TfsStore\Tfs_DAV
+//
+// FALSE POSITIVES
+// ---------------------------------------------------------------
+//   - Legitimate enterprise WebDAV use exists; Query 2 pairs the
+//     WebDAV/UNC source with a script file actually executing.
+//   - Do not add the Cloudflare IPs (see note) — that is the main
+//     FP trap for this campaign.
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. NETWORK IOCs — CAMPAIGN DOMAINS + PANEL PATHS (PRIMARY)
+//    Contact with the Kaido / fake-Adobe infrastructure or its
+//    panel endpoints. Domains are the reliable indicator here.
+// ------------------------------------------------------------
+let Kaido_Domains = dynamic([
+    "acrobatreaderonline.com", "kaido.sh", "free.kaido.sh", "x4m1k.com"
+]);
+let Kaido_IPs = dynamic(["185.208.158.27"]);   // non-Cloudflare; verify
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (Kaido_Domains)
+     or RemoteIP in (Kaido_IPs)
+     or (RemoteUrl has_any (Kaido_Domains)
+         and RemoteUrl has_any ("/hub", "/api/loot/", "/api/auth/refresh"))
+| project Timestamp, DeviceName, ActionType,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl,
+          InitiatingProcessFolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. WEBDAV-DELIVERED SCRIPT EXECUTION (CORE TRADECRAFT)
+//    A .bat/.cmd/.js/.vbs/.hta running from a WebDAV/UNC source
+//    or the WebDAV client cache (Tfs_DAV). This is the "open the
+//    remote folder and double-click" delivery.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("cmd.exe","wscript.exe","cscript.exe","mshta.exe","powershell.exe")
+| where ProcessCommandLine has_any (".bat",".cmd",".js",".vbs",".hta")
+| where ProcessCommandLine has_any (@"\\DavWWWRoot\", "@SSL", "Tfs_DAV", "TfsStore")
+     or ProcessCommandLine matches regex @"\\\\[^\\]+\\.*\.(bat|cmd|js|vbs|hta)"
+     or InitiatingProcessFolderPath has_any (@"\DavWWWRoot\", "Tfs_DAV")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. WEBCLIENT / WEBDAV MOUNT TO A REMOTE HOST
+//    Mapping a WebDAV share (net use to an http/@SSL target) or
+//    the WebDAV cache being populated — the setup for delivery.
+// ------------------------------------------------------------
+union
+    (DeviceProcessEvents
+        | where Timestamp > ago(30d)
+        | where FileName in~ ("net.exe","net1.exe","rundll32.exe")
+        | where ProcessCommandLine has_any ("use", "davclnt", "@SSL", "DavSetCookie", "http://", "https://")
+        | where ProcessCommandLine has_any ("@SSL", "DavWWWRoot", "webdav", @"\\")
+        | extend Src = "Process", Detail = ProcessCommandLine),
+    (DeviceFileEvents
+        | where Timestamp > ago(30d)
+        | where FolderPath has_any ("Tfs_DAV", "TfsStore")
+        | where FileName endswith ".bat" or FileName endswith ".exe"
+             or FileName endswith ".cmd" or FileName endswith ".dll"
+        | extend Src = "File", Detail = FolderPath)
+| project Timestamp, Src, DeviceName, FileName, Detail,
+          InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. .bat DROPPER SPAWNING A LOLBIN DOWNLOADER TO C2
+//    cmd/.bat handing off to powershell/curl/certutil/bitsadmin
+//    to pull the next stage. Pair with Query 1 domains.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("cmd.exe")
+     or InitiatingProcessCommandLine has_any (".bat",".cmd")
+| where FileName in~ ("powershell.exe","pwsh.exe","curl.exe","certutil.exe",
+                      "bitsadmin.exe","mshta.exe","wscript.exe","cscript.exe")
+| where ProcessCommandLine has_any ("http://","https://","DownloadString",
+        "DownloadFile","Invoke-WebRequest","iwr","-urlcache","-split",
+        "bitsadmin","certutil")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    A WebDAV-delivered script runs, THEN the host contacts the
+//    Kaido infrastructure within 1 hour.
+// ------------------------------------------------------------
+let Kaido_Domains = dynamic(["acrobatreaderonline.com","kaido.sh",
+                             "free.kaido.sh","x4m1k.com"]);
+let Kaido_IPs = dynamic(["185.208.158.27"]);
+let WebDavExec = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("cmd.exe","wscript.exe","cscript.exe","mshta.exe")
+| where ProcessCommandLine has_any (".bat",".cmd",".js",".vbs",".hta")
+| where ProcessCommandLine has_any (@"\\DavWWWRoot\","@SSL","Tfs_DAV","TfsStore")
+     or ProcessCommandLine matches regex @"\\\\[^\\]+\\.*\.(bat|cmd|js|vbs|hta)"
+| project DeviceName, ExecTime = Timestamp,
+          ExecProc = FileName, ExecCmd = ProcessCommandLine;
+let C2 = DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (Kaido_Domains) or RemoteIP in (Kaido_IPs)
+| project DeviceName, C2Time = Timestamp,
+          C2Proc = InitiatingProcessFileName,
+          C2Remote = iff(isempty(RemoteUrl), RemoteIP, RemoteUrl);
+WebDavExec
+| join kind=inner C2 on DeviceName
+| where C2Time between (ExecTime .. (ExecTime + 1h))
+| project ExecTime, C2Time, DeviceName,
+          ExecProc, ExecCmd, C2Proc, C2Remote
+| order by ExecTime desc
