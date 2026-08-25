@@ -1,0 +1,148 @@
+// ============================================================
+// Fake Microsoft Security Scan — "SysScan" Tech-Support Scam
+//   to Remote-Access Abuse & Data Harvesting
+// Source:   CyberSecurity News (Aug 2026) — "Fake Microsoft
+//           Security Scan"; fraudulent "SysScan" branded pages.
+// Type:     Tech-support scam / social engineering. NO malware
+//           payload; the victim is talked into installing a
+//           legitimate remote-access tool during a fake "refund
+//           manager" call, then data is harvested via Telegram.
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+// MITRE ATT&CK: T1566, T1204, T1219, T1562.001, T1071.001, T1657
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// Fake pages impersonate a Microsoft "SysScan" security tool,
+// show a rigged low score (13-30/100) and invented warnings, then
+// pressure the victim to (a) uninstall their real antivirus and
+// (b) install one of ~30 offered remote-access tools so a fake
+// support agent can "help". Harvested data is routed out via the
+// Telegram bot API. The endpoint tells are: a browser hitting the
+// scam domains, a remote-access tool appearing right afterwards,
+// and third-party AV being removed.
+//
+// IOC CONFIDENCE NOTE (correctness — READ FIRST)
+// ---------------------------------------------------------------
+//   HIGH  : the 11 campaign domains (Query 1). Use these.
+//   MEDIUM: IP 157.230.180.90 — a DigitalOcean VPS (157.230.0.0/16),
+//           dedicated so blockable, but verify it is still hostile.
+//   DO NOT BLOCKLIST: api.telegram.org — legitimate service the
+//           scam abuses for exfil. Hunt it only as weak context.
+//   No file hashes / process IOCs were published, so none are
+//   invented. Remote-access tools are LEGITIMATE — Query 2 must be
+//   tuned to your sanctioned tools before alerting.
+//
+// INDICATORS (domains)
+// ---------------------------------------------------------------
+//   detectsysscanner[.]at / .com / .de / .in.net / .xn--q9jyb4c
+//   detsysscanner[.]com / .de / .xn--q9jyb4c
+//   techsysscanner[.]com / .lol
+//   tlcscanner[.]com
+//   IP: 157.230.180.90
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. NETWORK IOCs — SCAM DOMAINS + HOSTING IP (PRIMARY)
+//    A browser (or any process) contacting the fake-SysScan
+//    infrastructure. Domains are the reliable indicator.
+// ------------------------------------------------------------
+let ScamDomains = dynamic([
+    "detectsysscanner.at", "detectsysscanner.com", "detectsysscanner.de",
+    "detectsysscanner.in.net", "detectsysscanner.xn--q9jyb4c",
+    "detsysscanner.com", "detsysscanner.de", "detsysscanner.xn--q9jyb4c",
+    "techsysscanner.com", "techsysscanner.lol", "tlcscanner.com"
+]);
+let ScamIPs = dynamic(["157.230.180.90"]);   // DigitalOcean VPS; verify
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (ScamDomains)
+     or RemoteIP in (ScamIPs)
+     or RemoteUrl has "sysscanner"          // catches close variants
+| project Timestamp, DeviceName, ActionType,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemotePort, RemoteUrl
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. REMOTE-ACCESS / REMOTE-SUPPORT TOOL APPEARS (THE PAYOFF)
+//    Tech-support scams end with the victim installing a remote
+//    tool for the "agent". Surface the common ones — TUNE OUT the
+//    tool your org sanctions before alerting.
+// ------------------------------------------------------------
+let RemoteTools = dynamic([
+    "anydesk.exe","teamviewer.exe","ultraviewer.exe","ultraviewer_desktop.exe",
+    "rustdesk.exe","supremo.exe","aweray_remote.exe","awesun.exe",
+    "screenconnect.clientservice.exe","screenconnect.windowsclient.exe",
+    "connectwisecontrol.clientservice.exe","logmein.exe","lmiignition.exe",
+    "getscreen.exe","zaservice.exe","za_connect.exe","dwagent.exe",
+    "remotepc.exe","remotepchost.exe","atera_agent.exe","syncro.exe",
+    "splashtop.exe","strwinclt.exe","fixme.it.exe","showmypc.exe"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ (RemoteTools)
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessFolderPath,
+          FileName, FolderPath, ProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. THIRD-PARTY ANTIVIRUS REMOVAL (THE SCAM'S TELL)
+//    The pages demand uninstalling real AV. Watch for uninstall
+//    commands referencing security-product names.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where (FileName in~ ("msiexec.exe","wmic.exe","powershell.exe","pwsh.exe","cmd.exe")
+         and ProcessCommandLine has_any ("uninstall","/x ","msiexec /x","Uninstall-Package",
+                                         "product where","call uninstall"))
+     or FileName has_any ("uninstall","unins000")
+| where ProcessCommandLine has_any (
+        "avast","avg","mcafee","norton","symantec","bitdefender","kaspersky",
+        "eset","nod32","malwarebytes","sophos","trend micro","avira","webroot",
+        "f-secure","gdata","comodo","panda")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, FileName, ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    Host visits a scam domain, THEN a remote-access tool runs or
+//    AV is uninstalled within 2 hours = scam likely successful.
+// ------------------------------------------------------------
+let ScamDomains = dynamic([
+    "detectsysscanner.at","detectsysscanner.com","detectsysscanner.de",
+    "detectsysscanner.in.net","detectsysscanner.xn--q9jyb4c",
+    "detsysscanner.com","detsysscanner.de","detsysscanner.xn--q9jyb4c",
+    "techsysscanner.com","techsysscanner.lol","tlcscanner.com"]);
+let ScamIPs = dynamic(["157.230.180.90"]);
+let RemoteTools = dynamic([
+    "anydesk.exe","teamviewer.exe","ultraviewer.exe","rustdesk.exe","supremo.exe",
+    "aweray_remote.exe","awesun.exe","screenconnect.clientservice.exe","logmein.exe",
+    "getscreen.exe","dwagent.exe","remotepc.exe","splashtop.exe","showmypc.exe"]);
+let Visit = DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has_any (ScamDomains) or RemoteIP in (ScamIPs)
+     or RemoteUrl has "sysscanner"
+| project DeviceName, VisitTime = Timestamp,
+          Browser = InitiatingProcessFileName,
+          ScamRemote = iff(isempty(RemoteUrl), RemoteIP, RemoteUrl);
+let Followup = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ (RemoteTools)
+     or (ProcessCommandLine has "uninstall"
+         and ProcessCommandLine has_any ("avast","avg","mcafee","norton","bitdefender",
+                                         "kaspersky","eset","malwarebytes","avira"))
+| project DeviceName, ActTime = Timestamp,
+          ActProc = FileName, ActCmd = ProcessCommandLine;
+Visit
+| join kind=inner Followup on DeviceName
+| where ActTime between (VisitTime .. (VisitTime + 2h))
+| project VisitTime, ActTime, DeviceName,
+          Browser, ScamRemote, ActProc, ActCmd
+| order by VisitTime desc
