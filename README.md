@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **August 2026**
+- [npm Supply-Chain Worm - openapi-react-query-codegen Compromise & Credential Theft](<npm Supply-Chain Worm - openapi-react-query-codegen Compromise & Credential Theft (August 2026)>)
 - [Fake Microsoft Security Scan - SysScan Tech-Support Scam to Remote-Access Abuse](<Fake Microsoft Security Scan - SysScan Tech-Support Scam to Remote-Access Abuse (August 2026)>)
 - [Kaido MaaS - Adobe-Themed WebDAV .bat Delivery & Infostealer Panel](<Kaido MaaS - Adobe-Themed WebDAV .bat Delivery & Infostealer Panel (August 2026)>)
 - [VMware vCenter Syslog Path Traversal - Active Exploitation to Babuk Ransomware (CVE-2026-59310)](<VMware vCenter Syslog Path Traversal - Active Exploitation to Babuk Ransomware (CVE-2026-59310, August 2026)>)

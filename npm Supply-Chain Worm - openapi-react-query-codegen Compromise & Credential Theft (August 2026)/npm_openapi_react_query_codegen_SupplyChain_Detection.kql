@@ -1,0 +1,184 @@
+// ============================================================
+// npm Supply-Chain Worm — @7nohe/openapi-react-query-codegen
+//   Compromise, Credential Theft & Self-Propagation
+// Source:   CyberSecurity News (Aug 2026) — "Popular npm Package
+//           Compromised". Shai-Hulud-style install-time worm.
+// Vector:   Abused GitHub Actions release workflow (release could
+//           be triggered by a PR comment from an untrusted fork),
+//           publishing 10 tainted releases of a ~150k/week package.
+// Platform: Microsoft Defender for Endpoint (Advanced Hunting)
+//           Targets developer / CI endpoints (Windows/Linux/macOS).
+// MITRE ATT&CK: T1195.002, T1059.007, T1552.001, T1552.005,
+//               T1543.002, T1546.004, T1567, T1071.001, T1021.004
+// ============================================================
+//
+// THREAT SUMMARY
+// ---------------------------------------------------------------
+// The tainted package runs a preinstall payload (node 3FWCvzduYZg.js)
+// that scans project files, process memory, CI variables and CLOUD
+// METADATA for tokens; validates and exfiltrates them to attacker-
+// created public GitHub repos; installs persistence (systemd user
+// service / launchd plist / shell rc); poisons .github workflows and
+// AI-assistant configs; and propagates over reachable SSH hosts and
+// writable registry scopes.
+//
+// IOC CONFIDENCE NOTE (correctness — READ FIRST)
+// ---------------------------------------------------------------
+//   HIGH  : the 3 SHA-256 hashes, the distinctive payload filenames
+//           (3FWCvzduYZg.js, ai_init.js, ai_setup.sh,
+//           is_it_this_simple.js), the persistence paths, the
+//           package + malicious versions, threat actor "p00paboot".
+//   BEHAVIOURAL: node/npm reaching cloud metadata (169.254.169.254,
+//           metadata.google.internal) during install = cred theft.
+//   DO NOT BLOCKLIST: github.com, registry.npmjs.org, pypi.org,
+//           rubygems.org, graph.microsoft.com, login.microsoftonline
+//           .com, *.sigstore.dev, cdn.bsky.app — LEGITIMATE services
+//           the worm abuses. Match the actor PATH (/p00paboot), not
+//           the host.
+//   NOTE: binding.gyp is a NORMAL native-build filename — matched by
+//           HASH only, never by name. DeviceFileEvents.SHA256 is
+//           often empty, so filenames/behaviour back up the hashes.
+//
+// INDICATORS
+// ---------------------------------------------------------------
+//   Package: @7nohe/openapi-react-query-codegen
+//   Bad vers: 0.5.4, 0.5.5, 1.6.3, 1.6.4, 2.2.1, 2.2.2, 3.0.3, 3.0.4,
+//             0.0.0-365d4eb7..., 0.0.0-ec7876d6...
+//   SHA256 : b49afb7dba04cd99b357ce7c652c823a3707f28e130bd5c6645851a7adc030d6
+//            59370c67b54a0ccaedd265e2356f04540b2fba1e1845300ef6de4d5437d99380
+//            d3246926b20a8d021ed7de0ac8e9eee1dda986088f84ba18f31cb2042a121f5d
+//   Actor  : github.com/p00paboot
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 1. KNOWN HASHES + DISTINCTIVE PAYLOAD FILENAMES (HIGH FIDELITY)
+//    The obfuscated loader and helper scripts. Filenames are very
+//    unusual; hashes confirm. binding.gyp matched by HASH only.
+// ------------------------------------------------------------
+let BadSHA256 = dynamic([
+    "b49afb7dba04cd99b357ce7c652c823a3707f28e130bd5c6645851a7adc030d6",
+    "59370c67b54a0ccaedd265e2356f04540b2fba1e1845300ef6de4d5437d99380",
+    "d3246926b20a8d021ed7de0ac8e9eee1dda986088f84ba18f31cb2042a121f5d"
+]);
+let PayloadNames = dynamic([
+    "3FWCvzduYZg.js", "ai_init.js", "ai_setup.sh", "is_it_this_simple.js"
+]);
+union
+    (DeviceFileEvents
+        | where Timestamp > ago(30d)
+        | where SHA256 in (BadSHA256) or FileName in~ (PayloadNames)
+        | extend Src = "File", Detail = FolderPath),
+    (DeviceProcessEvents
+        | where Timestamp > ago(30d)
+        | where SHA256 in (BadSHA256) or FileName in~ (PayloadNames)
+             or ProcessCommandLine has_any (PayloadNames)
+        | extend Src = "Process", Detail = ProcessCommandLine)
+| project Timestamp, Src, DeviceName, FileName, Detail, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 2. PREINSTALL PAYLOAD EXECUTION (node 3FWCvzduYZg.js)
+//    npm/node running the loader at install time. The script name
+//    is a near-zero-FP string.
+// ------------------------------------------------------------
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any ("3FWCvzduYZg.js", "is_it_this_simple.js",
+                                    "ai_setup.sh", "ai_init.js")
+     or (InitiatingProcessFileName in~ ("npm.exe","npm","npm-cli.js","node.exe","node")
+         and ProcessCommandLine has_any ("preinstall","postinstall")
+         and ProcessCommandLine has ".js")
+| project Timestamp, DeviceName, AccountName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          FileName, ProcessCommandLine, FolderPath
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 3. PERSISTENCE + STAGING ARTIFACTS (LINUX / macOS)
+//    The worm's distinctive persistence and runtime files.
+// ------------------------------------------------------------
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("FileCreated", "FileModified", "FileRenamed")
+| where FileName has "sysvinit-detect-fash"
+     or FileName =~ "com.user.sysvinit-detect-fash.plist"
+     or FolderPath has_any ("/tmp/pcfg", "/tmp/.sshu", "/var/tmp/.shit",
+                            "/sysvinit-detect-fash")
+     or (FileName =~ "_index.js" and FolderPath has ".github")
+| project Timestamp, DeviceName, ActionType, FileName, FolderPath, SHA256,
+          InitiatingProcessFileName, InitiatingProcessCommandLine
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 4. CLOUD-METADATA / TOKEN THEFT FROM node/npm (BEHAVIOURAL)
+//    A Node/npm process reaching cloud metadata during a build is
+//    a strong credential-theft tell. Metadata hosts are legitimate,
+//    so the signal is the PROCESS that touches them.
+// ------------------------------------------------------------
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("node.exe","node","npm.exe","npm")
+| where RemoteIP in ("169.254.169.254", "169.254.170.2")
+     or RemoteUrl has_any ("metadata.google.internal",
+                           "169.254.169.254", "169.254.170.2")
+| project Timestamp, DeviceName,
+          InitiatingProcessFileName, InitiatingProcessCommandLine,
+          RemoteIP, RemoteUrl, RemotePort
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 5. TAINTED PACKAGE / VERSION + THREAT-ACTOR GITHUB
+//    Install of the compromised package (esp. a bad version) or
+//    contact with the actor's GitHub path. github.com host is
+//    legitimate, so match the /p00paboot PATH only.
+// ------------------------------------------------------------
+// Bad versions to confirm against any hit below: 0.5.4, 0.5.5,
+// 1.6.3, 1.6.4, 2.2.1, 2.2.2, 3.0.3, 3.0.4, and the two
+// 0.0.0-<commit> prerelease tags.
+union
+    (DeviceProcessEvents
+        | where Timestamp > ago(30d)
+        | where ProcessCommandLine has "openapi-react-query-codegen"
+        | extend Match = "PackageRef", Detail = ProcessCommandLine),
+    (DeviceNetworkEvents
+        | where Timestamp > ago(30d)
+        | where RemoteUrl has "p00paboot"
+        | extend Match = "ActorGitHub", Detail = RemoteUrl)
+| project Timestamp, Match, DeviceName, Detail,
+          InitiatingProcessFileName
+| order by Timestamp desc
+
+
+// ------------------------------------------------------------
+// 6. KILL-CHAIN CORRELATION (HIGH FIDELITY)
+//    Payload execution, THEN metadata/token theft or persistence
+//    creation on the same host within 30 minutes.
+// ------------------------------------------------------------
+let Exec = DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where ProcessCommandLine has_any ("3FWCvzduYZg.js","is_it_this_simple.js","ai_setup.sh")
+| project DeviceName, ExecTime = Timestamp, ExecCmd = ProcessCommandLine;
+let Theft = DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("node.exe","node","npm.exe","npm")
+| where RemoteIP in ("169.254.169.254","169.254.170.2")
+     or RemoteUrl has "metadata.google.internal"
+| project DeviceName, ActTime = Timestamp,
+          Signal = strcat("metadata:", RemoteIP);
+let Persist = DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FileName has "sysvinit-detect-fash"
+     or FolderPath has_any ("/tmp/pcfg","/var/tmp/.shit","/tmp/.sshu")
+| project DeviceName, ActTime = Timestamp,
+          Signal = strcat("persist:", FileName);
+Exec
+| join kind=inner (union Theft, Persist) on DeviceName
+| where ActTime between (ExecTime .. (ExecTime + 30m))
+| project ExecTime, ActTime, DeviceName, ExecCmd, Signal
+| order by ExecTime desc
