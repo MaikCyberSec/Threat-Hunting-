@@ -36,6 +36,7 @@ All queries are built for:
 ### Recent Additions
 
 **August 2026**
+- [PoisonedRefresh - F5 BIG-IP Fileless PHP Web Shell Rootkit & Unix Socket Backdoor (CVE-2025-53521)](<PoisonedRefresh - F5 BIG-IP Fileless PHP Web Shell Rootkit & Unix Socket Backdoor (CVE-2025-53521, August 2026)>)
 - [Microsoft Exchange MRSProxy NTLM-Relay Auth Bypass - Exposure & Webshell Hunt (CVE-2026-62911)](<Microsoft Exchange MRSProxy NTLM-Relay Auth Bypass - Exposure & Webshell Hunt (CVE-2026-62911, August 2026)>)
 - [npm Supply-Chain Worm - openapi-react-query-codegen Compromise & Credential Theft](<npm Supply-Chain Worm - openapi-react-query-codegen Compromise & Credential Theft (August 2026)>)
 - [Fake Microsoft Security Scan - SysScan Tech-Support Scam to Remote-Access Abuse](<Fake Microsoft Security Scan - SysScan Tech-Support Scam to Remote-Access Abuse (August 2026)>)
